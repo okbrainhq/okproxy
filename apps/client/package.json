@@ -1,0 +1,11 @@
+{
+  "name": "tunnel-client",
+  "version": "1.0.0",
+  "description": "TCP tunnel client",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {}
+}

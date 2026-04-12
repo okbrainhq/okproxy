@@ -1,0 +1,13 @@
+# .deploy.server - Deployment configuration
+# Add this file to .gitignore to prevent accidental commits
+
+# HOSTNAME: The domain name for the tunnel server (used by Caddy for SSL)
+# Must point to your server's IP address via DNS A/AAAA records
+HOSTNAME=tunnel.example.com
+
+# REPO_URL: Git repository URL to clone the application
+REPO_URL=https://github.com/username/tunzero.git
+
+# Optional: Default deployment host (USER@HOST)
+# If set, you can run ./scripts/deploy/setup-server.sh without arguments
+# DEPLOY_HOST=deploy@tunnel.example.com

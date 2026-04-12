@@ -1,0 +1,35 @@
+# Certificate Authority files (keep private!)
+.ca/
+
+# Certificate files (contain private keys)
+.certs/
+
+# Any .deploy files
+.deploy*
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Runtime
+*.pid
+*.seed
+*.pid.lock
+
+# Test artifacts
+tmp/
+temp/
+*.tmp
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db

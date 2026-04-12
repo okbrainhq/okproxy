@@ -1,0 +1,7 @@
+{
+  "name": "frame-protocol",
+  "version": "1.0.0",
+  "description": "Shared framing protocol for tunnel communication",
+  "main": "index.js",
+  "type": "commonjs"
+}
