@@ -172,7 +172,6 @@ Deploy the tunnel server to a Debian-based server with systemd, Caddy (for SSL),
 
 - Debian/Ubuntu server with SSH access
 - Domain name pointing to your server (for SSL)
-- `rsync` installed on your local machine
 
 ### 1. Create Configuration File
 

@@ -74,7 +74,7 @@ Two scripts work together for remote deployment:
 
 1. Read `.deploy.server` for `HOSTNAME` and `REPO_URL`
 2. Copy `setup-server-remote.sh` to remote server
-3. If `--upload-certs`: rsync `.certs/` and `.ca/` to remote server
+3. If `--upload-certs`: scp certificates to remote server
 4. SSH into server and run: `sudo ./setup-server-remote.sh [hostname] [repo_url] [flags]`
 
 ### Remote Execution Context (setup-server-remote.sh)
@@ -118,14 +118,14 @@ This ensures:
 ### 2. System Preparation
 
 - Update apt
-- Install basic tools: curl, git, unzip, rsync
+- Install basic tools: curl, git, unzip
 - Install Node.js 20.x
 
 ### 3. Certificate Handling
 
 **If `--upload-certs` flag is provided:**
 - Check local `.certs/` and `.ca/` directories exist
-- Use rsync to upload to `/var/www/tunzero/` on server
+- Use scp to upload certificates to `/var/www/tunzero/certs/` on server
 
 **If flag NOT provided (production):**
 - Run `node apps/server/bin/tunnel-ca.js init` on server

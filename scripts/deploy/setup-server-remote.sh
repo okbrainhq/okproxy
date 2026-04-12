@@ -65,8 +65,8 @@ echo "Updating apt..."
 sudo apt update
 
 # 2. Install basic tools
-echo "Installing basic tools (curl, git, unzip, rsync)..."
-sudo apt install -y curl git unzip rsync
+echo "Installing basic tools (curl, git, unzip)..."
+sudo apt install -y curl git unzip
 
 # 3. Install Node.js (v20)
 if ! command -v node &> /dev/null; then
