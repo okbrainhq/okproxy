@@ -155,9 +155,6 @@ function createTLSServer(clientManager, options = {}) {
       if (clientManager.get() && clientManager.get().socket === socket) {
         console.log(`[${new Date().toISOString()}] Client disconnected, serial: ${serial}`);
         clientManager.remove();
-        // Clear active streams for this connection to prevent leaks on reconnect
-        // Stream IDs from the disconnected client should not block future allocations
-        activeStreams.clear();
       } else if (initialized) {
         console.log(`[${new Date().toISOString()}] Client connection closed (replaced), serial: ${serial}`);
       } else {
@@ -184,14 +181,16 @@ function createTLSServer(clientManager, options = {}) {
 
   // Method to allocate a new stream ID
   server.allocateStreamId = () => {
-    let id = nextStreamId++;
-    // Check for collision with active stream
-    while (activeStreams.has(id)) {
-      id = nextStreamId++;
+    const attempts = maxStreams;
+    for (let i = 0; i < attempts; i++) {
+      let id = nextStreamId++;
+      if (nextStreamId > 2147483647) nextStreamId = 1;
+      if (!activeStreams.has(id)) {
+        activeStreams.add(id);
+        return id;
+      }
     }
-    if (nextStreamId > 2147483647) nextStreamId = 1;
-    activeStreams.add(id);
-    return id;
+    throw new Error('No available stream IDs');
   };
 
   // Method to release a stream ID when done

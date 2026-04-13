@@ -71,8 +71,8 @@ function createFrameDecoder(onFrame, onError, maxFrameSize = MAX_FRAME_SIZE) {
       // Wait for complete payload
       if (buffer.length < 9 + length) return;
 
-      // Extract payload and remaining data using subarray (O(1), no copy)
-      const payload = buffer.subarray(9, 9 + length);
+      // Extract payload as a copy to prevent use-after-free if consumers hold the reference
+      const payload = Buffer.from(buffer.subarray(9, 9 + length));
       const remaining = buffer.subarray(9 + length);
 
       // Update state - use subarray result directly, only alloc if needed
