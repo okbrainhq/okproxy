@@ -6,7 +6,7 @@ const { encodeFrame, createFrameDecoder, FrameType } = require('../../../package
 
 const INITIAL_RECONNECT_DELAY = 1000;
 const MAX_RECONNECT_DELAY = 15000; // Max 15 seconds between retries
-const WATCHDOG_TIMEOUT = 120000; // 2 minutes - should receive at least one PING in this time
+const WATCHDOG_TIMEOUT = 30000; // 30 seconds - should receive at least one PING in this time
 
 function createTLSConnection(config, onFrame, onConnect, onDisconnect) {
   let socket = null;
@@ -31,7 +31,14 @@ function createTLSConnection(config, onFrame, onConnect, onDisconnect) {
       rejectUnauthorized: true
     };
 
+    // Connection timeout - don't let TCP hang for 75s on dead network
+    const connectionTimeout = setTimeout(() => {
+      console.log(`[${new Date().toISOString()}] Connection timeout (25s), destroying socket`);
+      if (socket) socket.destroy();
+    }, 25000);
+
     socket = connect(tlsOptions, () => {
+      clearTimeout(connectionTimeout);
       console.log('TLS connected to server');
       console.log('Server certificate valid:', socket.authorized);
 
@@ -84,12 +91,14 @@ function createTLSConnection(config, onFrame, onConnect, onDisconnect) {
     socket.on('data', decoder);
 
     socket.on('error', (err) => {
+      clearTimeout(connectionTimeout);
       if (err.code !== 'ECONNREFUSED' && err.code !== 'ECONNRESET') {
         console.error('TLS error:', err.message);
       }
     });
 
     socket.on('close', () => {
+      clearTimeout(connectionTimeout);
       initialized = false;
       stopWatchdog();
       const wasConnected = reconnectAttempts === 0;
