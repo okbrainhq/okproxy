@@ -279,9 +279,9 @@ Create a plist file at `~/Library/LaunchAgents/com.tunzero.client.plist`:
   <key>KeepAlive</key>
   <true/>
   <key>StandardOutPath</key>
-  <string>/Users/YOUR_USERNAME/.tunzero/logs/tunzero-out.log</string>
+  <string>/Users/YOUR_USERNAME/.tunzero/logs/client.log</string>
   <key>StandardErrorPath</key>
-  <string>/Users/YOUR_USERNAME/.tunzero/logs/tunzero-err.log</string>
+  <string>/Users/YOUR_USERNAME/.tunzero/logs/client-error.log</string>
 </dict>
 </plist>
 ```
@@ -336,15 +336,48 @@ launchctl load ~/Library/LaunchAgents/com.tunzero.client.plist
 ### 5. Viewing Logs
 
 ```bash
-# View stdout logs
-tail -f ~/.tunzero/logs/tunzero-out.log
+# View client stdout logs
+tail -f ~/.tunzero/logs/client.log
 
-# View stderr logs
-tail -f ~/.tunzero/logs/tunzero-err.log
+# View client error logs
+tail -f ~/.tunzero/logs/client-error.log
 
-# View both
-open ~/.tunzero/logs
+# View both log files
+ls -la ~/.tunzero/logs/
+
+# Check service status
+launchctl list com.tunzero.client
+
+# Check if client process is running with details
+ps aux | grep tunzero
 ```
+
+### Troubleshooting Client Connection Issues
+
+If requests to the server return "Tunnel client not connected":
+
+```bash
+# 1. Check if client process is running
+launchctl list com.tunzero.client
+
+# 2. Check client logs for reconnection attempts
+tail -100 ~/.tunzero/logs/client.log
+
+# 3. Check for errors
+cat ~/.tunzero/logs/client-error.log
+
+# 4. Verify network connection to server
+nc -zv your-server.com 9443
+
+# 5. Restart the client service
+launchctl stop com.tunzero.client
+launchctl start com.tunzero.client
+```
+
+**Common causes:**
+- **TCP half-open connection**: Internet loss caused server to close connection while client still thinks it's connected. Client will auto-reconnect (fixed with TCP keepalive).
+- **Certificate expired**: Check certificate validity with `openssl x509 -in ~/.tunzero/certs/client-cert.pem -noout -dates`
+- **Server down**: Verify server is running and reachable
 
 ### Automatic Start on Login
 

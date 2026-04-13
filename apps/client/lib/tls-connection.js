@@ -5,7 +5,8 @@ const { readFileSync } = require('node:fs');
 const { encodeFrame, createFrameDecoder, FrameType } = require('../../../packages/frame-protocol');
 
 const INITIAL_RECONNECT_DELAY = 1000;
-const MAX_RECONNECT_DELAY = 30000;
+const MAX_RECONNECT_DELAY = 15000; // Max 15 seconds between retries
+const WATCHDOG_TIMEOUT = 120000; // 2 minutes - should receive at least one PING in this time
 
 function createTLSConnection(config, onFrame, onConnect, onDisconnect) {
   let socket = null;
@@ -14,6 +15,9 @@ function createTLSConnection(config, onFrame, onConnect, onDisconnect) {
   let reconnectDelay = INITIAL_RECONNECT_DELAY;
   let reconnectTimer = null;
   let destroyed = false;
+  let watchdogTimer = null;
+  let lastActivity = 0;
+  let reconnectAttempts = 0;
 
   function connectToServer() {
     if (destroyed) return;
@@ -31,6 +35,9 @@ function createTLSConnection(config, onFrame, onConnect, onDisconnect) {
       console.log('TLS connected to server');
       console.log('Server certificate valid:', socket.authorized);
 
+      // Enable TCP keepalive to detect dead connections
+      socket.setKeepAlive(true, 30000); // 30s initial delay, OS default interval
+
       // Send INIT handshake after TLS connection is established
       socket.write(encodeFrame(0, FrameType.INIT, JSON.stringify({
         version: 1,
@@ -42,10 +49,17 @@ function createTLSConnection(config, onFrame, onConnect, onDisconnect) {
 
     decoder = createFrameDecoder(
       (frame) => {
+        recordActivity(); // Track that we received data
+
         if (!initialized) {
           if (frame.streamId === 0 && frame.type === FrameType.INIT) {
             initialized = true;
             reconnectDelay = INITIAL_RECONNECT_DELAY;
+            if (reconnectAttempts > 0) {
+              console.log(`[${new Date().toISOString()}] Reconnected successfully after ${reconnectAttempts} attempt(s)`);
+            }
+            reconnectAttempts = 0;
+            startWatchdog(); // Start monitoring connection health
             if (onConnect) onConnect();
             return;
           }
@@ -77,6 +91,11 @@ function createTLSConnection(config, onFrame, onConnect, onDisconnect) {
 
     socket.on('close', () => {
       initialized = false;
+      stopWatchdog();
+      const wasConnected = reconnectAttempts === 0;
+      if (wasConnected) {
+        console.log(`[${new Date().toISOString()}] Connection lost, will reconnect...`);
+      }
       if (onDisconnect) onDisconnect();
       if (!destroyed) scheduleReconnect();
     });
@@ -84,11 +103,37 @@ function createTLSConnection(config, onFrame, onConnect, onDisconnect) {
 
   function scheduleReconnect() {
     if (reconnectTimer) return;
+    reconnectAttempts++;
+    console.log(`[${new Date().toISOString()}] Reconnect attempt #${reconnectAttempts} in ${reconnectDelay}ms...`);
     reconnectTimer = setTimeout(() => {
       reconnectTimer = null;
       connectToServer();
     }, reconnectDelay);
     reconnectDelay = Math.min(reconnectDelay * 2, MAX_RECONNECT_DELAY);
+  }
+
+  function startWatchdog() {
+    lastActivity = Date.now();
+    if (watchdogTimer) clearInterval(watchdogTimer);
+    watchdogTimer = setInterval(() => {
+      if (!initialized || !socket || socket.destroyed) return;
+      const idleTime = Date.now() - lastActivity;
+      if (idleTime > WATCHDOG_TIMEOUT) {
+        console.log(`[${new Date().toISOString()}] Watchdog: no server activity for ${idleTime}ms, closing dead connection`);
+        socket.destroy();
+      }
+    }, 30000); // Check every 30 seconds
+  }
+
+  function stopWatchdog() {
+    if (watchdogTimer) {
+      clearInterval(watchdogTimer);
+      watchdogTimer = null;
+    }
+  }
+
+  function recordActivity() {
+    lastActivity = Date.now();
   }
 
   function write(data) {
@@ -100,6 +145,7 @@ function createTLSConnection(config, onFrame, onConnect, onDisconnect) {
 
   function destroy() {
     destroyed = true;
+    stopWatchdog();
     if (reconnectTimer) {
       clearTimeout(reconnectTimer);
       reconnectTimer = null;

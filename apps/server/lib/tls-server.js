@@ -45,7 +45,7 @@ function createTLSServer(clientManager, options = {}) {
       return;
     }
 
-    console.log('TLS client connected, serial:', serial);
+    console.log(`[${new Date().toISOString()}] Client connected, serial: ${serial}, remote: ${socket.remoteAddress}:${socket.remotePort}`);
 
     let initialized = false;
     let initTimer = null;
@@ -61,6 +61,7 @@ function createTLSServer(clientManager, options = {}) {
     function startKeepalive() {
       keepaliveTimer = setInterval(() => {
         if (keepaliveDeadline && Date.now() > keepaliveDeadline) {
+          console.log(`[${new Date().toISOString()}] Client keepalive timeout, serial: ${serial}`);
           socket.destroy();
           return;
         }
@@ -106,6 +107,7 @@ function createTLSServer(clientManager, options = {}) {
 
             initialized = true;
             startKeepalive();
+            console.log(`[${new Date().toISOString()}] Client ready, serial: ${serial}`);
             return;
           } catch (err) {
             socket.destroy();
@@ -144,7 +146,12 @@ function createTLSServer(clientManager, options = {}) {
       if (initTimer) clearTimeout(initTimer);
       // Remove the client if this socket is the current one
       if (clientManager.get() && clientManager.get().socket === socket) {
+        console.log(`[${new Date().toISOString()}] Client disconnected, serial: ${serial}`);
         clientManager.remove();
+      } else if (initialized) {
+        console.log(`[${new Date().toISOString()}] Client connection closed (replaced), serial: ${serial}`);
+      } else {
+        console.log(`[${new Date().toISOString()}] Client disconnected before init, serial: ${serial}`);
       }
     });
 
