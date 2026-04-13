@@ -31,8 +31,14 @@ function filterRequestHeaders(headers) {
   return filtered;
 }
 
-function createProxy(connection, targetPort, targetHost = 'localhost') {
+function createProxy(connection, targetPort, targetHost = 'localhost', maxStreams = 100) {
   const activeStreams = new Map(); // streamId -> proxyReq
+
+  // Increase max listeners to handle concurrent streams without warnings
+  // Each active stream adds a drain listener on the shared socket
+  if (connection.socket) {
+    connection.socket.setMaxListeners(maxStreams + 10);
+  }
 
   function handleFrame(frame) {
     // Handle PING (respond with PONG)

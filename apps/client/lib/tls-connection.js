@@ -18,6 +18,7 @@ function createTLSConnection(config, onFrame, onConnect, onDisconnect) {
   let watchdogTimer = null;
   let lastActivity = 0;
   let reconnectAttempts = 0;
+  let serverSettings = { maxConcurrentStreams: 100 }; // Default until negotiated
 
   function connectToServer() {
     if (destroyed) return;
@@ -66,6 +67,15 @@ function createTLSConnection(config, onFrame, onConnect, onDisconnect) {
               console.log(`[${new Date().toISOString()}] Reconnected successfully after ${reconnectAttempts} attempt(s)`);
             }
             reconnectAttempts = 0;
+            // Parse server settings from INIT ACK
+            try {
+              const settings = JSON.parse(frame.payload.toString());
+              if (settings.maxConcurrentStreams) {
+                serverSettings.maxConcurrentStreams = settings.maxConcurrentStreams;
+              }
+            } catch {
+              // Use default if parsing fails
+            }
             startWatchdog(); // Start monitoring connection health
             if (onConnect) onConnect();
             return;
@@ -178,7 +188,8 @@ function createTLSConnection(config, onFrame, onConnect, onDisconnect) {
     destroy,
     isConnected,
     isInitialized,
-    get socket() { return socket; }
+    get socket() { return socket; },
+    get maxConcurrentStreams() { return serverSettings.maxConcurrentStreams; }
   };
 }
 

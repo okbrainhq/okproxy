@@ -92,7 +92,7 @@ function main() {
     },
     () => {
       console.log('Connected to TLS tunnel server');
-      proxy = createProxy(connection, config.targetPort, config.targetHost);
+      proxy = createProxy(connection, config.targetPort, config.targetHost, connection.maxConcurrentStreams);
     },
     () => {
       console.log('Disconnected from TLS tunnel server');

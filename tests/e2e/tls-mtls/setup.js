@@ -124,7 +124,7 @@ async function createTestEnv(options = {}) {
           clearTimeout(timeout);
           clientConnected = true;
           clientDisconnected = false;
-          clientProxy = createProxy(clientConnection, targetPort);
+          clientProxy = createProxy(clientConnection, targetPort, 'localhost', options.maxStreams || 100);
           resolve();
         },
         () => {

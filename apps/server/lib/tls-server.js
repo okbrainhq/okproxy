@@ -5,7 +5,7 @@ const { readFileSync } = require('node:fs');
 const { encodeFrame, createFrameDecoder, FrameType } = require('../../../packages/frame-protocol');
 const { isRevoked } = require('./ca');
 
-const KEEPALIVE_INTERVAL = 10000; // 10 seconds
+const KEEPALIVE_INTERVAL = 30000; // 30 seconds
 const KEEPALIVE_TIMEOUT = 10000; // 10 seconds
 const INIT_TIMEOUT = 10000; // 10 seconds for INIT handshake
 const MAX_CONCURRENT_STREAMS = 100;
@@ -148,6 +148,9 @@ function createTLSServer(clientManager, options = {}) {
       if (clientManager.get() && clientManager.get().socket === socket) {
         console.log(`[${new Date().toISOString()}] Client disconnected, serial: ${serial}`);
         clientManager.remove();
+        // Clear active streams for this connection to prevent leaks on reconnect
+        // Stream IDs from the disconnected client should not block future allocations
+        activeStreams.clear();
       } else if (initialized) {
         console.log(`[${new Date().toISOString()}] Client connection closed (replaced), serial: ${serial}`);
       } else {

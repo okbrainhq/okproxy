@@ -64,6 +64,10 @@ function createHTTPServer(clientManager, tcpServer, options = {}) {
       return;
     }
 
+    // Increase max listeners to handle concurrent streams without warnings
+    // Each active stream adds a drain listener on the shared socket
+    client.socket.setMaxListeners(maxStreams + 10);
+
     // Check max concurrent streams
     if (client.activeStreams && client.activeStreams.size >= maxStreams) {
       res.statusCode = 503;
