@@ -25,6 +25,10 @@ function parseArgs() {
     switch (arg) {
       case '--server':
         const server = args[++i];
+        if (!server.includes(':')) {
+          console.error(`Error: --server requires host:port format (e.g., localhost:8080)`);
+          process.exit(1);
+        }
         const [host, port] = server.split(':');
         options.serverHost = host;
         const serverPort = parseInt(port, 10);
@@ -36,6 +40,10 @@ function parseArgs() {
         break;
       case '--target':
         const target = args[++i];
+        if (!target.includes(':')) {
+          console.error(`Error: --target requires host:port format (e.g., localhost:3000)`);
+          process.exit(1);
+        }
         const [tHost, tPort] = target.split(':');
         options.targetHost = tHost;
         const targetPort = parseInt(tPort, 10);

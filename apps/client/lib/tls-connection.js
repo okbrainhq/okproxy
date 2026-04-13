@@ -62,6 +62,8 @@ function createTLSConnection(config, onFrame, onConnect, onDisconnect) {
         if (!initialized) {
           if (frame.streamId === 0 && frame.type === FrameType.INIT) {
             initialized = true;
+            // Defensively clear timeout in case of any race condition
+            clearTimeout(connectionTimeout);
             reconnectDelay = INITIAL_RECONNECT_DELAY;
             if (reconnectAttempts > 0) {
               console.log(`[${new Date().toISOString()}] Reconnected successfully after ${reconnectAttempts} attempt(s)`);

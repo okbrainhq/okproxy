@@ -136,8 +136,8 @@ if [ "$DEV_MODE" = false ]; then
     fi
 
     # 7. Setup systemd service
-echo "Setting up systemd service..."
-sudo tee /etc/systemd/system/tunzero.service > /dev/null <<EOF
+    echo "Setting up systemd service..."
+    sudo tee /etc/systemd/system/tunzero.service > /dev/null <<EOF
 [Unit]
 Description=Tunzero Tunnel Server
 After=network.target
@@ -150,6 +150,24 @@ ExecStart=/usr/bin/node apps/server/index.js --http-port 8080 --tls-port 9443 $C
 Restart=always
 RestartSec=10
 Environment=NODE_ENV=production
+
+# Security hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHostname=true
+RestrictRealtime=true
+RestrictNamespaces=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RemoveIPC=true
 
 [Install]
 WantedBy=multi-user.target

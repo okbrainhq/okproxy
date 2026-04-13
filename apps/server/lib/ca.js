@@ -2,10 +2,26 @@
 // Note: openssl CLI is a runtime dependency for CA operations only
 
 const { execFileSync } = require('node:child_process');
-const { existsSync, mkdirSync, writeFileSync, readFileSync, chmodSync, appendFileSync, copyFileSync, unlinkSync } = require('node:fs');
+const { existsSync, mkdirSync, writeFileSync, readFileSync, chmodSync, appendFileSync, copyFileSync, unlinkSync, statSync } = require('node:fs');
 const { join } = require('node:path');
 
 const DEFAULT_CA_DIR = './.ca';
+
+/**
+ * Create a temporary combined CA file (cert + key) for signing operations.
+ * When the CA cert and key are in the same file, openssl x509 -req
+ * doesn't need -CAkey on the command line (avoiding exposure in /proc).
+ * @param {string} caDir - CA directory
+ * @returns {string} Path to temporary combined file
+ */
+function createTempCAFile(caDir) {
+  const caKeyPath = join(caDir, 'ca-key.pem');
+  const caCertPath = join(caDir, 'ca-cert.pem');
+  const tempCAPath = join(caDir, '.ca-combined.pem');
+  const combined = readFileSync(caCertPath, 'utf8') + readFileSync(caKeyPath, 'utf8');
+  writeFileSync(tempCAPath, combined, { mode: 0o600 });
+  return tempCAPath;
+}
 
 // In-memory cache for certificate revocation list (CRL)
 // This avoids reading from disk on every TLS connection
@@ -79,7 +95,6 @@ function issueClientCertificate(outputDir, caDir = DEFAULT_CA_DIR) {
 
   const serial = getNextSerial(caDir);
 
-  const caKeyPath = join(caDir, 'ca-key.pem');
   const caCertPath = join(caDir, 'ca-cert.pem');
 
   const clientKeyPath = join(outputDir, 'client-key.pem');
@@ -99,19 +114,27 @@ function issueClientCertificate(outputDir, caDir = DEFAULT_CA_DIR) {
   );
 
   // Sign certificate with CA (valid for 90 days)
-  execFileSync(
-    'openssl',
-    ['x509', '-req', '-in', clientCsrPath, '-CA', caCertPath, '-CAkey', caKeyPath, '-out', clientCertPath, '-days', '90', '-set_serial', String(serial)],
-    { stdio: 'pipe' }
-  );
+  // Use temp combined CA file to avoid CA key path in /proc/<pid>/cmdline
+  const tempCAFile = createTempCAFile(caDir);
+  try {
+    execFileSync(
+      'openssl',
+      ['x509', '-req', '-in', clientCsrPath, '-CA', tempCAFile, '-out', clientCertPath, '-days', '90', '-set_serial', String(serial)],
+      { stdio: 'pipe' }
+    );
+  } finally {
+    try {
+      unlinkSync(tempCAFile);
+    } catch {
+      // Ignore cleanup errors
+    }
+  }
 
-  // Copy CA cert to output directory (using fs.copyFileSync instead of exec)
-  const { copyFileSync } = require('node:fs');
+  // Copy CA cert to output directory
   copyFileSync(caCertPath, caOutPath);
 
   // Clean up CSR
   try {
-    const { unlinkSync } = require('node:fs');
     unlinkSync(clientCsrPath);
   } catch {
     // Ignore cleanup errors
@@ -138,11 +161,26 @@ function issueClientCertificate(outputDir, caDir = DEFAULT_CA_DIR) {
 
 /**
  * Validate hostname format (prevents injection in certificate subjects)
- * @param {string} hostname - Hostname to validate
+ * @param {string} hostname - Hostname to validate (supports IPv4, IPv6, and hostnames)
  * @returns {boolean} True if valid
  */
 function isValidHostname(hostname) {
-  // Allow: alphanumeric, dots, hyphens, and IPv4 addresses
+  // IPv6 addresses: allow [addr] or [addr]:port format
+  if (hostname.startsWith('[')) {
+    // IPv6 literal with optional port: [2001:db8::1] or [2001:db8::1]:8080
+    const ipv6Pattern = /^\[([a-fA-F0-9:]+)\](:\d+)?$/;
+    if (!ipv6Pattern.test(hostname)) {
+      return false;
+    }
+    // Validate the IPv6 part doesn't contain shell metacharacters
+    const ipv6Part = hostname.match(/^\[([a-fA-F0-9:]+)\]/)[1];
+    if (/[^a-fA-F0-9:]/.test(ipv6Part)) {
+      return false;
+    }
+    return true;
+  }
+
+  // IPv4 addresses and hostnames: alphanumeric, dots, hyphens
   // Block: shell metacharacters, quotes, backticks, dollar signs, etc.
   const validPattern = /^[a-zA-Z0-9.-]+$/;
   if (!validPattern.test(hostname)) {
@@ -175,7 +213,6 @@ function issueServerCertificate(hostname, outputDir, caDir = DEFAULT_CA_DIR) {
     mkdirSync(outputDir, { recursive: true });
   }
 
-  const caKeyPath = join(caDir, 'ca-key.pem');
   const caCertPath = join(caDir, 'ca-cert.pem');
 
   const serverKeyPath = join(outputDir, 'server-key.pem');
@@ -188,9 +225,16 @@ function issueServerCertificate(hostname, outputDir, caDir = DEFAULT_CA_DIR) {
   chmodSync(serverKeyPath, 0o600);
 
   // Create temp config for SAN extension
-  const sanExt = hostname.includes(':') || /^\d+$/.test(hostname.replace(/\./g, ''))
-    ? `IP:${hostname}`
-    : `DNS:${hostname}`;
+  let sanExt;
+  if (hostname.startsWith('[')) {
+    // IPv6 address: [addr] or [addr]:port - extract just the IP for SAN
+    const ipv6Match = hostname.match(/^\[([a-fA-F0-9:]+)\]/);
+    sanExt = ipv6Match ? `IP:${ipv6Match[1]}` : `DNS:${hostname}`;
+  } else if (hostname.includes(':') || /^\d+$/.test(hostname.replace(/\./g, ''))) {
+    sanExt = `IP:${hostname}`;
+  } else {
+    sanExt = `DNS:${hostname}`;
+  }
   writeFileSync(tempConfig, `[req]\ndistinguished_name=dn\n[dn]\n[SAN]\nsubjectAltName=${sanExt}\n`);
 
   // Create CSR with SAN - using execFileSync to avoid shell injection
@@ -208,15 +252,24 @@ function issueServerCertificate(hostname, outputDir, caDir = DEFAULT_CA_DIR) {
   );
 
   // Sign certificate with CA (valid for 1 year)
-  execFileSync(
-    'openssl',
-    ['x509', '-req', '-in', serverCsrPath, '-CA', caCertPath, '-CAkey', caKeyPath, '-out', serverCertPath, '-days', '365', '-extfile', tempConfig, '-extensions', 'SAN'],
-    { stdio: 'pipe' }
-  );
+  // Use temp combined CA file to avoid CA key path in /proc/<pid>/cmdline
+  const tempCAFile = createTempCAFile(caDir);
+  try {
+    execFileSync(
+      'openssl',
+      ['x509', '-req', '-in', serverCsrPath, '-CA', tempCAFile, '-out', serverCertPath, '-days', '365', '-extfile', tempConfig, '-extensions', 'SAN'],
+      { stdio: 'pipe' }
+    );
+  } finally {
+    try {
+      unlinkSync(tempCAFile);
+    } catch {
+      // Ignore cleanup errors
+    }
+  }
 
   // Clean up
   try {
-    const { unlinkSync } = require('node:fs');
     unlinkSync(serverCsrPath);
     unlinkSync(tempConfig);
   } catch {
@@ -242,17 +295,18 @@ function issueServerCertificate(hostname, outputDir, caDir = DEFAULT_CA_DIR) {
 function loadCRLIntoCache(caDir) {
   try {
     const crlPath = join(caDir, 'crl.txt');
+    const stats = statSync(crlPath);
     const crl = readFileSync(crlPath, 'utf8');
     const revokedSerials = new Set(
       crl.split('\n')
         .filter(Boolean)
         .map(s => String(s).toLowerCase().replace(/^0+/, '') || '0')
     );
-    crlCache.set(caDir, { revokedSerials });
+    crlCache.set(caDir, { revokedSerials, lastModified: stats.mtimeMs });
     return revokedSerials;
   } catch {
-    // If file doesn't exist, return empty set
-    crlCache.set(caDir, { revokedSerials: new Set() });
+    // If file doesn't exist, return empty set with timestamp 0
+    crlCache.set(caDir, { revokedSerials: new Set(), lastModified: 0 });
     return new Set();
   }
 }
@@ -285,8 +339,22 @@ function revokeCertificate(serial, caDir = DEFAULT_CA_DIR) {
  */
 function isRevoked(serial, caDir = DEFAULT_CA_DIR) {
   let cached = crlCache.get(caDir);
-  if (!cached) {
-    cached = { revokedSerials: loadCRLIntoCache(caDir) };
+  let needsReload = !cached;
+
+  // Check if CRL file has been modified since last load
+  if (!needsReload) {
+    try {
+      const crlPath = join(caDir, 'crl.txt');
+      const stats = statSync(crlPath);
+      needsReload = stats.mtimeMs > (cached.lastModified || 0);
+    } catch {
+      // File doesn't exist or can't be accessed, use cached if available
+    }
+  }
+
+  if (needsReload) {
+    loadCRLIntoCache(caDir);
+    cached = crlCache.get(caDir);
   }
 
   const parsed = parseInt(String(serial), 16);

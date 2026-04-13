@@ -66,6 +66,8 @@ function createTLSServer(clientManager, options = {}) {
     }
 
     function startKeepalive() {
+      // Send first PING immediately to start the keepalive cycle
+      sendPing();
       keepaliveTimer = setInterval(() => {
         if (keepaliveDeadline && Date.now() > keepaliveDeadline) {
           console.log(`[${new Date().toISOString()}] Client keepalive timeout, serial: ${serial}`);

@@ -76,7 +76,7 @@ else
             ;;
     esac
     
-    NODE_VERSION="v20.12.2"
+    NODE_VERSION="v24.14.1"
     NODE_TARBALL="node-${NODE_VERSION}-${NODE_ARCH}.tar.gz"
     NODE_URL="https://nodejs.org/dist/${NODE_VERSION}/${NODE_TARBALL}"
     

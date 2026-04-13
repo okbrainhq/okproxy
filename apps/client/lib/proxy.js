@@ -32,7 +32,8 @@ function filterRequestHeaders(headers) {
 }
 
 function createProxy(connection, targetPort, targetHost = 'localhost', maxStreams = 100) {
-  const activeStreams = new Map(); // streamId -> proxyReq
+  const activeStreams = new Map(); // streamId -> { proxyReq, onDrain }
+  const drainListeners = new Map(); // streamId -> onDrain function
 
   // Increase max listeners to handle concurrent streams without warnings
   // Each active stream adds a drain listener on the shared socket
@@ -110,8 +111,11 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
           proxyRes.pause();
         }
 
+        // Capture socket reference to ensure we remove listener from correct socket
+        const connectionSocket = connection.socket;
         const onDrain = () => proxyRes.resume();
-        connection.socket.on('drain', onDrain);
+        connectionSocket.on('drain', onDrain);
+        drainListeners.set(streamId, onDrain);
 
         // Stream response body (split large chunks into multiple frames)
         proxyRes.on('data', (chunk) => {
@@ -129,14 +133,17 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
         });
 
         proxyRes.on('end', () => {
-          connection.socket.removeListener('drain', onDrain);
+          connectionSocket.removeListener('drain', onDrain);
+          drainListeners.delete(streamId);
           connection.write(encodeFrame(streamId, FrameType.FIN, Buffer.alloc(0)));
           activeStreams.delete(streamId);
         });
 
         proxyRes.on('error', (err) => {
-          connection.socket.removeListener('drain', onDrain);
-          connection.write(encodeFrame(streamId, FrameType.ERROR, Buffer.from(err.message)));
+          connectionSocket.removeListener('drain', onDrain);
+          drainListeners.delete(streamId);
+          // Use generic error message to avoid leaking internal details to server
+          connection.write(encodeFrame(streamId, FrameType.ERROR, Buffer.from('Target error')));
           activeStreams.delete(streamId);
         });
       });
@@ -153,7 +160,8 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
           })));
           connection.write(encodeFrame(streamId, FrameType.DATA, Buffer.from('Target service not available')));
         } else {
-          connection.write(encodeFrame(streamId, FrameType.ERROR, Buffer.from(err.message)));
+          // Use generic error message to avoid leaking internal details to server
+          connection.write(encodeFrame(streamId, FrameType.ERROR, Buffer.from('Target error')));
         }
         activeStreams.delete(streamId);
       });
@@ -170,6 +178,12 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
   }
 
   function destroy() {
+    // Clean up all drain listeners from the socket
+    const connectionSocket = connection.socket;
+    for (const [streamId, onDrain] of drainListeners) {
+      connectionSocket.removeListener('drain', onDrain);
+    }
+    drainListeners.clear();
     // Clean up all active streams
     for (const [streamId, proxyReq] of activeStreams) {
       proxyReq.destroy();

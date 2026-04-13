@@ -33,6 +33,27 @@ function filterResponseHeaders(headers) {
   return filtered;
 }
 
+/**
+ * Sanitize request headers for JSON serialization
+ * Ensures all values are strings and removes any problematic entries
+ * @param {Object} headers - Raw headers from HTTP request
+ * @returns {Object} Sanitized headers safe to serialize
+ */
+function sanitizeRequestHeaders(headers) {
+  const sanitized = {};
+  for (const [key, value] of Object.entries(headers)) {
+    // Node.js http parser ensures keys are strings, but values could be arrays or other types
+    if (typeof value === 'string') {
+      sanitized[key] = value;
+    } else if (Array.isArray(value)) {
+      // Join multiple headers with same name (RFC 2616 allows this)
+      sanitized[key] = value.join(', ');
+    }
+    // Skip non-string, non-array values (shouldn't happen with Node.js HTTP parser)
+  }
+  return sanitized;
+}
+
 function createHTTPServer(clientManager, tcpServer, options = {}) {
   const streamTimeout = options.streamTimeout || STREAM_TIMEOUT;
   const maxStreams = options.maxConcurrentStreams || 100;
@@ -64,11 +85,7 @@ function createHTTPServer(clientManager, tcpServer, options = {}) {
       return;
     }
 
-    // Increase max listeners to handle concurrent streams without warnings
-    // Each active stream adds a drain listener on the shared socket
-    client.socket.setMaxListeners(maxStreams + 10);
-
-    // Check max concurrent streams
+    // Check max concurrent streams atomically during registration
     if (client.activeStreams && client.activeStreams.size >= maxStreams) {
       res.statusCode = 503;
       addCORSHeaders();
@@ -78,20 +95,28 @@ function createHTTPServer(clientManager, tcpServer, options = {}) {
 
     const streamId = tcpServer.allocateStreamId();
 
+    // Increase max listeners to handle concurrent streams without warnings
+    // Each active stream adds a drain listener on the shared socket
+    client.socket.setMaxListeners(maxStreams + 10);
+
+    // Capture the socket reference to ensure we remove from the correct socket
+    // (client.socket may change if a new client reconnects)
+    const clientSocket = client.socket;
+
     // Set up backpressure handling
     let paused = false;
     function onDrain() {
       paused = false;
       req.resume();
     }
-    client.socket.on('drain', onDrain);
+    clientSocket.on('drain', onDrain);
 
     // Send HEADERS frame (use full URL as path to target)
     // Pass headers through transparently - tunnel is not a firewall
     const canWriteHeaders = client.write(encodeFrame(streamId, FrameType.HEADERS, JSON.stringify({
       method: req.method,
       path: req.url,
-      headers: req.headers
+      headers: sanitizeRequestHeaders(req.headers)
     })));
     if (!canWriteHeaders) {
       paused = true;
@@ -160,7 +185,8 @@ function createHTTPServer(clientManager, tcpServer, options = {}) {
 
     function cleanup() {
       clearTimeout(streamTimer);
-      client.socket.removeListener('drain', onDrain);
+      // Use captured socket reference to avoid removing from wrong client
+      clientSocket.removeListener('drain', onDrain);
       clientManager.unregisterStream(streamId);
       tcpServer.releaseStreamId(streamId);
     }
