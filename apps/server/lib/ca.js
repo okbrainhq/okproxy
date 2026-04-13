@@ -272,22 +272,26 @@ function revokeCertificate(serial, caDir = DEFAULT_CA_DIR) {
 /**
  * Check if a certificate serial is revoked
  * Uses in-memory cache to avoid file I/O on every TLS connection
- * @param {number|string} serial - Certificate serial number (can be hex from OpenSSL or decimal)
+ *
+ * The CRL stores decimal serials (written by revokeCertificate/issueClientCertificate).
+ * Node.js exposes cert.serialNumber as an uppercase hex string, so the input is
+ * always parsed as hex and converted to decimal for lookup. Dual-format matching
+ * was tried previously and caused false positives (e.g. revoking decimal 10 would
+ * also flag a cert with decimal serial 16, whose hex form is "10").
+ *
+ * @param {number|string} serial - Certificate serial number as hex (from TLS socket)
  * @param {string} caDir - CA directory
  * @returns {boolean} True if revoked
  */
 function isRevoked(serial, caDir = DEFAULT_CA_DIR) {
-  // Get or load cached CRL
   let cached = crlCache.get(caDir);
   if (!cached) {
     cached = { revokedSerials: loadCRLIntoCache(caDir) };
   }
 
-  // Normalize the input serial - it could be hex (from OpenSSL) or decimal
-  const normalizedSerial = String(serial).toLowerCase().replace(/^0+/, '') || '0';
-
-  // Check if serial is in the revoked set
-  return cached.revokedSerials.has(normalizedSerial);
+  const parsed = parseInt(String(serial), 16);
+  if (!Number.isFinite(parsed)) return false;
+  return cached.revokedSerials.has(String(parsed));
 }
 
 /**

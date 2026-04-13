@@ -23,7 +23,8 @@ const testFiles = [
   'test-max-streams.js',
   'test-stream-timeout.js',
   'test-cors.js',
-  'test-security.js'
+  'test-security.js',
+  'test-revocation.js'
 ];
 
 async function main() {
