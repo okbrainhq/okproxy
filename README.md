@@ -1,4 +1,4 @@
-# TCP Tunnel (TLS + mTLS)
+# tunzero
 
 A secure ngrok alternative using TLS encryption with mutual TLS (mTLS) authentication. **Zero third-party dependencies** - only Node.js built-in modules.
 
