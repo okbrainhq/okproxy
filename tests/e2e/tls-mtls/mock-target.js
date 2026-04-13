@@ -81,6 +81,27 @@ function createMockTarget(options = {}) {
       return;
     }
 
+    // Header echo endpoint - echoes back headers (for testing hop-by-hop filtering)
+    if (urlPath === '/header-echo') {
+      res.writeHead(200, {
+        'Content-Type': 'application/json',
+        'Connection': 'keep-alive',
+        'Keep-Alive': 'timeout=5',
+        'Transfer-Encoding': 'chunked',
+        'Upgrade': 'h2',
+        'TE': 'trailers',
+        'Trailer': 'X-Trailer-Test',
+        'Proxy-Authenticate': 'Basic',
+        'Proxy-Authorization': 'test',
+        'X-Custom-Header': 'should-be-present'
+      });
+      res.end(JSON.stringify({
+        receivedHeaders: req.headers,
+        message: 'headers echoed'
+      }));
+      return;
+    }
+
     // Echo endpoint - echoes back the request body
     if (urlPath === '/echo') {
       const chunks = [];

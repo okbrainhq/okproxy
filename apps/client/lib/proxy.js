@@ -1,7 +1,35 @@
 // Proxy - HTTP proxy to local target service
 
 const { request } = require('node:http');
-const { encodeFrame, FrameType } = require('../../../packages/frame-protocol');
+const { encodeFrame, FrameType, MAX_FRAME_SIZE } = require('../../../packages/frame-protocol');
+
+// Hop-by-hop headers that should not be forwarded to target (RFC 2616)
+const HOP_BY_HOP_HEADERS = new Set([
+  'connection',
+  'keep-alive',
+  'proxy-authenticate',
+  'proxy-authorization',
+  'te',
+  'trailer',
+  'transfer-encoding',
+  'upgrade',
+  'content-length' // Strip content-length - let Node.js recalculate for streamed body
+]);
+
+/**
+ * Filter hop-by-hop headers before forwarding to target
+ * @param {Object} headers - Raw headers from tunnel
+ * @returns {Object} Filtered headers safe to send to target
+ */
+function filterRequestHeaders(headers) {
+  const filtered = {};
+  for (const [key, value] of Object.entries(headers)) {
+    if (!HOP_BY_HOP_HEADERS.has(key.toLowerCase())) {
+      filtered[key] = value;
+    }
+  }
+  return filtered;
+}
 
 function createProxy(connection, targetPort, targetHost = 'localhost') {
   const activeStreams = new Map(); // streamId -> proxyReq
@@ -46,10 +74,10 @@ function createProxy(connection, targetPort, targetHost = 'localhost') {
     try {
       const reqInfo = JSON.parse(payload.toString());
 
-      // Rewrite headers to make request appear local
-      const proxyHeaders = { ...reqInfo.headers };
+      // Filter hop-by-hop headers and rewrite for local request
+      const proxyHeaders = filterRequestHeaders(reqInfo.headers);
       proxyHeaders.host = `${targetHost}:${targetPort}`;
-      
+
       // Remove origin/referer to prevent CSRF issues
       // The app will see this as a direct request, not cross-origin
       delete proxyHeaders.origin;
@@ -62,10 +90,13 @@ function createProxy(connection, targetPort, targetHost = 'localhost') {
         path: reqInfo.path,
         headers: proxyHeaders
       }, (proxyRes) => {
+        // Filter hop-by-hop headers from target response before sending back to server
+        const filteredHeaders = filterRequestHeaders(proxyRes.headers);
+
         // Send response headers back to server
         const canWrite = connection.write(encodeFrame(streamId, FrameType.HEADERS, JSON.stringify({
           status: proxyRes.statusCode,
-          headers: proxyRes.headers
+          headers: filteredHeaders
         })));
 
         // Set up backpressure handling
@@ -76,10 +107,17 @@ function createProxy(connection, targetPort, targetHost = 'localhost') {
         const onDrain = () => proxyRes.resume();
         connection.socket.on('drain', onDrain);
 
-        // Stream response body
+        // Stream response body (split large chunks into multiple frames)
         proxyRes.on('data', (chunk) => {
-          const canWriteChunk = connection.write(encodeFrame(streamId, FrameType.DATA, chunk));
-          if (!canWriteChunk) {
+          let offset = 0;
+          let canWrite = true;
+          while (offset < chunk.length) {
+            const end = Math.min(offset + MAX_FRAME_SIZE, chunk.length);
+            const frameChunk = chunk.subarray(offset, end);
+            canWrite = connection.write(encodeFrame(streamId, FrameType.DATA, frameChunk));
+            offset = end;
+          }
+          if (!canWrite) {
             proxyRes.pause();
           }
         });

@@ -242,10 +242,10 @@ describe('Security: Hop-by-hop Header Removal', () => {
 
   it('should remove Content-Length header from public request before forwarding', async () => {
     const env = await createTestEnv();
-    
+
     try {
       await env.startClient();
-      
+
       const response = await httpRequest({
         hostname: 'localhost',
         port: env.ports.httpPort,
@@ -254,21 +254,58 @@ describe('Security: Hop-by-hop Header Removal', () => {
         headers: {
           'Content-Type': 'text/plain',
           'X-Test': 'content-length-test'
+          // Note: Content-Length is automatically added by Node.js http client
+          // but should be stripped by proxy before forwarding to target
         },
         body: Buffer.from('test body content')
       });
-      
+
       assert.strictEqual(response.statusCode, 200);
       const body = JSON.parse(response.body.toString());
-      
+
       // Custom header should be present
       assert.strictEqual(body.headers['x-test'], 'content-length-test');
-      
-      // Note: Content-Length is stripped from the forwarded request (security)
-      // Node.js will calculate and add the correct Content-Length when sending
-      // to the target, which is correct behavior
+
+      // Content-Length is stripped by the proxy before forwarding
+      // (filterRequestHeaders includes 'content-length' in HOP_BY_HOP_HEADERS)
+      // Node.js then recalculates it when sending to the target
     } finally {
       await env.cleanup();
     }
   });
 });
+
+describe('Security: Hop-by-hop Header Filtering in Response', () => {
+  it('should filter hop-by-hop headers from target response', async () => {
+    const env = await createTestEnv();
+
+    try {
+      await env.startClient();
+
+      const response = await httpRequest({
+        hostname: 'localhost',
+        port: env.ports.httpPort,
+        path: '/header-echo',
+        method: 'GET'
+      });
+
+      assert.strictEqual(response.statusCode, 200);
+
+      // Custom header should be present (not a hop-by-hop header)
+      assert.strictEqual(response.headers['x-custom-header'], 'should-be-present');
+
+      // Hop-by-hop headers from the target should be filtered
+      // Note: Node.js may add its own Connection/Keep-Alive headers automatically,
+      // but the ones from the mock target (TE, Trailer, Upgrade, Proxy-*) should be gone
+      assert.ok(!response.headers['te'], 'TE header from target should be filtered');
+      assert.ok(!response.headers['trailer'], 'Trailer header from target should be filtered');
+      assert.ok(!response.headers['upgrade'], 'Upgrade header from target should be filtered');
+      assert.ok(!response.headers['proxy-authenticate'], 'Proxy-Authenticate header from target should be filtered');
+      assert.ok(!response.headers['proxy-authorization'], 'Proxy-Authorization header from target should be filtered');
+    } finally {
+      await env.cleanup();
+    }
+  });
+});
+
+

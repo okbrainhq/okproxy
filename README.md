@@ -12,7 +12,6 @@ A secure ngrok alternative using TLS encryption with mutual TLS (mTLS) authentic
 - **Auto-reconnection** - Client automatically reconnects with exponential backoff
 - **Backpressure** - Flow control when network or target is slow
 - **Keepalive** - PING/PONG detects dead connections
-- **CORS** - Automatic CORS headers for cross-origin browser requests
 - **Caddy SSL** - Automatic HTTPS with Let's Encrypt certificates via Caddy
 - **Certificate revocation** - Server checks revocation list on each connection
 - **Auto-expiry** - Certificates have built-in expiration (enforced by TLS)
@@ -482,19 +481,6 @@ No requests can be sent until INIT completes.
 - Server sends PING every 30 seconds of inactivity
 - Client must respond with PONG within 10 seconds
 - Dead connections are cleaned up automatically
-
-### CORS (Cross-Origin Resource Sharing)
-
-The tunnel server automatically adds CORS headers to all responses:
-
-```
-Access-Control-Allow-Origin: *
-Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS, PATCH, HEAD
-Access-Control-Allow-Headers: Content-Type, Authorization, X-Requested-With, Accept, Origin
-Access-Control-Allow-Credentials: true
-```
-
-This allows browser-based apps to make API requests through the tunnel without CORS errors. Preflight OPTIONS requests are handled automatically (returns 204).
 
 ## Running Tests
 

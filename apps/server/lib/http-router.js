@@ -1,12 +1,37 @@
 // HTTP Router - Routes public HTTP requests to the single tunnel client
-// Note: This is a transparent proxy - it does NOT filter headers.
-// Security should be handled at the application/target service layer.
 
 const { createServer } = require('node:http');
-const { encodeFrame, FrameType } = require('../../../packages/frame-protocol');
+const { encodeFrame, FrameType, MAX_FRAME_SIZE } = require('../../../packages/frame-protocol');
 
 const STREAM_TIMEOUT = 30000; // 30 seconds
 const DEFAULT_MAX_BODY_SIZE = 10 * 1024 * 1024; // 10MB default
+
+// Hop-by-hop headers that should not be forwarded (RFC 2616)
+const HOP_BY_HOP_HEADERS = new Set([
+  'connection',
+  'keep-alive',
+  'proxy-authenticate',
+  'proxy-authorization',
+  'te',
+  'trailer',
+  'transfer-encoding',
+  'upgrade'
+]);
+
+/**
+ * Filter hop-by-hop headers from response headers
+ * @param {Object} headers - Raw headers from target
+ * @returns {Object} Filtered headers safe to send to client
+ */
+function filterResponseHeaders(headers) {
+  const filtered = {};
+  for (const [key, value] of Object.entries(headers)) {
+    if (!HOP_BY_HOP_HEADERS.has(key.toLowerCase())) {
+      filtered[key] = value;
+    }
+  }
+  return filtered;
+}
 
 function createHTTPServer(clientManager, tcpServer, options = {}) {
   const streamTimeout = options.streamTimeout || STREAM_TIMEOUT;
@@ -83,10 +108,18 @@ function createHTTPServer(clientManager, tcpServer, options = {}) {
         }
         return;
       }
-      const canWrite = client.write(encodeFrame(streamId, FrameType.DATA, chunk));
-      if (!canWrite && !paused) {
-        paused = true;
-        req.pause();
+
+      // Split large chunks into multiple frames (max 1MB each)
+      let offset = 0;
+      while (offset < chunk.length) {
+        const end = Math.min(offset + MAX_FRAME_SIZE, chunk.length);
+        const frameChunk = chunk.subarray(offset, end);
+        const canWrite = client.write(encodeFrame(streamId, FrameType.DATA, frameChunk));
+        if (!canWrite && !paused) {
+          paused = true;
+          req.pause();
+        }
+        offset = end;
       }
     });
 
@@ -140,9 +173,10 @@ function createHTTPServer(clientManager, tcpServer, options = {}) {
             res.statusCode = headers.status || 200;
             // Add CORS headers first
             addCORSHeaders();
-            // Then add target service headers (pass through all headers)
+            // Then add target service headers (filter hop-by-hop headers)
             if (headers.headers) {
-              Object.entries(headers.headers).forEach(([k, v]) => {
+              const filteredHeaders = filterResponseHeaders(headers.headers);
+              Object.entries(filteredHeaders).forEach(([k, v]) => {
                 res.setHeader(k, v);
               });
             }
