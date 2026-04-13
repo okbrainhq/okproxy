@@ -45,24 +45,17 @@ function encodeFrame(streamId, type, payload) {
  * @returns {Function} Decoder function(chunk)
  */
 function createFrameDecoder(onFrame, onError, maxFrameSize = MAX_FRAME_SIZE) {
-  let chunks = [];
-  let totalLength = 0;
+  let buffer = Buffer.alloc(0);
   let destroyed = false;
 
   return function decoder(chunk) {
     if (destroyed) return;
 
-    chunks.push(chunk);
-    totalLength += chunk.length;
+    // Append new chunk efficiently - single concat per chunk
+    buffer = buffer.length === 0 ? chunk : Buffer.concat([buffer, chunk]);
 
-    while (totalLength >= 9) {
-      // Merge chunks if needed for reading header
-      if (chunks.length > 1) {
-        const merged = Buffer.concat(chunks);
-        chunks = [merged];
-      }
-
-      const buffer = chunks[0];
+    while (buffer.length >= 9) {
+      // Read header directly from buffer (no concat needed per iteration)
       const streamId = buffer.readUInt32BE(0);
       const type = buffer.readUInt8(4);
       const length = buffer.readUInt32BE(5);
@@ -70,24 +63,22 @@ function createFrameDecoder(onFrame, onError, maxFrameSize = MAX_FRAME_SIZE) {
       // Check for oversized frame
       if (length > maxFrameSize) {
         destroyed = true;
-        chunks = [];
-        totalLength = 0;
+        buffer = Buffer.alloc(0);
         onError(new Error(`Frame too large: ${length} bytes (max: ${maxFrameSize})`));
         return;
       }
 
       // Wait for complete payload
-      if (totalLength < 9 + length) return;
+      if (buffer.length < 9 + length) return;
 
-      // Extract payload and remaining data
+      // Extract payload and remaining data using subarray (O(1), no copy)
       const payload = buffer.subarray(9, 9 + length);
       const remaining = buffer.subarray(9 + length);
 
-      // Update state
-      chunks = remaining.length > 0 ? [remaining] : [];
-      totalLength = remaining.length;
+      // Update state - use subarray result directly, only alloc if needed
+      buffer = remaining.length > 0 ? remaining : Buffer.alloc(0);
 
-      // Emit frame
+      // Emit frame (payload is a view into original buffer, no copy)
       onFrame({ streamId, type, payload });
     }
   };

@@ -22,13 +22,13 @@ The tunnel requires a Certificate Authority (CA) and certificates for both serve
 
 ```bash
 # Initialize the CA (one-time setup)
-node apps/server/bin/tunnel-ca.js init
+npx ca init
 
 # Issue server certificate (for localhost or your domain)
-node apps/server/bin/tunnel-ca.js issue-server --hostname localhost --output ./.certs
+npx ca issue-server --hostname localhost --output ./.certs
 
 # Issue client certificate
-node apps/server/bin/tunnel-ca.js issue-client
+npx ca issue-client
 ```
 
 This creates:
@@ -39,22 +39,22 @@ This creates:
 
 ```bash
 # Initialize CA (creates .ca/ directory)
-node apps/server/bin/tunnel-ca.js init
+npx ca init
 
 # Issue server certificate with SAN for hostname validation
-node apps/server/bin/tunnel-ca.js issue-server \
+npx ca issue-server \
   --hostname <domain> \
   [--output <dir>]
 
 # Issue client certificate
-node apps/server/bin/tunnel-ca.js issue-client \
+npx ca issue-client \
   [--output <dir>]
 
 # List all issued certificates
-node apps/server/bin/tunnel-ca.js list
+npx ca list
 
 # Revoke a certificate by serial number
-node apps/server/bin/tunnel-ca.js revoke --serial <number>
+npx ca revoke --serial <number>
 ```
 
 ### Default Directory Structure
@@ -87,10 +87,10 @@ node apps/server/bin/tunnel-ca.js revoke --serial <number>
 
 Client certificates expire after 90 days. To rotate without downtime:
 
-1. Issue a new certificate: `tunnel-ca.js issue-client`
+1. Issue a new certificate: `npx ca issue-client`
 2. Deploy the new certificate to the client
 3. The client reconnects with the new certificate
-4. (Optional) Revoke the old certificate: `tunnel-ca.js revoke --serial <old>`
+4. (Optional) Revoke the old certificate: `npx ca revoke --serial <old>`
 
 Both old and new certificates work during the overlap period since revocation is by serial number.
 
@@ -101,13 +101,13 @@ Both old and new certificates work during the overlap period since revocation is
 With default certificate paths (`.certs/server-key.pem`, `.certs/server-cert.pem`, `.ca/ca-cert.pem`):
 
 ```bash
-node apps/server/index.js
+npm run server
 ```
 
 With custom paths:
 
 ```bash
-node apps/server/index.js \
+npm run server -- \
   --key ./custom/server-key.pem \
   --cert ./custom/server-cert.pem \
   --ca ./.ca/ca-cert.pem
@@ -133,13 +133,13 @@ python -m http.server 3000
 With default certificate paths (`.certs/client-key.pem`, `.certs/client-cert.pem`, `.ca/ca-cert.pem`):
 
 ```bash
-node apps/client/index.js --target localhost:3000
+npm run client -- --target localhost:3000
 ```
 
 With custom paths:
 
 ```bash
-node apps/client/index.js \
+npm run client -- \
   --server localhost:9443 \
   --target localhost:3000 \
   --key ./custom/client-key.pem \
@@ -496,16 +496,16 @@ node --test tests/e2e/tls-mtls/test-frames.js
 
 Terminal 1 - Initialize CA and generate certificates:
 ```bash
-$ node apps/server/bin/tunnel-ca.js init
+$ npx ca init
 CA initialized
 CA Certificate: .ca/ca-cert.pem
 
-$ node apps/server/bin/tunnel-ca.js issue-server --hostname localhost --output ./.certs
+$ npx ca issue-server --hostname localhost --output ./.certs
 Server certificate issued for localhost
   Key: .certs/server-key.pem
   Cert: .certs/server-cert.pem
 
-$ node apps/server/bin/tunnel-ca.js issue-client
+$ npx ca issue-client
 Client certificate issued (serial: 1)
   Key: .certs/client-key.pem
   Cert: .certs/client-cert.pem
@@ -514,7 +514,7 @@ Client certificate issued (serial: 1)
 
 Terminal 2 - Start server (uses default paths):
 ```bash
-$ node apps/server/index.js
+$ npm run server
 Starting TLS tunnel server...
 TLS tunnel server listening on port 9443
 HTTP server listening on port 8080
@@ -528,7 +528,7 @@ Serving HTTP on 0.0.0.0 port 3000
 
 Terminal 4 - Start tunnel client (uses default paths):
 ```bash
-$ node apps/client/index.js --target localhost:3000
+$ npm run client -- --target localhost:3000
 Starting TLS tunnel client...
 Server: localhost:9443
 Target: localhost:3000

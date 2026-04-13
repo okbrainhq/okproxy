@@ -84,28 +84,28 @@ if [ "$UPLOAD_CERTS" = true ]; then
     # Check local cert directories exist
     if [ ! -d "$PROJECT_ROOT/.certs" ]; then
         echo "Error: .certs directory not found in project root"
-        echo "Generate certificates first: node apps/server/bin/tunnel-ca.js init"
+        echo "Generate certificates first: npx ca init"
         exit 1
     fi
     if [ ! -d "$PROJECT_ROOT/.ca" ]; then
         echo "Error: .ca directory not found in project root"
-        echo "Generate certificates first: node apps/server/bin/tunnel-ca.js init"
+        echo "Generate certificates first: npx ca init"
         exit 1
     fi
-    
+
     # Check required client certificate files exist
     if [ ! -f "$PROJECT_ROOT/.certs/client-cert.pem" ] || [ ! -f "$PROJECT_ROOT/.certs/client-key.pem" ]; then
         echo "Error: Client certificates not found in .certs/"
         echo "Required files: client-cert.pem, client-key.pem"
-        echo "Generate with: node apps/server/bin/tunnel-ca.js issue-client"
+        echo "Generate with: npx ca issue-client"
         exit 1
     fi
-    
+
     # Check CA certificate exists
     if [ ! -f "$PROJECT_ROOT/.ca/ca-cert.pem" ]; then
         echo "Error: CA certificate not found in .ca/"
         echo "Required file: ca-cert.pem"
-        echo "Generate with: node apps/server/bin/tunnel-ca.js init"
+        echo "Generate with: npx ca init"
         exit 1
     fi
     

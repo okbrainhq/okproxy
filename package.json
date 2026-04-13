@@ -1,0 +1,28 @@
+{
+  "name": "tunzero",
+  "version": "1.0.0",
+  "description": "A secure ngrok alternative using TLS encryption with mutual TLS (mTLS) authentication",
+  "private": true,
+  "scripts": {
+    "server": "node apps/server/index.js",
+    "client": "node apps/client/index.js"
+  },
+  "bin": {
+    "ca": "apps/server/bin/tunnel-ca.js"
+  },
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "keywords": [
+    "tunnel",
+    "tls",
+    "mtls",
+    "ngrok-alternative",
+    "secure-tunnel"
+  ],
+  "license": "MIT"
+}

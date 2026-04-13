@@ -27,13 +27,23 @@ function parseArgs() {
         const server = args[++i];
         const [host, port] = server.split(':');
         options.serverHost = host;
-        options.serverPort = parseInt(port, 10) || 9443;
+        const serverPort = parseInt(port, 10);
+        if (isNaN(serverPort) || serverPort < 1 || serverPort > 65535) {
+          console.error(`Error: Invalid server port ${port}. Must be 1-65535.`);
+          process.exit(1);
+        }
+        options.serverPort = serverPort;
         break;
       case '--target':
         const target = args[++i];
         const [tHost, tPort] = target.split(':');
         options.targetHost = tHost;
-        options.targetPort = parseInt(tPort, 10) || 3000;
+        const targetPort = parseInt(tPort, 10);
+        if (isNaN(targetPort) || targetPort < 1 || targetPort > 65535) {
+          console.error(`Error: Invalid target port ${tPort}. Must be 1-65535.`);
+          process.exit(1);
+        }
+        options.targetPort = targetPort;
         break;
       case '--key':
         options.clientKey = args[++i];

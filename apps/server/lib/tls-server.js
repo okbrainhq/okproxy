@@ -39,6 +39,13 @@ function createTLSServer(clientManager, options = {}) {
     const cert = socket.getPeerCertificate();
     const serial = cert.serialNumber;
 
+    // Guard against edge cases where certificate info is not available
+    if (!serial) {
+      console.error('Client certificate serial number unavailable, rejecting connection');
+      socket.destroy();
+      return;
+    }
+
     if (isRevoked(serial, options.caDir || './data/ca')) {
       console.error('Client certificate revoked, serial:', serial);
       socket.destroy();

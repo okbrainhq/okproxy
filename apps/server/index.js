@@ -29,10 +29,20 @@ function parseArgs() {
     const arg = args[i];
     switch (arg) {
       case '--http-port':
-        options.httpPort = parseInt(args[++i], 10);
+        const httpPort = parseInt(args[++i], 10);
+        if (httpPort < 1 || httpPort > 65535) {
+          console.error(`Error: Invalid HTTP port ${httpPort}. Must be 1-65535.`);
+          process.exit(1);
+        }
+        options.httpPort = httpPort;
         break;
       case '--tls-port':
-        options.tlsPort = parseInt(args[++i], 10);
+        const tlsPort = parseInt(args[++i], 10);
+        if (tlsPort < 1 || tlsPort > 65535) {
+          console.error(`Error: Invalid TLS port ${tlsPort}. Must be 1-65535.`);
+          process.exit(1);
+        }
+        options.tlsPort = tlsPort;
         break;
       case '--key':
         options.serverKey = args[++i];

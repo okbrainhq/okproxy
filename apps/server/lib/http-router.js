@@ -180,9 +180,14 @@ function createHTTPServer(clientManager, tcpServer, options = {}) {
             // Then add target service headers (filter hop-by-hop headers)
             if (headers.headers) {
               const filteredHeaders = filterResponseHeaders(headers.headers);
-              Object.entries(filteredHeaders).forEach(([k, v]) => {
-                res.setHeader(k, v);
-              });
+              for (const [k, v] of Object.entries(filteredHeaders)) {
+                try {
+                  res.setHeader(k, v);
+                } catch (headerErr) {
+                  // Skip malformed headers - log but don't fail the whole request
+                  console.error(`Skipping malformed header '${k}':`, headerErr.message);
+                }
+              }
             }
             headersSent = true;
           } catch (err) {
