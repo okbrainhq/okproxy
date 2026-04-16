@@ -68,13 +68,59 @@ sudo apt update
 echo "Installing basic tools (curl, git, unzip)..."
 sudo apt install -y curl git unzip
 
-# 3. Install Node.js (v20)
-if ! command -v node &> /dev/null; then
-    echo "Node.js not found. Installing Node.js v20..."
-    curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
-    sudo apt install -y nodejs
+# 3. Install/Update Node.js (Latest LTS)
+echo "Checking Node.js status..."
+
+# Fetch latest LTS version from official Node.js releases JSON
+# Filter for entries where "lts" is a string (not false) and extract version
+LTS_DATA=$(curl -fsSL https://nodejs.org/dist/index.json 2>/dev/null | head -c 10000 || echo "")
+
+if [ -n "$LTS_DATA" ]; then
+    # Find first entry with "lts":"codename" (not "lts":false)
+    # Extract the version from the first LTS entry
+    TARGET_VERSION=$(echo "$LTS_DATA" | grep -oE '\{"version":"v[0-9]+\.[^}]*"lts":"[^"]+"[^}]*\}' | head -1 | grep -oE '"version":"v[0-9]+' | grep -oE 'v[0-9]+')
+    TARGET_MAJOR=$(echo "$TARGET_VERSION" | grep -oE '[0-9]+')
+    
+    if [ -n "$TARGET_MAJOR" ]; then
+        TARGET_NODE_VERSION="v${TARGET_MAJOR}"
+        echo "Latest LTS detected: Node.js ${TARGET_NODE_VERSION}.x"
+    else
+        # Fallback to v22 if detection fails
+        TARGET_NODE_VERSION="v22"
+        TARGET_MAJOR="22"
+        echo "Could not detect latest LTS. Using fallback: Node.js ${TARGET_NODE_VERSION}"
+    fi
 else
-    echo "Node.js is already installed: $(node -v)"
+    # Fallback to v22 if API is unreachable
+    TARGET_NODE_VERSION="v22"
+    TARGET_MAJOR="22"
+    echo "Could not fetch LTS info. Using fallback: Node.js ${TARGET_NODE_VERSION}"
+fi
+
+INSTALL_NODE=false
+
+if ! command -v node &> /dev/null; then
+    echo "Node.js not found. Will install Node.js ${TARGET_NODE_VERSION}..."
+    INSTALL_NODE=true
+else
+    CURRENT_NODE_VERSION=$(node -v)
+    echo "Current Node.js version: ${CURRENT_NODE_VERSION}"
+    
+    # Check if current major version matches target
+    if [[ "${CURRENT_NODE_VERSION}" == ${TARGET_NODE_VERSION}* ]]; then
+        echo "Node.js is already at latest LTS version ${TARGET_NODE_VERSION}."
+    else
+        echo "Node.js version mismatch. Target: ${TARGET_NODE_VERSION}, Current: ${CURRENT_NODE_VERSION}"
+        echo "Will update to Node.js ${TARGET_NODE_VERSION}..."
+        INSTALL_NODE=true
+    fi
+fi
+
+if [ "$INSTALL_NODE" = true ]; then
+    echo "Installing Node.js ${TARGET_NODE_VERSION}.x from NodeSource..."
+    curl -fsSL "https://deb.nodesource.com/setup_${TARGET_MAJOR}.x" | sudo -E bash -
+    sudo apt install -y nodejs
+    echo "Node.js installed: $(node -v)"
 fi
 
 # ============================================================
