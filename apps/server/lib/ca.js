@@ -4,6 +4,8 @@
 const { execFileSync } = require('node:child_process');
 const { existsSync, mkdirSync, writeFileSync, readFileSync, chmodSync, appendFileSync, copyFileSync, unlinkSync, statSync } = require('node:fs');
 const { join } = require('node:path');
+const { tmpdir } = require('node:os');
+const { randomBytes } = require('node:crypto');
 
 const DEFAULT_CA_DIR = './.ca';
 
@@ -11,13 +13,16 @@ const DEFAULT_CA_DIR = './.ca';
  * Create a temporary combined CA file (cert + key) for signing operations.
  * When the CA cert and key are in the same file, openssl x509 -req
  * doesn't need -CAkey on the command line (avoiding exposure in /proc).
+ * File is created in os.tmpdir() and cleaned up after use.
  * @param {string} caDir - CA directory
  * @returns {string} Path to temporary combined file
  */
 function createTempCAFile(caDir) {
   const caKeyPath = join(caDir, 'ca-key.pem');
   const caCertPath = join(caDir, 'ca-cert.pem');
-  const tempCAPath = join(caDir, '.ca-combined.pem');
+  // Use random filename in tmpdir to avoid collisions and ensure cleanup on crash
+  const randomSuffix = randomBytes(8).toString('hex');
+  const tempCAPath = join(tmpdir(), `.tunzero-ca-combined-${randomSuffix}.pem`);
   const combined = readFileSync(caCertPath, 'utf8') + readFileSync(caKeyPath, 'utf8');
   writeFileSync(tempCAPath, combined, { mode: 0o600 });
   return tempCAPath;
@@ -78,7 +83,7 @@ function initCA(caDir = DEFAULT_CA_DIR) {
 function getNextSerial(caDir = DEFAULT_CA_DIR) {
   const counterPath = join(caDir, 'serial-counter.txt');
   const counter = parseInt(readFileSync(counterPath, 'utf8'), 10);
-  writeFileSync(counterPath, String(counter + 1));
+  writeFileSync(counterPath, String(counter + 1), { mode: 0o600 });
   return counter;
 }
 

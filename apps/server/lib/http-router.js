@@ -119,6 +119,8 @@ function createHTTPServer(clientManager, tcpServer, options = {}) {
           res.statusCode = 413; // Payload Too Large
           res.end('Request body too large');
         }
+        // Stop reading from the request to prevent continued streaming
+        req.destroy();
         return;
       }
 

@@ -100,7 +100,35 @@ function createTLSServer(clientManager, options = {}) {
               initTimer = null;
             }
 
-            // Send INIT ACK
+            // Parse and validate client INIT payload
+            let clientInit;
+            try {
+              clientInit = JSON.parse(frame.payload.toString());
+            } catch (parseErr) {
+              console.error(`[${new Date().toISOString()}] Invalid INIT payload from client ${serial}:`, parseErr.message);
+              socket.destroy();
+              return;
+            }
+
+            // Validate protocol version
+            if (typeof clientInit.version !== 'number' || clientInit.version < 1) {
+              console.error(`[${new Date().toISOString()}] Invalid protocol version from client ${serial}:`, clientInit.version);
+              socket.destroy();
+              return;
+            }
+
+            // Validate maxFrameSize if provided (must be reasonable)
+            if (clientInit.maxFrameSize !== undefined) {
+              if (typeof clientInit.maxFrameSize !== 'number' ||
+                  clientInit.maxFrameSize < 1024 ||
+                  clientInit.maxFrameSize > 10485760) { // Max 10MB
+                console.error(`[${new Date().toISOString()}] Invalid maxFrameSize from client ${serial}:`, clientInit.maxFrameSize);
+                socket.destroy();
+                return;
+              }
+            }
+
+            // Send INIT ACK with server's capabilities
             socket.write(encodeFrame(0, FrameType.INIT, JSON.stringify({
               version: 1,
               maxFrameSize: 1048576,
@@ -116,7 +144,7 @@ function createTLSServer(clientManager, options = {}) {
 
             initialized = true;
             startKeepalive();
-            console.log(`[${new Date().toISOString()}] Client ready, serial: ${serial}`);
+            console.log(`[${new Date().toISOString()}] Client ready, serial: ${serial}, protocol version: ${clientInit.version}`);
             return;
           } catch (err) {
             socket.destroy();
