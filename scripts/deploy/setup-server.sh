@@ -127,6 +127,9 @@ fi
 
 # 3. Execute setup script remotely (this handles git clone/update and service start)
 echo "Executing setup script on remote host..."
-ssh "$HOST" "chmod +x ~/setup-server-remote.sh && sudo ~/setup-server-remote.sh '$HOSTNAME' '$REPO_URL'"
+# Use printf %q to properly escape arguments to prevent shell injection
+ESCAPED_HOSTNAME=$(printf '%q' "$HOSTNAME")
+ESCAPED_REPO_URL=$(printf '%q' "$REPO_URL")
+ssh "$HOST" "chmod +x ~/setup-server-remote.sh && sudo ~/setup-server-remote.sh $ESCAPED_HOSTNAME $ESCAPED_REPO_URL"
 
 echo "Remote setup completed successfully!"

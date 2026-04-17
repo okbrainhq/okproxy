@@ -121,7 +121,12 @@ function createMockTarget(options = {}) {
 
     // JSON response
     if (urlPath === '/json') {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
+      const headers = { 'Content-Type': 'application/json' };
+      // Add CORS headers if configured (for testing CORS passthrough)
+      if (options.corsHeaders) {
+        Object.assign(headers, options.corsHeaders);
+      }
+      res.writeHead(200, headers);
       res.end(JSON.stringify({
         message: 'hello world',
         requestId: reqId,

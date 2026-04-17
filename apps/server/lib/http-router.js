@@ -60,27 +60,9 @@ function createHTTPServer(clientManager, tcpServer, options = {}) {
   const maxBodySize = options.maxBodySize || DEFAULT_MAX_BODY_SIZE;
 
   const server = createServer((req, res) => {
-    // CORS headers to add to all responses
-    // Note: Allow-Credentials is NOT set because we use '*' for origin
-    // Setting both would be a security risk and is blocked by browsers
-    function addCORSHeaders() {
-      res.setHeader('Access-Control-Allow-Origin', '*');
-      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS, PATCH, HEAD');
-      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Requested-With, Accept, Origin');
-      res.setHeader('Access-Control-Max-Age', '86400');
-    }
-    // Handle CORS preflight (OPTIONS) directly
-    if (req.method === 'OPTIONS') {
-      addCORSHeaders();
-      res.statusCode = 204;
-      res.end();
-      return;
-    }
-
     const client = clientManager.get();
     if (!client) {
       res.statusCode = 502;
-      addCORSHeaders();
       res.end('Tunnel client not connected');
       return;
     }
@@ -88,7 +70,6 @@ function createHTTPServer(clientManager, tcpServer, options = {}) {
     // Check max concurrent streams atomically during registration
     if (client.activeStreams && client.activeStreams.size >= maxStreams) {
       res.statusCode = 503;
-      addCORSHeaders();
       res.end('Max concurrent streams exceeded');
       return;
     }
@@ -111,12 +92,16 @@ function createHTTPServer(clientManager, tcpServer, options = {}) {
     }
     clientSocket.on('drain', onDrain);
 
+    // Get real client IP (handle both IPv4 and IPv6)
+    const clientIp = req.socket.remoteAddress || '127.0.0.1';
+
     // Send HEADERS frame (use full URL as path to target)
-    // Pass headers through transparently - tunnel is not a firewall
+    // Include real client IP so proxy can set authoritative X-Forwarded-For
     const canWriteHeaders = client.write(encodeFrame(streamId, FrameType.HEADERS, JSON.stringify({
       method: req.method,
       path: req.url,
-      headers: sanitizeRequestHeaders(req.headers)
+      headers: sanitizeRequestHeaders(req.headers),
+      remoteAddress: clientIp
     })));
     if (!canWriteHeaders) {
       paused = true;
@@ -132,7 +117,6 @@ function createHTTPServer(clientManager, tcpServer, options = {}) {
         cleanup();
         if (!res.writableEnded) {
           res.statusCode = 413; // Payload Too Large
-          addCORSHeaders();
           res.end('Request body too large');
         }
         return;
@@ -201,9 +185,7 @@ function createHTTPServer(clientManager, tcpServer, options = {}) {
           try {
             const headers = JSON.parse(frame.payload.toString());
             res.statusCode = headers.status || 200;
-            // Add CORS headers first
-            addCORSHeaders();
-            // Then add target service headers (filter hop-by-hop headers)
+            // Add target service headers (filter hop-by-hop headers)
             if (headers.headers) {
               const filteredHeaders = filterResponseHeaders(headers.headers);
               for (const [k, v] of Object.entries(filteredHeaders)) {
@@ -220,14 +202,12 @@ function createHTTPServer(clientManager, tcpServer, options = {}) {
             console.error('Invalid headers frame:', err.message);
             cleanup();
             res.statusCode = 502;
-            addCORSHeaders();
             res.end('Invalid response');
           }
         } else if (frame.type === FrameType.DATA) {
           if (!headersSent) {
             // Auto-send 200 if headers not sent yet
             res.statusCode = 200;
-            addCORSHeaders();
             headersSent = true;
           }
           res.write(frame.payload);
@@ -240,7 +220,6 @@ function createHTTPServer(clientManager, tcpServer, options = {}) {
           cleanup();
           if (!res.writableEnded) {
             res.statusCode = 502;
-            addCORSHeaders();
             // Use generic error message to avoid leaking internal details
             res.end('Bad Gateway');
           }
@@ -252,7 +231,6 @@ function createHTTPServer(clientManager, tcpServer, options = {}) {
         cleanup();
         if (!res.writableEnded) {
           res.statusCode = 502;
-          addCORSHeaders();
           // Use generic error message to avoid leaking internal details
           res.end('Bad Gateway');
         }

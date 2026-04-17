@@ -128,7 +128,11 @@ fi
 
 # 3. Execute setup script remotely
 echo "Executing setup script on remote MacBook..."
-ssh "$HOST" "chmod +x ~/setup-client-remote.sh && ~/setup-client-remote.sh '$SERVER_HOST' '$TARGET_HOST' '$REPO_URL'"
+# Use printf %q to properly escape arguments to prevent shell injection
+ESCAPED_SERVER_HOST=$(printf '%q' "$SERVER_HOST")
+ESCAPED_TARGET_HOST=$(printf '%q' "$TARGET_HOST")
+ESCAPED_REPO_URL=$(printf '%q' "$REPO_URL")
+ssh "$HOST" "chmod +x ~/setup-client-remote.sh && ~/setup-client-remote.sh $ESCAPED_SERVER_HOST $ESCAPED_TARGET_HOST $ESCAPED_REPO_URL"
 
 echo ""
 echo "Client setup completed successfully on $HOST!"

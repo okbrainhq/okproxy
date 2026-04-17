@@ -1,13 +1,13 @@
 // Test: CORS Support and Header Handling (TLS version)
+// Note: The tunnel server does NOT add CORS headers automatically.
+// CORS is the responsibility of the target service.
 
 const { describe, it } = require('node:test');
 const assert = require('node:assert');
 const { createTestEnv, httpRequest } = require('./setup');
-const { connect } = require('node:tls');
-const { encodeFrame, FrameType } = require('../../../packages/frame-protocol');
 
-describe('CORS Support', () => {
-  it('should add CORS headers to successful response', async () => {
+describe('CORS: Tunnel does not add automatic CORS headers', () => {
+  it('should NOT add CORS headers - target service is responsible for CORS', async () => {
     const env = await createTestEnv();
     
     try {
@@ -24,19 +24,54 @@ describe('CORS Support', () => {
       });
       
       assert.strictEqual(response.statusCode, 200);
-      // Check CORS headers are present
-      assert.strictEqual(response.headers['access-control-allow-origin'], '*');
-      assert.ok(response.headers['access-control-allow-methods'], 'Should have allow-methods header');
-      assert.ok(response.headers['access-control-allow-headers'], 'Should have allow-headers header');
+      // Tunnel should NOT add CORS headers - target doesn't set them
+      assert.strictEqual(response.headers['access-control-allow-origin'], undefined,
+        'Tunnel should NOT add CORS headers automatically');
     } finally {
       await env.cleanup();
     }
   });
 
-  it('should handle OPTIONS preflight request', async () => {
+  it('should pass through CORS headers from target service', async () => {
+    const env = await createTestEnv({
+      mockTarget: {
+        corsHeaders: {
+          'Access-Control-Allow-Origin': 'https://example.com',
+          'Access-Control-Allow-Methods': 'GET, POST',
+          'Access-Control-Allow-Headers': 'Content-Type'
+        }
+      }
+    });
+    
+    try {
+      await env.startClient();
+      
+      const response = await httpRequest({
+        hostname: 'localhost',
+        port: env.ports.httpPort,
+        path: '/json',
+        method: 'GET',
+        headers: {
+          'Origin': 'http://example.com'
+        }
+      });
+      
+      assert.strictEqual(response.statusCode, 200);
+      // CORS headers from target should be passed through
+      assert.strictEqual(response.headers['access-control-allow-origin'], 'https://example.com',
+        'CORS headers from target should be passed through');
+    } finally {
+      await env.cleanup();
+    }
+  });
+
+  it('should NOT handle OPTIONS preflight - passes through to target', async () => {
     const env = await createTestEnv();
     
     try {
+      await env.startClient();
+      
+      // OPTIONS request should pass through to target (which returns 404)
       const response = await httpRequest({
         hostname: 'localhost',
         port: env.ports.httpPort,
@@ -49,17 +84,15 @@ describe('CORS Support', () => {
         }
       });
       
-      // Should return 204 No Content for preflight
-      assert.strictEqual(response.statusCode, 204);
-      // Should have CORS headers
-      assert.strictEqual(response.headers['access-control-allow-origin'], '*');
-      assert.ok(response.headers['access-control-allow-methods'].includes('POST'), 'Should allow POST');
+      // Mock target returns 404 for unknown paths, not 204
+      // This proves OPTIONS is passed through to target, not handled by tunnel
+      assert.strictEqual(response.statusCode, 404);
     } finally {
       await env.cleanup();
     }
   });
 
-  it('should add CORS headers to 502 error when no client', async () => {
+  it('should NOT add CORS headers to 502 error when no client', async () => {
     const env = await createTestEnv();
     
     try {
@@ -75,14 +108,15 @@ describe('CORS Support', () => {
       });
       
       assert.strictEqual(response.statusCode, 502);
-      // CORS headers should be present even on errors
-      assert.strictEqual(response.headers['access-control-allow-origin'], '*');
+      // Tunnel should NOT add CORS headers even on errors
+      assert.strictEqual(response.headers['access-control-allow-origin'], undefined,
+        'Tunnel should NOT add CORS headers even on errors');
     } finally {
       await env.cleanup();
     }
   });
 
-  it('should add CORS headers to 503 when max streams exceeded', async () => {
+  it('should NOT add CORS headers to 503 when max streams exceeded', async () => {
     const env = await createTestEnv({ maxStreams: 1 });
     
     try {
@@ -115,7 +149,8 @@ describe('CORS Support', () => {
       });
       
       assert.strictEqual(response.statusCode, 503);
-      assert.strictEqual(response.headers['access-control-allow-origin'], '*');
+      assert.strictEqual(response.headers['access-control-allow-origin'], undefined,
+        'Tunnel should NOT add CORS headers even on 503 errors');
       
       hangingReq.destroy();
     } finally {

@@ -121,8 +121,8 @@ describe('Security: Response Header Filtering', () => {
   });
 });
 
-describe('Security: CORS Misconfiguration', () => {
-  it('should NOT include Access-Control-Allow-Credentials header', async () => {
+describe('Security: No Automatic CORS Headers', () => {
+  it('should NOT automatically add any CORS headers', async () => {
     const env = await createTestEnv();
     
     try {
@@ -139,34 +139,51 @@ describe('Security: CORS Misconfiguration', () => {
       });
       
       assert.strictEqual(response.statusCode, 200);
-      // Allow-Origin should be *
-      assert.strictEqual(response.headers['access-control-allow-origin'], '*');
-      // Allow-Credentials should NOT be present (security fix)
-      assert.ok(!response.headers['access-control-allow-credentials'], 
-        'Access-Control-Allow-Credentials should NOT be present with wildcard origin');
+      // Tunnel should NOT add any CORS headers automatically
+      // CORS is the responsibility of the target service
+      assert.strictEqual(response.headers['access-control-allow-origin'], undefined, 
+        'Tunnel should NOT add Access-Control-Allow-Origin');
+      assert.strictEqual(response.headers['access-control-allow-methods'], undefined,
+        'Tunnel should NOT add Access-Control-Allow-Methods');
+      assert.strictEqual(response.headers['access-control-allow-headers'], undefined,
+        'Tunnel should NOT add Access-Control-Allow-Headers');
+      assert.strictEqual(response.headers['access-control-allow-credentials'], undefined,
+        'Tunnel should NOT add Access-Control-Allow-Credentials');
     } finally {
       await env.cleanup();
     }
   });
 
-  it('should NOT include Allow-Credentials in OPTIONS response', async () => {
-    const env = await createTestEnv();
+  it('should pass CORS headers through from target service when present', async () => {
+    const env = await createTestEnv({
+      mockTarget: {
+        corsHeaders: {
+          'Access-Control-Allow-Origin': 'https://trusted-site.com',
+          'Access-Control-Allow-Methods': 'GET, POST',
+          'Access-Control-Allow-Credentials': 'true'
+        }
+      }
+    });
     
     try {
+      await env.startClient();
+      
       const response = await httpRequest({
         hostname: 'localhost',
         port: env.ports.httpPort,
-        path: '/api/test',
-        method: 'OPTIONS',
+        path: '/json',
+        method: 'GET',
         headers: {
-          'Origin': 'http://example.com',
-          'Access-Control-Request-Method': 'POST'
+          'Origin': 'http://example.com'
         }
       });
       
-      assert.strictEqual(response.statusCode, 204);
-      assert.ok(!response.headers['access-control-allow-credentials'], 
-        'Access-Control-Allow-Credentials should NOT be present in preflight');
+      assert.strictEqual(response.statusCode, 200);
+      // CORS headers from target should be passed through unchanged
+      assert.strictEqual(response.headers['access-control-allow-origin'], 'https://trusted-site.com',
+        'CORS headers from target should pass through');
+      assert.strictEqual(response.headers['access-control-allow-credentials'], 'true',
+        'Allow-Credentials from target should pass through');
     } finally {
       await env.cleanup();
     }

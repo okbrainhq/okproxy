@@ -16,15 +16,29 @@ const HOP_BY_HOP_HEADERS = new Set([
   'content-length' // Strip content-length - let Node.js recalculate for streamed body
 ]);
 
+// X-Forwarded headers that must be stripped to prevent spoofing
+// We will set these ourselves with authoritative values
+const X_FORWARDED_HEADERS = new Set([
+  'x-forwarded-for',
+  'x-forwarded-host',
+  'x-forwarded-proto',
+  'x-forwarded-port',
+  'x-forwarded-path',
+  'forwarded'
+]);
+
 /**
  * Filter hop-by-hop headers before forwarding to target
+ * Also strips X-Forwarded-* headers to prevent client spoofing
  * @param {Object} headers - Raw headers from tunnel
  * @returns {Object} Filtered headers safe to send to target
  */
 function filterRequestHeaders(headers) {
   const filtered = {};
   for (const [key, value] of Object.entries(headers)) {
-    if (!HOP_BY_HOP_HEADERS.has(key.toLowerCase())) {
+    const lowerKey = key.toLowerCase();
+    // Strip both hop-by-hop and X-Forwarded headers
+    if (!HOP_BY_HOP_HEADERS.has(lowerKey) && !X_FORWARDED_HEADERS.has(lowerKey)) {
       filtered[key] = value;
     }
   }
@@ -89,6 +103,12 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
       // The app will see this as a direct request, not cross-origin
       delete proxyHeaders.origin;
       delete proxyHeaders.referer;
+
+      // Set authoritative X-Forwarded-For with real client IP from server
+      // This prevents clients from spoofing their IP address
+      if (reqInfo.remoteAddress) {
+        proxyHeaders['x-forwarded-for'] = reqInfo.remoteAddress;
+      }
 
       const proxyReq = request({
         hostname: targetHost,

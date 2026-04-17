@@ -273,8 +273,17 @@ if [ "$DEV_MODE" = false ]; then
         echo "Repository cloned."
     fi
 
-    # Ensure proper ownership
-    sudo chown -R "$REAL_USER":"$REAL_USER" "$APP_DIR"
+    # Create dedicated tunzero system user if it doesn't exist
+    if ! id -u tunzero &>/dev/null; then
+        echo "Creating dedicated tunzero system user..."
+        sudo useradd --system --no-create-home --shell /usr/sbin/nologin tunzero
+    else
+        echo "tunzero user already exists"
+    fi
+
+    # Set proper ownership for app and cert directories
+    sudo chown -R tunzero:tunzero "$APP_DIR"
+    sudo chown -R tunzero:tunzero "$CERT_DIR"
 
     # 6. Check/generate certificates
     CERT_DIR="/opt/tunzero/certs"
@@ -303,7 +312,8 @@ After=network.target
 
 [Service]
 Type=simple
-User=$REAL_USER
+User=tunzero
+Group=tunzero
 WorkingDirectory=/opt/tunzero
 ExecStart=$NODE_PATH apps/server/index.js --http-port 8080 --tls-port 9443 $CERT_OPTS
 Restart=always
