@@ -71,6 +71,25 @@ sudo apt install -y curl git unzip
 # 3. Install/Update Node.js (Latest LTS)
 echo "Checking Node.js status..."
 
+# If TUNZERO_NODE_PATH is set, verify it exists and skip all detection/installation
+if [ -n "$TUNZERO_NODE_PATH" ]; then
+    if [ -x "$TUNZERO_NODE_PATH" ]; then
+        echo "Using custom Node.js path from TUNZERO_NODE_PATH: $TUNZERO_NODE_PATH"
+        echo "Skipping Node.js detection and installation."
+        NODE_PATH="$TUNZERO_NODE_PATH"
+        # Skip the entire install block - will jump to end of section
+        SKIP_NODE_INSTALL=true
+    else
+        echo "Error: TUNZERO_NODE_PATH is set but executable not found: $TUNZERO_NODE_PATH"
+        exit 1
+    fi
+else
+    SKIP_NODE_INSTALL=false
+fi
+
+# Only run detection and installation if not using custom path
+if [ "$SKIP_NODE_INSTALL" = false ]; then
+
 # Detect architecture
 ARCH=$(uname -m)
 case "$ARCH" in
@@ -112,34 +131,34 @@ else
     echo "Could not fetch LTS info. Using fallback: Node.js ${TARGET_NODE_VERSION}"
 fi
 
+# Check only our custom Node.js installation at /usr/local/bin/node (ignore system Node.js)
 INSTALL_NODE=false
-CURRENT_NODE_VERSION=""
 
 if [ -x "/usr/local/bin/node" ]; then
     CURRENT_NODE_VERSION=$(/usr/local/bin/node -v)
-    echo "Found existing Node.js installation: ${CURRENT_NODE_VERSION}"
-elif command -v node &> /dev/null; then
-    CURRENT_NODE_VERSION=$(node -v)
-    echo "Found Node.js in PATH: ${CURRENT_NODE_VERSION}"
-else
-    echo "Node.js not found. Will install Node.js ${TARGET_NODE_VERSION}..."
-    INSTALL_NODE=true
-fi
+    echo "Found custom Node.js installation: ${CURRENT_NODE_VERSION}"
 
-# Check if current major version matches target (if Node.js is installed)
-if [ -n "$CURRENT_NODE_VERSION" ]; then
+    # Check if current major version matches target
     if [[ "${CURRENT_NODE_VERSION}" == ${TARGET_NODE_VERSION}* ]]; then
-        echo "Node.js is already at latest LTS version ${TARGET_NODE_VERSION}."
+        echo "Node.js is already at target LTS version ${TARGET_NODE_VERSION}."
         INSTALL_NODE=false
     else
         echo "Node.js version mismatch. Target: ${TARGET_NODE_VERSION}, Current: ${CURRENT_NODE_VERSION}"
         echo "Will update to Node.js ${TARGET_NODE_VERSION}..."
         INSTALL_NODE=true
     fi
+else
+    echo "Custom Node.js not found at /usr/local/bin/node. Will install Node.js ${TARGET_NODE_VERSION}..."
+    INSTALL_NODE=true
 fi
 
 if [ "$INSTALL_NODE" = true ]; then
     echo "Installing Node.js ${TARGET_NODE_VERSION}.x from official Node.js distribution..."
+
+    # Warn if system Node.js exists (before we start installing)
+    if command -v node &> /dev/null; then
+        echo "Note: Node.js also found in PATH, system package manager version may coexist."
+    fi
 
     NODE_VERSION_FULL=$(curl -fsSL "https://nodejs.org/dist/latest-${TARGET_NODE_VERSION}.x/" 2>/dev/null | grep -oE "node-${TARGET_NODE_VERSION}\.[0-9]+\.[0-9]+-${NODE_ARCH}\.tar\.gz" | head -1 | sed "s/node-//;s/-${NODE_ARCH}\.tar\.gz//")
     if [ -z "$NODE_VERSION_FULL" ]; then
@@ -151,8 +170,9 @@ if [ "$INSTALL_NODE" = true ]; then
     fi
 
     NODE_TARBALL="node-${NODE_VERSION_FULL}-${NODE_ARCH}.tar.gz"
-    NODE_URL="https://nodejs.org/dist/v${NODE_VERSION_FULL}/${NODE_TARBALL}"
-    SHASUMS_URL="https://nodejs.org/dist/v${NODE_VERSION_FULL}/SHASUMS256.txt"
+    # NODE_VERSION_FULL already includes 'v' prefix, don't add another
+    NODE_URL="https://nodejs.org/dist/${NODE_VERSION_FULL}/${NODE_TARBALL}"
+    SHASUMS_URL="https://nodejs.org/dist/${NODE_VERSION_FULL}/SHASUMS256.txt"
 
     # Create temp directory for downloads
     TEMP_DIR=$(mktemp -d)
@@ -185,9 +205,6 @@ if [ "$INSTALL_NODE" = true ]; then
         echo "Removing existing Node.js installation..."
         sudo rm -rf /usr/local/lib/node /usr/local/bin/node /usr/local/bin/npm /usr/local/bin/npx 2>/dev/null || true
     fi
-    if command -v node &> /dev/null; then
-        echo "Note: Node.js also found in PATH, system package manager version may coexist."
-    fi
 
     # Extract tarball to /usr/local
     echo "Extracting Node.js to /usr/local..."
@@ -201,7 +218,23 @@ if [ "$INSTALL_NODE" = true ]; then
         echo "Error: Node.js installation failed"
         exit 1
     fi
+
+# End of INSTALL_NODE block
 fi
+# End of SKIP_NODE_INSTALL wrapper
+fi
+
+# Determine the Node.js executable path to use in systemd service
+# If TUNZERO_NODE_PATH wasn't set earlier, use the default location
+if [ -z "$NODE_PATH" ]; then
+    NODE_PATH="/usr/local/bin/node"
+fi
+if [ ! -x "$NODE_PATH" ]; then
+    echo "Error: Node.js executable not found at $NODE_PATH"
+    echo "Install Node.js first, or set TUNZERO_NODE_PATH to the correct binary"
+    exit 1
+fi
+echo "Using Node.js at: $NODE_PATH ($($NODE_PATH -v))"
 
 # ============================================================
 # Production-only steps (skipped in --dev mode)
@@ -251,9 +284,9 @@ if [ "$DEV_MODE" = false ]; then
     elif [ ! -f "$APP_DIR/.certs/server-cert.pem" ]; then
         echo "Generating certificates..."
         cd "$APP_DIR"
-        node apps/server/bin/tunnel-ca.js init
-        node apps/server/bin/tunnel-ca.js issue-server --hostname "$HOSTNAME" --output ./.certs
-        node apps/server/bin/tunnel-ca.js issue-client
+        "$NODE_PATH" apps/server/bin/tunnel-ca.js init
+        "$NODE_PATH" apps/server/bin/tunnel-ca.js issue-server --hostname "$HOSTNAME" --output ./.certs
+        "$NODE_PATH" apps/server/bin/tunnel-ca.js issue-client
         echo "Certificates generated."
         CERT_OPTS=""
     else
@@ -272,7 +305,7 @@ After=network.target
 Type=simple
 User=$REAL_USER
 WorkingDirectory=/opt/tunzero
-ExecStart=/usr/local/bin/node apps/server/index.js --http-port 8080 --tls-port 9443 $CERT_OPTS
+ExecStart=$NODE_PATH apps/server/index.js --http-port 8080 --tls-port 9443 $CERT_OPTS
 Restart=always
 RestartSec=10
 Environment=NODE_ENV=production

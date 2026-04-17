@@ -50,6 +50,18 @@ echo "Checking for Node.js..."
 
 LOCAL_NODE="$HOME/.local/bin/node"
 
+# If TUNZERO_NODE_PATH is set and exists, skip all detection and installation
+if [ -n "$TUNZERO_NODE_PATH" ]; then
+    if [ -x "$TUNZERO_NODE_PATH" ]; then
+        echo "Using custom Node.js path from TUNZERO_NODE_PATH: $TUNZERO_NODE_PATH"
+        echo "Skipping Node.js detection and installation."
+        NODE_PATH="$TUNZERO_NODE_PATH"
+    else
+        echo "Error: TUNZERO_NODE_PATH is set but executable not found: $TUNZERO_NODE_PATH"
+        exit 1
+    fi
+else
+
 # Detect architecture
 ARCH=$(uname -m)
 case "$ARCH" in
@@ -86,33 +98,26 @@ else
     echo "Could not fetch LTS info. Using fallback: Node.js ${TARGET_NODE_VERSION}"
 fi
 
+# Check only our custom Node.js installation at ~/.local/bin/node (ignore system Node.js)
 INSTALL_NODE=false
-CURRENT_NODE_VERSION=""
 
 if [ -x "$LOCAL_NODE" ]; then
     CURRENT_NODE_VERSION=$("$LOCAL_NODE" -v)
-    echo "Found local Node.js installation: ${CURRENT_NODE_VERSION}"
-elif command -v node &> /dev/null; then
-    CURRENT_NODE_VERSION=$(node -v)
-    echo "Found Node.js in PATH: ${CURRENT_NODE_VERSION}"
-else
-    echo "Node.js not found. Will install Node.js ${TARGET_NODE_VERSION}..."
-    INSTALL_NODE=true
-fi
+    echo "Found custom Node.js installation: ${CURRENT_NODE_VERSION}"
 
-# Check if current major version matches target (if Node.js is installed)
-if [ -n "$CURRENT_NODE_VERSION" ]; then
+    # Check if current major version matches target
     if [[ "${CURRENT_NODE_VERSION}" == ${TARGET_NODE_VERSION}* ]]; then
-        echo "Node.js is already at latest LTS version ${TARGET_NODE_VERSION}."
+        echo "Node.js is already at target LTS version ${TARGET_NODE_VERSION}."
         INSTALL_NODE=false
     else
         echo "Node.js version mismatch. Target: ${TARGET_NODE_VERSION}, Current: ${CURRENT_NODE_VERSION}"
         echo "Will update to Node.js ${TARGET_NODE_VERSION}..."
         INSTALL_NODE=true
     fi
+else
+    echo "Custom Node.js not found at $LOCAL_NODE. Will install Node.js ${TARGET_NODE_VERSION}..."
+    INSTALL_NODE=true
 fi
-
-NODE_PATH="$LOCAL_NODE"
 
 if [ "$INSTALL_NODE" = true ]; then
     echo "Installing Node.js ${TARGET_NODE_VERSION}.x from official Node.js distribution..."
@@ -126,8 +131,9 @@ if [ "$INSTALL_NODE" = true ]; then
     fi
 
     NODE_TARBALL="node-${NODE_VERSION_FULL}-${NODE_ARCH}.tar.gz"
-    NODE_URL="https://nodejs.org/dist/v${NODE_VERSION_FULL}/${NODE_TARBALL}"
-    SHASUMS_URL="https://nodejs.org/dist/v${NODE_VERSION_FULL}/SHASUMS256.txt"
+    # NODE_VERSION_FULL already includes 'v' prefix, don't add another
+    NODE_URL="https://nodejs.org/dist/${NODE_VERSION_FULL}/${NODE_TARBALL}"
+    SHASUMS_URL="https://nodejs.org/dist/${NODE_VERSION_FULL}/SHASUMS256.txt"
 
     # Create temp directory for downloads
     TEMP_DIR=$(mktemp -d)
@@ -174,7 +180,23 @@ if [ "$INSTALL_NODE" = true ]; then
         echo "Error: Node.js installation failed"
         exit 1
     fi
+
+# End of INSTALL_NODE block
 fi
+# End of TUNZERO_NODE_PATH else branch
+fi
+
+# If we didn't use TUNZERO_NODE_PATH, determine the path now
+if [ -z "$NODE_PATH" ]; then
+    # Determine the Node.js executable path for the LaunchAgent plist
+    NODE_PATH="$LOCAL_NODE"
+    if [ ! -x "$NODE_PATH" ]; then
+        echo "Error: Node.js executable not found at $NODE_PATH"
+        echo "Install Node.js first, or set TUNZERO_NODE_PATH to the correct binary"
+        exit 1
+    fi
+fi
+echo "Using Node.js at: $NODE_PATH ($($NODE_PATH -v))"
 
 # 2. Create necessary directories
 echo "Creating directories..."
@@ -220,11 +242,6 @@ if [ ! -f "$CA_CERT" ]; then
 fi
 
 echo "Certificates verified at $CERT_DIR"
-
-# Ensure we have NODE_PATH set for the plist
-if [ -z "$NODE_PATH" ]; then
-    NODE_PATH=$(which node)
-fi
 
 # 5. Unload existing LaunchAgent if present
 echo "Checking for existing LaunchAgent..."
