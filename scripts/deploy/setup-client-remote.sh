@@ -47,47 +47,129 @@ echo "Repository: $REPO_URL"
 
 # 1. Check for and install Node.js if needed
 echo "Checking for Node.js..."
-NODE_PATH=$(which node 2>/dev/null || true)
+
 LOCAL_NODE="$HOME/.local/bin/node"
 
-if [ -x "$LOCAL_NODE" ]; then
-    echo "Found local Node.js installation: $LOCAL_NODE"
-    NODE_PATH="$LOCAL_NODE"
-elif command -v node &> /dev/null; then
-    NODE_VERSION=$(node --version)
-    echo "Node.js is already installed: $NODE_VERSION"
-    NODE_PATH=$(which node)
+# Detect architecture
+ARCH=$(uname -m)
+case "$ARCH" in
+    arm64)
+        NODE_ARCH="darwin-arm64"
+        ;;
+    x86_64)
+        NODE_ARCH="darwin-x64"
+        ;;
+    *)
+        echo "Error: Unsupported architecture: $ARCH"
+        exit 1
+        ;;
+esac
+
+# Fetch latest LTS version from official Node.js releases JSON
+LTS_DATA=$(curl -fsSL https://nodejs.org/dist/index.json 2>/dev/null | head -c 10000 || echo "")
+
+if [ -n "$LTS_DATA" ]; then
+    TARGET_VERSION=$(echo "$LTS_DATA" | grep -oE '\{"version":"v[0-9]+\.[^}]*"lts":"[^"]+"[^}]*\}' | head -1 | grep -oE '"version":"v[0-9]+' | grep -oE 'v[0-9]+')
+    TARGET_MAJOR=$(echo "$TARGET_VERSION" | grep -oE '[0-9]+')
+
+    if [ -n "$TARGET_MAJOR" ]; then
+        TARGET_NODE_VERSION="v${TARGET_MAJOR}"
+        echo "Latest LTS detected: Node.js ${TARGET_NODE_VERSION}.x"
+    else
+        TARGET_NODE_VERSION="v22"
+        TARGET_MAJOR="22"
+        echo "Could not detect latest LTS. Using fallback: Node.js ${TARGET_NODE_VERSION}"
+    fi
 else
-    echo "Node.js not found. Installing Node.js locally (no sudo required)..."
-    
-    # Detect architecture
-    ARCH=$(uname -m)
-    case "$ARCH" in
-        arm64)
-            NODE_ARCH="darwin-arm64"
-            ;;
-        x86_64)
-            NODE_ARCH="darwin-x64"
-            ;;
-        *)
-            echo "Unsupported architecture: $ARCH"
-            echo "Please install Node.js manually from https://nodejs.org"
-            exit 1
-            ;;
-    esac
-    
-    NODE_VERSION="v24.14.1"
-    NODE_TARBALL="node-${NODE_VERSION}-${NODE_ARCH}.tar.gz"
-    NODE_URL="https://nodejs.org/dist/${NODE_VERSION}/${NODE_TARBALL}"
-    
-    echo "Downloading Node.js ${NODE_VERSION} for ${ARCH}..."
+    TARGET_NODE_VERSION="v22"
+    TARGET_MAJOR="22"
+    echo "Could not fetch LTS info. Using fallback: Node.js ${TARGET_NODE_VERSION}"
+fi
+
+INSTALL_NODE=false
+CURRENT_NODE_VERSION=""
+
+if [ -x "$LOCAL_NODE" ]; then
+    CURRENT_NODE_VERSION=$("$LOCAL_NODE" -v)
+    echo "Found local Node.js installation: ${CURRENT_NODE_VERSION}"
+elif command -v node &> /dev/null; then
+    CURRENT_NODE_VERSION=$(node -v)
+    echo "Found Node.js in PATH: ${CURRENT_NODE_VERSION}"
+else
+    echo "Node.js not found. Will install Node.js ${TARGET_NODE_VERSION}..."
+    INSTALL_NODE=true
+fi
+
+# Check if current major version matches target (if Node.js is installed)
+if [ -n "$CURRENT_NODE_VERSION" ]; then
+    if [[ "${CURRENT_NODE_VERSION}" == ${TARGET_NODE_VERSION}* ]]; then
+        echo "Node.js is already at latest LTS version ${TARGET_NODE_VERSION}."
+        INSTALL_NODE=false
+    else
+        echo "Node.js version mismatch. Target: ${TARGET_NODE_VERSION}, Current: ${CURRENT_NODE_VERSION}"
+        echo "Will update to Node.js ${TARGET_NODE_VERSION}..."
+        INSTALL_NODE=true
+    fi
+fi
+
+NODE_PATH="$LOCAL_NODE"
+
+if [ "$INSTALL_NODE" = true ]; then
+    echo "Installing Node.js ${TARGET_NODE_VERSION}.x from official Node.js distribution..."
+
+    NODE_VERSION_FULL=$(curl -fsSL "https://nodejs.org/dist/latest-${TARGET_NODE_VERSION}.x/" 2>/dev/null | grep -oE "node-${TARGET_NODE_VERSION}\.[0-9]+\.[0-9]+-${NODE_ARCH}\.tar\.gz" | head -1 | sed "s/node-//;s/-${NODE_ARCH}\.tar\.gz//")
+    if [ -z "$NODE_VERSION_FULL" ]; then
+        NODE_VERSION_FULL="${TARGET_NODE_VERSION}.15.0"
+        echo "Could not detect latest ${TARGET_NODE_VERSION}.x version. Using fallback: ${NODE_VERSION_FULL}"
+    else
+        echo "Installing Node.js ${NODE_VERSION_FULL}..."
+    fi
+
+    NODE_TARBALL="node-${NODE_VERSION_FULL}-${NODE_ARCH}.tar.gz"
+    NODE_URL="https://nodejs.org/dist/v${NODE_VERSION_FULL}/${NODE_TARBALL}"
+    SHASUMS_URL="https://nodejs.org/dist/v${NODE_VERSION_FULL}/SHASUMS256.txt"
+
+    # Create temp directory for downloads
+    TEMP_DIR=$(mktemp -d)
+    trap "rm -rf $TEMP_DIR" EXIT
+
+    # Download tarball and checksums
+    echo "Downloading Node.js ${NODE_VERSION_FULL} for ${ARCH}..."
+    curl -fsSL "$NODE_URL" -o "$TEMP_DIR/$NODE_TARBALL"
+    curl -fsSL "$SHASUMS_URL" -o "$TEMP_DIR/SHASUMS256.txt"
+
+    # Verify SHA256 checksum
+    echo "Verifying SHA256 checksum..."
+    EXPECTED_HASH=$(grep "$NODE_TARBALL" "$TEMP_DIR/SHASUMS256.txt" | awk '{print $1}')
+    if [ -z "$EXPECTED_HASH" ]; then
+        echo "Error: Could not find checksum for $NODE_TARBALL"
+        exit 1
+    fi
+
+    ACTUAL_HASH=$(shasum -a 256 "$TEMP_DIR/$NODE_TARBALL" | awk '{print $1}')
+    if [ "$EXPECTED_HASH" != "$ACTUAL_HASH" ]; then
+        echo "Error: SHA256 checksum verification failed!"
+        echo "Expected: $EXPECTED_HASH"
+        echo "Actual:   $ACTUAL_HASH"
+        exit 1
+    fi
+    echo "SHA256 checksum verified."
+
+    # Remove any existing local Node.js installation
+    if [ -d "$HOME/.local/lib/node" ]; then
+        echo "Removing existing Node.js installation..."
+        rm -rf "$HOME/.local/lib/node" "$HOME/.local/bin/node" "$HOME/.local/bin/npm" "$HOME/.local/bin/npx" 2>/dev/null || true
+    fi
+
+    # Extract tarball to ~/.local
+    echo "Extracting Node.js to ~/.local..."
     mkdir -p "$HOME/.local"
-    curl -fsSL "$NODE_URL" | tar -xz -C "$HOME/.local" --strip-components=1
-    
+    tar -xz -C "$HOME/.local" --strip-components=1 -f "$TEMP_DIR/$NODE_TARBALL"
+
+    # Verify installation
     if [ -x "$LOCAL_NODE" ]; then
-        NODE_PATH="$LOCAL_NODE"
-        echo "Node.js installed successfully: $($NODE_PATH --version)"
-        echo "Node location: $NODE_PATH"
+        echo "Node.js installed successfully: $($LOCAL_NODE -v)"
+        echo "npm version: $("$HOME/.local/bin/npm" -v)"
     else
         echo "Error: Node.js installation failed"
         exit 1

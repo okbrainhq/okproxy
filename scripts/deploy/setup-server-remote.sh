@@ -16,7 +16,7 @@ for arg in "$@"; do
     esac
 done
 
-APP_DIR="/var/www/tunzero"
+APP_DIR="/opt/tunzero"
 
 if [ "$DEV_MODE" = false ]; then
     # Collect positional args (skip flags)
@@ -71,6 +71,21 @@ sudo apt install -y curl git unzip
 # 3. Install/Update Node.js (Latest LTS)
 echo "Checking Node.js status..."
 
+# Detect architecture
+ARCH=$(uname -m)
+case "$ARCH" in
+    x86_64)
+        NODE_ARCH="linux-x64"
+        ;;
+    aarch64|arm64)
+        NODE_ARCH="linux-arm64"
+        ;;
+    *)
+        echo "Error: Unsupported architecture: $ARCH"
+        exit 1
+        ;;
+esac
+
 # Fetch latest LTS version from official Node.js releases JSON
 # Filter for entries where "lts" is a string (not false) and extract version
 LTS_DATA=$(curl -fsSL https://nodejs.org/dist/index.json 2>/dev/null | head -c 10000 || echo "")
@@ -80,7 +95,7 @@ if [ -n "$LTS_DATA" ]; then
     # Extract the version from the first LTS entry
     TARGET_VERSION=$(echo "$LTS_DATA" | grep -oE '\{"version":"v[0-9]+\.[^}]*"lts":"[^"]+"[^}]*\}' | head -1 | grep -oE '"version":"v[0-9]+' | grep -oE 'v[0-9]+')
     TARGET_MAJOR=$(echo "$TARGET_VERSION" | grep -oE '[0-9]+')
-    
+
     if [ -n "$TARGET_MAJOR" ]; then
         TARGET_NODE_VERSION="v${TARGET_MAJOR}"
         echo "Latest LTS detected: Node.js ${TARGET_NODE_VERSION}.x"
@@ -98,17 +113,24 @@ else
 fi
 
 INSTALL_NODE=false
+CURRENT_NODE_VERSION=""
 
-if ! command -v node &> /dev/null; then
+if [ -x "/usr/local/bin/node" ]; then
+    CURRENT_NODE_VERSION=$(/usr/local/bin/node -v)
+    echo "Found existing Node.js installation: ${CURRENT_NODE_VERSION}"
+elif command -v node &> /dev/null; then
+    CURRENT_NODE_VERSION=$(node -v)
+    echo "Found Node.js in PATH: ${CURRENT_NODE_VERSION}"
+else
     echo "Node.js not found. Will install Node.js ${TARGET_NODE_VERSION}..."
     INSTALL_NODE=true
-else
-    CURRENT_NODE_VERSION=$(node -v)
-    echo "Current Node.js version: ${CURRENT_NODE_VERSION}"
-    
-    # Check if current major version matches target
+fi
+
+# Check if current major version matches target (if Node.js is installed)
+if [ -n "$CURRENT_NODE_VERSION" ]; then
     if [[ "${CURRENT_NODE_VERSION}" == ${TARGET_NODE_VERSION}* ]]; then
         echo "Node.js is already at latest LTS version ${TARGET_NODE_VERSION}."
+        INSTALL_NODE=false
     else
         echo "Node.js version mismatch. Target: ${TARGET_NODE_VERSION}, Current: ${CURRENT_NODE_VERSION}"
         echo "Will update to Node.js ${TARGET_NODE_VERSION}..."
@@ -117,10 +139,68 @@ else
 fi
 
 if [ "$INSTALL_NODE" = true ]; then
-    echo "Installing Node.js ${TARGET_NODE_VERSION}.x from NodeSource..."
-    curl -fsSL "https://deb.nodesource.com/setup_${TARGET_MAJOR}.x" | sudo -E bash -
-    sudo apt install -y nodejs
-    echo "Node.js installed: $(node -v)"
+    echo "Installing Node.js ${TARGET_NODE_VERSION}.x from official Node.js distribution..."
+
+    NODE_VERSION_FULL=$(curl -fsSL "https://nodejs.org/dist/latest-${TARGET_NODE_VERSION}.x/" 2>/dev/null | grep -oE "node-${TARGET_NODE_VERSION}\.[0-9]+\.[0-9]+-${NODE_ARCH}\.tar\.gz" | head -1 | sed "s/node-//;s/-${NODE_ARCH}\.tar\.gz//")
+    if [ -z "$NODE_VERSION_FULL" ]; then
+        # Fallback to known version if detection fails
+        NODE_VERSION_FULL="${TARGET_NODE_VERSION}.15.0"
+        echo "Could not detect latest ${TARGET_NODE_VERSION}.x version. Using fallback: ${NODE_VERSION_FULL}"
+    else
+        echo "Installing Node.js ${NODE_VERSION_FULL}..."
+    fi
+
+    NODE_TARBALL="node-${NODE_VERSION_FULL}-${NODE_ARCH}.tar.gz"
+    NODE_URL="https://nodejs.org/dist/v${NODE_VERSION_FULL}/${NODE_TARBALL}"
+    SHASUMS_URL="https://nodejs.org/dist/v${NODE_VERSION_FULL}/SHASUMS256.txt"
+
+    # Create temp directory for downloads
+    TEMP_DIR=$(mktemp -d)
+    trap "rm -rf $TEMP_DIR" EXIT
+
+    # Download tarball and checksums
+    echo "Downloading Node.js ${NODE_VERSION_FULL} for ${ARCH}..."
+    curl -fsSL "$NODE_URL" -o "$TEMP_DIR/$NODE_TARBALL"
+    curl -fsSL "$SHASUMS_URL" -o "$TEMP_DIR/SHASUMS256.txt"
+
+    # Verify SHA256 checksum
+    echo "Verifying SHA256 checksum..."
+    EXPECTED_HASH=$(grep "$NODE_TARBALL" "$TEMP_DIR/SHASUMS256.txt" | awk '{print $1}')
+    if [ -z "$EXPECTED_HASH" ]; then
+        echo "Error: Could not find checksum for $NODE_TARBALL"
+        exit 1
+    fi
+
+    ACTUAL_HASH=$(sha256sum "$TEMP_DIR/$NODE_TARBALL" | awk '{print $1}')
+    if [ "$EXPECTED_HASH" != "$ACTUAL_HASH" ]; then
+        echo "Error: SHA256 checksum verification failed!"
+        echo "Expected: $EXPECTED_HASH"
+        echo "Actual:   $ACTUAL_HASH"
+        exit 1
+    fi
+    echo "SHA256 checksum verified."
+
+    # Remove any existing Node.js installation
+    if [ -d "/usr/local/lib/node" ]; then
+        echo "Removing existing Node.js installation..."
+        sudo rm -rf /usr/local/lib/node /usr/local/bin/node /usr/local/bin/npm /usr/local/bin/npx 2>/dev/null || true
+    fi
+    if command -v node &> /dev/null; then
+        echo "Note: Node.js also found in PATH, system package manager version may coexist."
+    fi
+
+    # Extract tarball to /usr/local
+    echo "Extracting Node.js to /usr/local..."
+    sudo tar -xz -C /usr/local --strip-components=1 -f "$TEMP_DIR/$NODE_TARBALL"
+
+    # Verify installation
+    if [ -x "/usr/local/bin/node" ]; then
+        echo "Node.js installed successfully: $(/usr/local/bin/node -v)"
+        echo "npm version: $(/usr/local/bin/npm -v)"
+    else
+        echo "Error: Node.js installation failed"
+        exit 1
+    fi
 fi
 
 # ============================================================
@@ -142,7 +222,7 @@ if [ "$DEV_MODE" = false ]; then
     fi
 
     # 5. Clone or update repository
-    CERT_DIR="/var/www/tunzero/certs"
+    CERT_DIR="/opt/tunzero/certs"
     if [ -d "$APP_DIR/.git" ]; then
         echo "App directory exists. Updating repository..."
         cd "$APP_DIR"
@@ -164,7 +244,7 @@ if [ "$DEV_MODE" = false ]; then
     sudo chown -R "$REAL_USER":"$REAL_USER" "$APP_DIR"
 
     # 6. Check/generate certificates
-    CERT_DIR="/var/www/tunzero/certs"
+    CERT_DIR="/opt/tunzero/certs"
     if [ -f "$CERT_DIR/server-cert.pem" ]; then
         echo "Using uploaded certificates from $CERT_DIR"
         CERT_OPTS="--key $CERT_DIR/server-key.pem --cert $CERT_DIR/server-cert.pem --ca $CERT_DIR/ca-cert.pem"
@@ -191,8 +271,8 @@ After=network.target
 [Service]
 Type=simple
 User=$REAL_USER
-WorkingDirectory=/var/www/tunzero
-ExecStart=/usr/bin/node apps/server/index.js --http-port 8080 --tls-port 9443 $CERT_OPTS
+WorkingDirectory=/opt/tunzero
+ExecStart=/usr/local/bin/node apps/server/index.js --http-port 8080 --tls-port 9443 $CERT_OPTS
 Restart=always
 RestartSec=10
 Environment=NODE_ENV=production

@@ -74,7 +74,7 @@ echo "Copying setup-server-remote.sh..."
 scp "$SCRIPT_DIR/setup-server-remote.sh" "$HOST:~/setup-server-remote.sh"
 
 # 2. Upload certificates if requested (do this FIRST so they exist when service starts)
-CERT_DIR="/var/www/tunzero/certs"
+CERT_DIR="/opt/tunzero/certs"
 if [ "$UPLOAD_CERTS" = true ]; then
     echo "Validating and uploading certificates..."
     
@@ -109,18 +109,19 @@ if [ "$UPLOAD_CERTS" = true ]; then
     echo "Local certificates validated."
     echo "Uploading certificates to remote server..."
     
-    # Create remote cert directory
-    ssh "$HOST" "sudo mkdir -p $CERT_DIR && sudo chown -R \$USER:\$USER /var/www/tunzero"
-    
+    # Create remote cert directory with secure permissions FIRST
+    ssh "$HOST" "sudo mkdir -p $CERT_DIR && sudo chown -R \$USER:\$USER /opt/tunzero && sudo chmod 700 $CERT_DIR"
+
     # Upload certificates using scp
     scp "$PROJECT_ROOT/.certs/server-cert.pem" "$HOST:$CERT_DIR/"
     scp "$PROJECT_ROOT/.certs/server-key.pem" "$HOST:$CERT_DIR/"
     scp "$PROJECT_ROOT/.ca/ca-cert.pem" "$HOST:$CERT_DIR/"
-    
-    # Fix ownership
-    echo "Fixing certificate ownership..."
+
+    # Fix ownership and permissions (directory already restricted, just fix files)
+    echo "Fixing certificate ownership and permissions..."
     ssh "$HOST" "sudo chown -R \"\$SUDO_USER:\$SUDO_USER\" $CERT_DIR 2>/dev/null || sudo chown -R \"\$USER:\$USER\" $CERT_DIR"
-    
+    ssh "$HOST" "sudo chmod 600 $CERT_DIR/server-key.pem && sudo chmod 644 $CERT_DIR/server-cert.pem $CERT_DIR/ca-cert.pem"
+
     echo "Certificates uploaded successfully to $CERT_DIR"
 fi
 
