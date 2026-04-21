@@ -200,6 +200,9 @@ function createHTTPServer(clientManager, tcpServer, options = {}) {
               }
             }
             headersSent = true;
+            // Reset timeout on outgoing headers - critical for slow-starting responses
+            // that take nearly 30s to send headers before streaming data
+            resetStreamTimeout();
           } catch (err) {
             console.error('Invalid headers frame:', err.message);
             cleanup();
@@ -213,7 +216,13 @@ function createHTTPServer(clientManager, tcpServer, options = {}) {
             headersSent = true;
           }
           res.write(frame.payload);
+          // Reset timeout on outgoing data - critical for SSE where client sends nothing after initial request.
+          // Without this, unidirectional server→client streams timeout after 30s because the timeout
+          // was only being reset when receiving frames FROM the client. See: .design/06-sse-stream-timeout-fix.md
+          resetStreamTimeout();
         } else if (frame.type === FrameType.FIN) {
+          // Reset timeout before cleanup to prevent race with timer callback
+          resetStreamTimeout();
           cleanup();
           if (!res.writableEnded) {
             res.end();

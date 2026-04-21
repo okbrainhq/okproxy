@@ -13,6 +13,7 @@ const testFiles = [
   'test-concurrent.js',
   'test-streaming.js',
   'test-sse.js',
+  'test-sse-timeout.js', // Tests SSE connections stay open beyond 30s timeout
   'test-large-body.js',
   'test-disconnect.js',
   'test-reconnect.js',
@@ -26,6 +27,17 @@ const testFiles = [
   'test-security.js',
   'test-revocation.js'
 ];
+
+// Files that need longer timeout (in ms)
+const longTimeoutFiles = new Set([
+  'test-sse-timeout.js' // 65s test + 60s slow headers test + margin = ~130s
+]);
+
+// Timeout values for different test types (in ms)
+const TIMEOUTS = {
+  default: 30000,
+  long: 180000 // 3 minutes for SSE timeout tests (65s + 60s tests + margin)
+};
 
 async function main() {
   console.log('Running TLS E2E tests...\n');
@@ -41,9 +53,11 @@ async function main() {
     process.stdout.write(`${file} ... `);
 
     try {
+      // Use longer timeout for tests that need it (e.g., SSE timeout tests run for 65+ seconds)
+      const timeout = longTimeoutFiles.has(file) ? TIMEOUTS.long : TIMEOUTS.default;
       const stream = run({
         files: [filePath],
-        timeout: 30000
+        timeout
       });
 
       let passed = 0;
