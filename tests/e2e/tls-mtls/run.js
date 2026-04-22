@@ -25,7 +25,8 @@ const testFiles = [
   'test-stream-timeout.js',
   'test-cors.js',
   'test-security.js',
-  'test-revocation.js'
+  'test-revocation.js',
+  'test-websocket.js'
 ];
 
 // Files that need longer timeout (in ms)

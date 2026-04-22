@@ -1,12 +1,9 @@
-// Test: WebSocket Support
-
 const { describe, it } = require('node:test');
 const assert = require('node:assert');
 const { createTestEnv } = require('./setup');
 const crypto = require('node:crypto');
 const { request } = require('node:http');
 
-// Build masked client frame (browser->server)
 function buildMaskedWebSocketFrame(opcode, payload) {
   const payloadLen = payload.length;
   const maskKey = crypto.randomBytes(4);
@@ -28,7 +25,6 @@ function buildMaskedWebSocketFrame(opcode, payload) {
     offset = 8;
   }
   
-  // Copy and mask payload
   for (let i = 0; i < payload.length; i++) {
     frame[offset + i] = payload[i] ^ maskKey[i % 4];
   }
@@ -36,228 +32,158 @@ function buildMaskedWebSocketFrame(opcode, payload) {
   return frame;
 }
 
+function wsConnect(httpPort, path) {
+  return new Promise((resolve, reject) => {
+    const req = request({
+      hostname: 'localhost',
+      port: httpPort,
+      path: path || '/ws-echo',
+      method: 'GET',
+      headers: {
+        'Upgrade': 'websocket',
+        'Connection': 'Upgrade',
+        'Sec-WebSocket-Key': 'dGhlIHNhbXBsZSBub25jZQ==',
+        'Sec-WebSocket-Version': '13'
+      }
+    }, (res) => {
+      reject(new Error('Got HTTP response: ' + res.statusCode));
+    });
+    
+    req.on('upgrade', (res, socket, head) => {
+      resolve({ res, socket });
+    });
+    
+    req.on('error', reject);
+    req.end();
+    
+    setTimeout(() => {
+      req.destroy();
+      reject(new Error('WebSocket connect timeout'));
+    }, 5000);
+  });
+}
+
 describe('WebSocket Support', () => {
   it('should complete WebSocket handshake', async () => {
     const env = await createTestEnv();
-    let wsSocket = null;
     
     try {
       await env.startClient();
       await new Promise(r => setTimeout(r, 200));
       
-      const result = await new Promise((resolve, reject) => {
-        const req = request({
-          hostname: 'localhost',
-          port: env.ports.httpPort,
-          path: '/ws-echo',
-          method: 'GET',
-          headers: {
-            'Upgrade': 'websocket',
-            'Connection': 'Upgrade',
-            'Sec-WebSocket-Key': 'dGhlIHNhbXBsZSBub25jZQ==',
-            'Sec-WebSocket-Version': '13'
-          }
-        }, (res) => {
-          resolve({ upgraded: false, statusCode: res.statusCode });
-        });
-        
-        req.on('upgrade', (res, socket, head) => {
-          wsSocket = socket;
-          resolve({ 
-            upgraded: true, 
-            statusCode: res.statusCode,
-            headers: res.headers
-          });
-        });
-        
-        req.on('error', reject);
-        req.end();
-        
-        setTimeout(() => {
-          req.destroy();
-          reject(new Error('Timeout'));
-        }, 3000);
-      });
+      const { res, socket } = await wsConnect(env.ports.httpPort, '/ws-echo');
       
-      assert.ok(result.upgraded, 'Should upgrade to WebSocket');
-      assert.strictEqual(result.statusCode, 101);
-      assert.ok(result.headers['sec-websocket-accept'], 'Should have Sec-WebSocket-Accept');
-      assert.strictEqual(result.headers.upgrade, 'websocket');
+      assert.strictEqual(res.statusCode, 101);
+      assert.ok(res.headers['sec-websocket-accept'], 'Should have Sec-WebSocket-Accept');
+      assert.strictEqual(res.headers.upgrade, 'websocket');
+      
+      socket.destroy();
     } finally {
-      // Important: Destroy WebSocket socket before cleanup
-      if (wsSocket) {
-        wsSocket.destroy();
-        await new Promise(r => setTimeout(r, 100));
-      }
+      await new Promise(r => setTimeout(r, 100));
       await env.cleanup();
     }
   });
 
   it('should relay WebSocket text frames', async () => {
     const env = await createTestEnv();
-    let wsSocket = null;
     
     try {
       await env.startClient();
       await new Promise(r => setTimeout(r, 200));
       
+      const { socket } = await wsConnect(env.ports.httpPort, '/ws-echo');
       const messages = [];
       
       await new Promise((resolve, reject) => {
-        const timeout = setTimeout(() => {
-          resolve();
-        }, 2000);
+        const timeout = setTimeout(resolve, 2000);
         
-        const req = request({
-          hostname: 'localhost',
-          port: env.ports.httpPort,
-          path: '/ws-echo',
-          method: 'GET',
-          headers: {
-            'Upgrade': 'websocket',
-            'Connection': 'Upgrade',
-            'Sec-WebSocket-Key': 'dGhlIHNhbXBsZSBub25jZQ==',
-            'Sec-WebSocket-Version': '13'
-          }
-        }, (res) => {
-          clearTimeout(timeout);
-          reject(new Error('Got HTTP response instead of upgrade'));
-        });
-        
-        req.on('upgrade', (res, socket, head) => {
-          wsSocket = socket;
-          
-          socket.on('data', (chunk) => {
-            // Parse simple text frame (unmasked from server)
-            if (chunk.length >= 2) {
-              const opcode = chunk[0] & 0x0f;
-              const payloadLen = chunk[1] & 0x7f;
-              if (opcode === 0x01 && chunk.length >= 2 + payloadLen) {
-                const payload = chunk.subarray(2, 2 + payloadLen);
-                messages.push(payload.toString());
-              }
+        socket.on('data', (chunk) => {
+          if (chunk.length >= 2) {
+            const opcode = chunk[0] & 0x0f;
+            const payloadLen = chunk[1] & 0x7f;
+            if (opcode === 0x01 && chunk.length >= 2 + payloadLen) {
+              const payload = chunk.subarray(2, 2 + payloadLen);
+              messages.push(payload.toString());
             }
-          });
-          
-          socket.on('close', () => {
-            clearTimeout(timeout);
-            resolve();
-          });
-          
-          socket.on('error', (err) => {
-            clearTimeout(timeout);
-            reject(err);
-          });
-          
-          // Send masked text frame
-          const frame = buildMaskedWebSocketFrame(0x01, Buffer.from('Hello WebSocket'));
-          socket.write(frame);
-          
-          // Close after receiving echo
-          setTimeout(() => {
-            const closeFrame = buildMaskedWebSocketFrame(0x08, Buffer.alloc(0));
-            socket.write(closeFrame);
-            socket.end();
-          }, 300);
+          }
         });
         
-        req.on('error', (err) => {
+        socket.on('error', (err) => {
           clearTimeout(timeout);
           reject(err);
         });
         
-        req.end();
+        socket.write(buildMaskedWebSocketFrame(0x01, Buffer.from('Hello WebSocket')));
+        
+        setTimeout(() => {
+          socket.write(buildMaskedWebSocketFrame(0x08, Buffer.alloc(0)));
+          socket.end();
+        }, 300);
       });
       
       assert.ok(messages.some(m => m.includes('Hello WebSocket')), 'Should receive echo');
+      
+      socket.destroy();
     } finally {
-      if (wsSocket) {
-        wsSocket.destroy();
-        await new Promise(r => setTimeout(r, 100));
-      }
+      await new Promise(r => setTimeout(r, 100));
       await env.cleanup();
     }
   });
 
   it('should handle WebSocket close frame', async () => {
     const env = await createTestEnv();
-    let wsSocket = null;
     
     try {
       await env.startClient();
       await new Promise(r => setTimeout(r, 200));
       
+      const { socket } = await wsConnect(env.ports.httpPort, '/ws-echo');
       let closeReceived = false;
       
       await new Promise((resolve, reject) => {
-        const timeout = setTimeout(() => {
-          resolve();
-        }, 2000);
+        const timeout = setTimeout(resolve, 2000);
         
-        const req = request({
-          hostname: 'localhost',
-          port: env.ports.httpPort,
-          path: '/ws-echo',
-          method: 'GET',
-          headers: {
-            'Upgrade': 'websocket',
-            'Connection': 'Upgrade',
-            'Sec-WebSocket-Key': 'dGhlIHNhbXBsZSBub25jZQ==',
-            'Sec-WebSocket-Version': '13'
+        socket.on('data', (chunk) => {
+          const opcode = chunk[0] & 0x0f;
+          if (opcode === 0x08) {
+            closeReceived = true;
           }
-        }, (res) => {
+        });
+        
+        socket.on('close', () => {
           clearTimeout(timeout);
-          reject(new Error('Got HTTP response'));
+          resolve();
         });
         
-        req.on('upgrade', (res, socket, head) => {
-          wsSocket = socket;
-          
-          socket.on('data', (chunk) => {
-            const opcode = chunk[0] & 0x0f;
-            if (opcode === 0x08) {
-              closeReceived = true;
-            }
-          });
-          
-          socket.on('close', () => {
-            clearTimeout(timeout);
-            resolve();
-          });
-          
-          // Send close frame
-          setTimeout(() => {
-            const closeFrame = buildMaskedWebSocketFrame(0x08, Buffer.alloc(0));
-            socket.write(closeFrame);
-          }, 100);
+        socket.on('error', (err) => {
+          clearTimeout(timeout);
+          reject(err);
         });
         
-        req.on('error', reject);
-        req.end();
+        setTimeout(() => {
+          socket.write(buildMaskedWebSocketFrame(0x08, Buffer.alloc(0)));
+        }, 100);
       });
       
       assert.ok(closeReceived, 'Should receive close frame response');
+      
+      socket.destroy();
     } finally {
-      if (wsSocket) {
-        wsSocket.destroy();
-        await new Promise(r => setTimeout(r, 100));
-      }
+      await new Promise(r => setTimeout(r, 100));
       await env.cleanup();
     }
   });
 
   it('should preserve Sec-WebSocket-Key through tunnel', async () => {
     const env = await createTestEnv();
-    let wsSocket = null;
     
     try {
       await env.startClient();
       await new Promise(r => setTimeout(r, 200));
       
-      // Create unique key
       const uniqueKey = crypto.randomBytes(16).toString('base64');
       
-      const result = await new Promise((resolve, reject) => {
+      const { res, socket } = await new Promise((resolve, reject) => {
         const req = request({
           hostname: 'localhost',
           port: env.ports.httpPort,
@@ -269,15 +195,9 @@ describe('WebSocket Support', () => {
             'Sec-WebSocket-Key': uniqueKey,
             'Sec-WebSocket-Version': '13'
           }
-        }, (res) => {
-          resolve({ upgraded: false });
-        });
+        }, () => resolve({ res: null, socket: null }));
         
-        req.on('upgrade', (res, socket, head) => {
-          wsSocket = socket;
-          resolve({ upgraded: true, headers: res.headers });
-        });
-        
+        req.on('upgrade', (res, socket) => resolve({ res, socket }));
         req.on('error', reject);
         req.end();
         
@@ -287,14 +207,12 @@ describe('WebSocket Support', () => {
         }, 3000);
       });
       
-      assert.ok(result.upgraded, 'Should upgrade');
-      // Verify accept hash is present (means target received the key)
-      assert.ok(result.headers['sec-websocket-accept'], 'Should have accept header');
+      assert.ok(res, 'Should upgrade');
+      assert.ok(res.headers['sec-websocket-accept'], 'Should have accept header');
+      
+      socket.destroy();
     } finally {
-      if (wsSocket) {
-        wsSocket.destroy();
-        await new Promise(r => setTimeout(r, 100));
-      }
+      await new Promise(r => setTimeout(r, 100));
       await env.cleanup();
     }
   });

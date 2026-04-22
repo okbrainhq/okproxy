@@ -214,23 +214,25 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
           headers: responseHeaders
         })));
 
-        // Handle data from target
+        // Handle data from target - forward RAW BYTES (preserves unmasked server frames)
         let buffer = Buffer.alloc(0);
         
         proxySocket.on('data', (chunk) => {
           buffer = Buffer.concat([buffer, chunk]);
           
-          // Parse complete WebSocket frames and forward
+          // Parse frame boundaries but forward RAW BYTES
           while (buffer.length >= 2) {
-            const frameInfo = parseWebSocketFrame(buffer);
+            const frameInfo = parseWebSocketFrame(buffer, true); // true = boundaries only
             if (!frameInfo) break;
             
-            const { fin, opcode, payload, remaining } = frameInfo;
+            const { frameSize, opcode, remaining } = frameInfo;
+            
+            // Slice the raw frame (preserves original format)
+            const rawFrame = Buffer.from(buffer.subarray(0, frameSize));
             buffer = remaining;
             
-            // Build WebSocket frame and wrap in DATA frame
-            const wsFrame = buildWebSocketFrame(opcode, payload);
-            const canWrite = connection.write(encodeFrame(streamId, FrameType.DATA, wsFrame));
+            // Forward raw frame in DATA frame
+            const canWrite = connection.write(encodeFrame(streamId, FrameType.DATA, rawFrame));
             
             if (!canWrite) {
               proxySocket.pause();
@@ -382,8 +384,11 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
 
   /**
    * Parse WebSocket frame from raw bytes
+   * @param {Buffer} buffer - Raw data
+   * @param {boolean} boundariesOnly - If true, only return frame size/opcode without unmasking
+   * @returns {Object|null} Parsed frame or null if incomplete
    */
-  function parseWebSocketFrame(buffer) {
+  function parseWebSocketFrame(buffer, boundariesOnly = false) {
     if (buffer.length < 2) return null;
     
     const fin = (buffer[0] & 0x80) !== 0;
@@ -405,24 +410,31 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
       offset = 10;
     }
     
-    let maskKey = null;
+    // Account for mask key length if present
     if (masked) {
-      if (buffer.length < offset + 4) return null;
-      maskKey = buffer.subarray(offset, offset + 4);
       offset += 4;
     }
     
-    if (buffer.length < offset + payloadLen) return null;
+    // Check if we have full payload
+    const frameSize = offset + payloadLen;
+    if (buffer.length < frameSize) return null;
     
-    const payload = buffer.subarray(offset, offset + payloadLen);
+    const remaining = buffer.subarray(frameSize);
     
-    if (masked && maskKey) {
+    if (boundariesOnly) {
+      return { frameSize, opcode, remaining };
+    }
+    
+    // Full parsing with unmasking
+    let payload = buffer.subarray(offset - (masked ? 4 : 0), frameSize);
+    
+    if (masked) {
+      const maskKey = buffer.subarray(offset - 4, offset);
+      payload = Buffer.from(payload);
       for (let i = 0; i < payload.length; i++) {
         payload[i] ^= maskKey[i % 4];
       }
     }
-    
-    const remaining = buffer.subarray(offset + payloadLen);
     
     return { fin, opcode, payload, remaining };
   }

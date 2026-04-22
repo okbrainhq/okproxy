@@ -105,10 +105,13 @@ function buildWebSocketFrame(opcode, payload) {
 /**
  * Parse WebSocket frame from browser
  * @param {Buffer} buffer - Raw data from socket
- * @returns {Object|null} Parsed frame {fin, opcode, payload, remaining} or null if incomplete
+ * @param {boolean} boundariesOnly - If true, only return frame size/opcode without unmasking
+ * @returns {Object|null} Parsed frame or null if incomplete
+ *   - boundariesOnly=false: {fin, opcode, payload, remaining}
+ *   - boundariesOnly=true: {frameSize, opcode, remaining}
  */
-function parseWebSocketFrame(buffer) {
-  if (buffer.length < 2) return null; // Need at least 2 bytes
+function parseWebSocketFrame(buffer, boundariesOnly = false) {
+  if (buffer.length < 2) return null;
   
   const fin = (buffer[0] & 0x80) !== 0;
   const opcode = buffer[0] & 0x0f;
@@ -124,7 +127,6 @@ function parseWebSocketFrame(buffer) {
     offset = 4;
   } else if (payloadLen === 127) {
     if (buffer.length < 10) return null;
-    // Read 64-bit length (but we only support 32-bit for now)
     const high = buffer.readUInt32BE(2);
     const low = buffer.readUInt32BE(6);
     if (high !== 0) throw new Error('Payload too large (>4GB)');
@@ -132,33 +134,40 @@ function parseWebSocketFrame(buffer) {
     offset = 10;
   }
   
-  // Mask key (client frames are always masked)
-  let maskKey = null;
+  // Account for mask key length if present
   if (masked) {
-    if (buffer.length < offset + 4) return null;
-    maskKey = buffer.subarray(offset, offset + 4);
     offset += 4;
   }
   
   // Check if we have full payload
-  if (buffer.length < offset + payloadLen) return null;
+  const frameSize = offset + payloadLen;
+  if (buffer.length < frameSize) return null;
   
-  const payload = buffer.subarray(offset, offset + payloadLen);
+  const remaining = buffer.subarray(frameSize);
+  
+  if (boundariesOnly) {
+    // Return frame size and opcode for slicing raw bytes
+    return { frameSize, opcode, remaining };
+  }
+  
+  // Full parsing with unmasking
+  let payload = buffer.subarray(offset - (masked ? 4 : 0), frameSize);
   
   // Unmask if needed
-  if (masked && maskKey) {
+  if (masked) {
+    const maskKey = buffer.subarray(offset - 4, offset);
+    // Create a copy to avoid modifying the original buffer
+    payload = Buffer.from(payload);
     for (let i = 0; i < payload.length; i++) {
       payload[i] ^= maskKey[i % 4];
     }
   }
   
-  const remaining = buffer.subarray(offset + payloadLen);
-  
   return {
     fin,
-    opcode,  // 1=text, 2=binary, 8=close, 9=ping, 10=pong
+    opcode,
     payload,
-    remaining  // Unparsed data for next frame
+    remaining
   };
 }
 
@@ -445,13 +454,10 @@ function createHTTPServer(clientManager, tcpServer, options = {}) {
               ''
             ];
 
-            // Write response
+            // Write response - set flag synchronously before async write
+            upgradeResponseReceived = true;
             socket.write(headerLines.join('\r\n'), (err) => {
-              if (err) {
-                cleanup();
-                return;
-              }
-              upgradeResponseReceived = true;
+              if (err) cleanup();
             });
           } catch (err) {
             console.error('Invalid UPGRADE response:', err.message);
@@ -480,17 +486,20 @@ function createHTTPServer(clientManager, tcpServer, options = {}) {
     socket.on('data', (chunk) => {
       wsBuffer = Buffer.concat([wsBuffer, chunk]);
       
-      // Parse and forward complete frames
+      // Parse frame boundaries but forward RAW BYTES (preserves masking)
+      // RFC 6455 requires client->server frames to be masked
       while (wsBuffer.length >= 2) {
-        const result = parseWebSocketFrame(wsBuffer);
+        const result = parseWebSocketFrame(wsBuffer, true); // true = boundaries only
         if (!result) break; // Need more data
         
-        const { fin, opcode, payload, remaining } = result;
+        const { frameSize, remaining, opcode } = result;
+        
+        // Slice the raw frame (preserves original masking)
+        const rawFrame = Buffer.from(wsBuffer.subarray(0, frameSize));
         wsBuffer = remaining;
         
-        // Build WebSocket frame and wrap in DATA frame
-        const wsFrame = buildWebSocketFrame(opcode, payload);
-        const canWrite = client.write(encodeFrame(streamId, FrameType.DATA, wsFrame));
+        // Forward raw frame in DATA frame
+        const canWrite = client.write(encodeFrame(streamId, FrameType.DATA, rawFrame));
         
         if (!canWrite) {
           // Backpressure - pause reading
@@ -500,9 +509,11 @@ function createHTTPServer(clientManager, tcpServer, options = {}) {
           });
         }
         
-        // Handle close frame - clean up
+        // Handle close frame - forward it and stop reading, but don't cleanup yet.
+        // The target will respond with its own close frame, which flows back:
+        // target → client → DATA → server → browser. Cleanup happens when
+        // the client sends FIN (target closed) or the browser socket closes.
         if (opcode === 0x08) {
-          cleanup();
           return;
         }
       }
