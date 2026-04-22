@@ -45,9 +45,29 @@ function filterRequestHeaders(headers) {
   return filtered;
 }
 
+/**
+ * Filter headers for WebSocket upgrade requests
+ * For WebSocket, we need to preserve Upgrade and Connection headers
+ * @param {Object} headers - Raw headers
+ * @returns {Object} Filtered headers for WebSocket upgrade
+ */
+function filterWebSocketHeaders(headers) {
+  const filtered = {};
+  for (const [key, value] of Object.entries(headers)) {
+    const lowerKey = key.toLowerCase();
+    // For WebSocket, preserve upgrade/connection headers
+    // Strip X-Forwarded headers only
+    if (!X_FORWARDED_HEADERS.has(lowerKey)) {
+      filtered[key] = value;
+    }
+  }
+  return filtered;
+}
+
 function createProxy(connection, targetPort, targetHost = 'localhost', maxStreams = 100) {
   const activeStreams = new Map(); // streamId -> { proxyReq, onDrain }
   const drainListeners = new Map(); // streamId -> onDrain function
+  const activeWebSockets = new Map(); // streamId -> { socket, cleanup }
 
   // Increase max listeners to handle concurrent streams without warnings
   // Each active stream adds a drain listener on the shared socket
@@ -62,10 +82,19 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
       return;
     }
 
+    // Handle WebSocket streams
+    if (activeWebSockets.has(frame.streamId)) {
+      handleWebSocketFrame(frame);
+      return;
+    }
+
     // Handle server frames
     if (frame.type === FrameType.HEADERS) {
       // New request from server
       startProxyRequest(frame.streamId, frame.payload);
+    } else if (frame.type === FrameType.UPGRADE) {
+      // WebSocket upgrade request
+      startWebSocketProxy(frame.streamId, frame.payload);
     } else if (frame.type === FrameType.DATA) {
       // Body chunk from server
       const proxyReq = activeStreams.get(frame.streamId);
@@ -88,6 +117,162 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
         proxyReq.destroy();
         activeStreams.delete(frame.streamId);
       }
+    }
+  }
+
+  function handleWebSocketFrame(frame) {
+    const wsState = activeWebSockets.get(frame.streamId);
+    if (!wsState) return;
+
+    if (frame.type === FrameType.DATA) {
+      // Forward WebSocket frame to target
+      // frame.payload contains the raw WebSocket frame
+      const canWrite = wsState.socket.write(frame.payload);
+      if (!canWrite) {
+        // Backpressure
+        wsState.socket.pause();
+        connection.socket.once('drain', () => {
+          wsState.socket.resume();
+        });
+      }
+    } else if (frame.type === FrameType.FIN) {
+      // Server signaled end - close WebSocket
+      wsState.cleanup();
+    } else if (frame.type === FrameType.ERROR) {
+      wsState.cleanup();
+    }
+  }
+
+  function startWebSocketProxy(streamId, payload) {
+    try {
+      const upgradeInfo = JSON.parse(payload.toString());
+      
+      if (upgradeInfo.protocol !== 'websocket') {
+        connection.write(encodeFrame(streamId, FrameType.ERROR, Buffer.from('Unsupported protocol')));
+        return;
+      }
+
+      // For WebSocket, preserve original headers including Upgrade/Connection
+      const proxyHeaders = filterWebSocketHeaders(upgradeInfo.headers);
+      proxyHeaders.host = `${targetHost}:${targetPort}`;
+
+      // Set authoritative X-Forwarded-For
+      if (upgradeInfo.remoteAddress) {
+        proxyHeaders['x-forwarded-for'] = upgradeInfo.remoteAddress;
+      }
+
+      const proxyReq = request({
+        hostname: targetHost,
+        port: targetPort,
+        method: upgradeInfo.method,
+        path: upgradeInfo.path,
+        headers: proxyHeaders
+      });
+
+      let cleanupCalled = false;
+
+      function cleanup() {
+        if (cleanupCalled) return;
+        cleanupCalled = true;
+        
+        activeWebSockets.delete(streamId);
+        
+        if (wsState.socket && !wsState.socket.destroyed) {
+          wsState.socket.destroy();
+        }
+        
+        // Signal to server that stream is done
+        connection.write(encodeFrame(streamId, FrameType.FIN, Buffer.alloc(0)));
+      }
+
+      const wsState = {
+        socket: null,
+        cleanup
+      };
+
+      proxyReq.on('upgrade', (proxyRes, proxySocket, proxyHead) => {
+        // Target accepted upgrade
+        wsState.socket = proxySocket;
+        activeWebSockets.set(streamId, wsState);
+
+        // Send target's response back to server
+        const responseHeaders = {
+          upgrade: proxyRes.headers.upgrade || 'websocket',
+          connection: proxyRes.headers.connection || 'Upgrade',
+          'sec-websocket-accept': proxyRes.headers['sec-websocket-accept']
+        };
+
+        // Forward any other relevant headers
+        for (const [key, value] of Object.entries(proxyRes.headers)) {
+          if (!responseHeaders[key]) {
+            responseHeaders[key] = value;
+          }
+        }
+
+        connection.write(encodeFrame(streamId, FrameType.UPGRADE, JSON.stringify({
+          status: 101,
+          headers: responseHeaders
+        })));
+
+        // Handle data from target - forward RAW BYTES (preserves unmasked server frames)
+        let buffer = Buffer.alloc(0);
+        
+        proxySocket.on('data', (chunk) => {
+          buffer = Buffer.concat([buffer, chunk]);
+          
+          // Parse frame boundaries but forward RAW BYTES
+          while (buffer.length >= 2) {
+            const frameInfo = parseWebSocketFrame(buffer, true); // true = boundaries only
+            if (!frameInfo) break;
+            
+            const { frameSize, opcode, remaining } = frameInfo;
+            
+            // Slice the raw frame (preserves original format)
+            const rawFrame = Buffer.from(buffer.subarray(0, frameSize));
+            buffer = remaining;
+            
+            // Forward raw frame in DATA frame
+            const canWrite = connection.write(encodeFrame(streamId, FrameType.DATA, rawFrame));
+            
+            if (!canWrite) {
+              proxySocket.pause();
+              connection.socket.once('drain', () => {
+                proxySocket.resume();
+              });
+            }
+            
+            // Handle close from target
+            if (opcode === 0x08) {
+              cleanup();
+              return;
+            }
+          }
+        });
+
+        proxySocket.on('close', () => {
+          if (!cleanupCalled) {
+            cleanup();
+          }
+        });
+
+        proxySocket.on('error', (err) => {
+          console.error('WebSocket target error:', err.message);
+          cleanup();
+        });
+      });
+
+      proxyReq.on('error', (err) => {
+        console.error('WebSocket upgrade request error:', err.message);
+        connection.write(encodeFrame(streamId, FrameType.ERROR, Buffer.from('Upgrade failed')));
+      });
+
+      // No response means upgrade was successful (handled by 'upgrade' event)
+      // We need to explicitly end the request to trigger the upgrade
+      proxyReq.end();
+
+    } catch (err) {
+      console.error('Invalid UPGRADE payload:', err.message);
+      connection.write(encodeFrame(streamId, FrameType.ERROR, Buffer.from('Invalid upgrade request')));
     }
   }
 
@@ -197,7 +382,100 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
     }
   }
 
+  /**
+   * Parse WebSocket frame from raw bytes
+   * @param {Buffer} buffer - Raw data
+   * @param {boolean} boundariesOnly - If true, only return frame size/opcode without unmasking
+   * @returns {Object|null} Parsed frame or null if incomplete
+   */
+  function parseWebSocketFrame(buffer, boundariesOnly = false) {
+    if (buffer.length < 2) return null;
+    
+    const fin = (buffer[0] & 0x80) !== 0;
+    const opcode = buffer[0] & 0x0f;
+    const masked = (buffer[1] & 0x80) !== 0;
+    let payloadLen = buffer[1] & 0x7f;
+    
+    let offset = 2;
+    
+    if (payloadLen === 126) {
+      if (buffer.length < 4) return null;
+      payloadLen = buffer.readUInt16BE(2);
+      offset = 4;
+    } else if (payloadLen === 127) {
+      if (buffer.length < 10) return null;
+      const high = buffer.readUInt32BE(2);
+      if (high !== 0) return null;
+      payloadLen = buffer.readUInt32BE(6);
+      offset = 10;
+    }
+    
+    // Account for mask key length if present
+    if (masked) {
+      offset += 4;
+    }
+    
+    // Check if we have full payload
+    const frameSize = offset + payloadLen;
+    if (buffer.length < frameSize) return null;
+    
+    const remaining = buffer.subarray(frameSize);
+    
+    if (boundariesOnly) {
+      return { frameSize, opcode, remaining };
+    }
+    
+    // Full parsing with unmasking
+    let payload = buffer.subarray(offset - (masked ? 4 : 0), frameSize);
+    
+    if (masked) {
+      const maskKey = buffer.subarray(offset - 4, offset);
+      payload = Buffer.from(payload);
+      for (let i = 0; i < payload.length; i++) {
+        payload[i] ^= maskKey[i % 4];
+      }
+    }
+    
+    return { fin, opcode, payload, remaining };
+  }
+
+  /**
+   * Build WebSocket frame
+   */
+  function buildWebSocketFrame(opcode, payload) {
+    const payloadLen = payload.length;
+    let frame;
+    
+    if (payloadLen < 126) {
+      frame = Buffer.allocUnsafe(2 + payloadLen);
+      frame[0] = 0x80 | opcode;
+      frame[1] = payloadLen;
+      payload.copy(frame, 2);
+    } else if (payloadLen < 65536) {
+      frame = Buffer.allocUnsafe(4 + payloadLen);
+      frame[0] = 0x80 | opcode;
+      frame[1] = 126;
+      frame.writeUInt16BE(payloadLen, 2);
+      payload.copy(frame, 4);
+    } else {
+      frame = Buffer.allocUnsafe(10 + payloadLen);
+      frame[0] = 0x80 | opcode;
+      frame[1] = 127;
+      frame.writeUInt32BE(0, 2);
+      frame.writeUInt32BE(payloadLen, 6);
+      payload.copy(frame, 10);
+    }
+    
+    return frame;
+  }
+
   function destroy() {
+    // Clean up all WebSocket connections
+    for (const [streamId, wsState] of activeWebSockets) {
+      wsState.cleanup();
+    }
+    activeWebSockets.clear();
+
     // Clean up all drain listeners from the socket
     const connectionSocket = connection.socket;
     for (const [streamId, onDrain] of drainListeners) {

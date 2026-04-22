@@ -113,12 +113,11 @@ function createTLSConnection(config, onFrame, onConnect, onDisconnect) {
       clearTimeout(connectionTimeout);
       initialized = false;
       stopWatchdog();
-      const wasConnected = reconnectAttempts === 0;
-      if (wasConnected) {
-        console.log(`[${new Date().toISOString()}] Connection lost, will reconnect...`);
-      }
       if (onDisconnect) onDisconnect();
-      if (!destroyed) scheduleReconnect();
+      if (!destroyed) {
+        console.log(`[${new Date().toISOString()}] Connection lost, will reconnect...`);
+        scheduleReconnect();
+      }
     });
   }
 

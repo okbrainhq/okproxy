@@ -19,6 +19,18 @@ const HOP_BY_HOP_HEADERS = new Set([
 ]);
 
 /**
+ * Detect WebSocket upgrade request
+ * @param {Object} req - HTTP request object
+ * @returns {boolean} True if this is a WebSocket upgrade request
+ */
+function isWebSocketUpgrade(req) {
+  const upgrade = req.headers.upgrade?.toLowerCase();
+  const connection = req.headers.connection?.toLowerCase();
+  return upgrade === 'websocket' && 
+         (connection === 'upgrade' || connection?.includes('upgrade'));
+}
+
+/**
  * Filter hop-by-hop headers from response headers
  * @param {Object} headers - Raw headers from target
  * @returns {Object} Filtered headers safe to send to client
@@ -52,6 +64,111 @@ function sanitizeRequestHeaders(headers) {
     // Skip non-string, non-array values (shouldn't happen with Node.js HTTP parser)
   }
   return sanitized;
+}
+
+/**
+ * Build WebSocket frame for sending to browser
+ * @param {number} opcode - WebSocket opcode (1=text, 2=binary, 8=close, 9=ping, 10=pong)
+ * @param {Buffer} payload - Frame payload
+ * @returns {Buffer} WebSocket frame
+ */
+function buildWebSocketFrame(opcode, payload) {
+  const payloadLen = payload.length;
+  let frame;
+  
+  if (payloadLen < 126) {
+    // Small payload: 2 byte header + payload
+    frame = Buffer.allocUnsafe(2 + payloadLen);
+    frame[0] = 0x80 | opcode; // FIN=1, opcode
+    frame[1] = payloadLen;
+    payload.copy(frame, 2);
+  } else if (payloadLen < 65536) {
+    // Medium payload: 4 byte header + payload
+    frame = Buffer.allocUnsafe(4 + payloadLen);
+    frame[0] = 0x80 | opcode;
+    frame[1] = 126;
+    frame.writeUInt16BE(payloadLen, 2);
+    payload.copy(frame, 4);
+  } else {
+    // Large payload: 10 byte header + payload (up to 4GB)
+    frame = Buffer.allocUnsafe(10 + payloadLen);
+    frame[0] = 0x80 | opcode;
+    frame[1] = 127;
+    frame.writeUInt32BE(0, 2); // High 32 bits = 0
+    frame.writeUInt32BE(payloadLen, 6); // Low 32 bits
+    payload.copy(frame, 10);
+  }
+  
+  return frame;
+}
+
+/**
+ * Parse WebSocket frame from browser
+ * @param {Buffer} buffer - Raw data from socket
+ * @param {boolean} boundariesOnly - If true, only return frame size/opcode without unmasking
+ * @returns {Object|null} Parsed frame or null if incomplete
+ *   - boundariesOnly=false: {fin, opcode, payload, remaining}
+ *   - boundariesOnly=true: {frameSize, opcode, remaining}
+ */
+function parseWebSocketFrame(buffer, boundariesOnly = false) {
+  if (buffer.length < 2) return null;
+  
+  const fin = (buffer[0] & 0x80) !== 0;
+  const opcode = buffer[0] & 0x0f;
+  const masked = (buffer[1] & 0x80) !== 0;
+  let payloadLen = buffer[1] & 0x7f;
+  
+  let offset = 2;
+  
+  // Extended payload length
+  if (payloadLen === 126) {
+    if (buffer.length < 4) return null;
+    payloadLen = buffer.readUInt16BE(2);
+    offset = 4;
+  } else if (payloadLen === 127) {
+    if (buffer.length < 10) return null;
+    const high = buffer.readUInt32BE(2);
+    const low = buffer.readUInt32BE(6);
+    if (high !== 0) throw new Error('Payload too large (>4GB)');
+    payloadLen = low;
+    offset = 10;
+  }
+  
+  // Account for mask key length if present
+  if (masked) {
+    offset += 4;
+  }
+  
+  // Check if we have full payload
+  const frameSize = offset + payloadLen;
+  if (buffer.length < frameSize) return null;
+  
+  const remaining = buffer.subarray(frameSize);
+  
+  if (boundariesOnly) {
+    // Return frame size and opcode for slicing raw bytes
+    return { frameSize, opcode, remaining };
+  }
+  
+  // Full parsing with unmasking
+  let payload = buffer.subarray(offset - (masked ? 4 : 0), frameSize);
+  
+  // Unmask if needed
+  if (masked) {
+    const maskKey = buffer.subarray(offset - 4, offset);
+    // Create a copy to avoid modifying the original buffer
+    payload = Buffer.from(payload);
+    for (let i = 0; i < payload.length; i++) {
+      payload[i] ^= maskKey[i % 4];
+    }
+  }
+  
+  return {
+    fin,
+    opcode,
+    payload,
+    remaining
+  };
 }
 
 function createHTTPServer(clientManager, tcpServer, options = {}) {
@@ -257,7 +374,169 @@ function createHTTPServer(clientManager, tcpServer, options = {}) {
     });
   });
 
+  // Handle WebSocket upgrade events
+  server.on('upgrade', (req, socket, head) => {
+    const client = clientManager.get();
+    if (!client) {
+      socket.destroy();
+      return;
+    }
+
+    // Check max concurrent streams
+    if (client.activeStreams && client.activeStreams.size >= maxStreams) {
+      socket.destroy();
+      return;
+    }
+
+    // Verify this is actually a WebSocket upgrade
+    if (!isWebSocketUpgrade(req)) {
+      socket.destroy();
+      return;
+    }
+
+    const streamId = tcpServer.allocateStreamId();
+
+    // Increase max listeners
+    client.socket.setMaxListeners(maxStreams + 10);
+    const clientSocket = client.socket;
+
+    // Send UPGRADE frame to client with original request info
+    const upgradePayload = JSON.stringify({
+      protocol: 'websocket',
+      method: req.method,
+      path: req.url,
+      headers: sanitizeRequestHeaders(req.headers)
+    });
+
+    const canWrite = client.write(encodeFrame(streamId, FrameType.UPGRADE, upgradePayload));
+    if (!canWrite) {
+      // If we can't write, clean up and destroy socket
+      tcpServer.releaseStreamId(streamId);
+      socket.destroy();
+      return;
+    }
+
+    // WebSocket frame buffer for parsing
+    let wsBuffer = Buffer.alloc(0);
+    let upgradeResponseReceived = false;
+    let cleanupCalled = false;
+
+    function cleanup() {
+      if (cleanupCalled) return;
+      cleanupCalled = true;
+      clientManager.unregisterStream(streamId);
+      tcpServer.releaseStreamId(streamId);
+      socket.destroy();
+    }
+
+    // Register stream handler for client's response
+    clientManager.registerStream(streamId, {
+      frameHandler: (frame) => {
+        if (frame.type === FrameType.UPGRADE) {
+          // Client is sending the target's upgrade response
+          try {
+            const response = JSON.parse(frame.payload.toString());
+            
+            if (response.status !== 101) {
+              // Upgrade rejected
+              cleanup();
+              return;
+            }
+
+            // Send 101 response to browser
+            const headers = response.headers || {};
+            const headerLines = [
+              'HTTP/1.1 101 Switching Protocols',
+              `Upgrade: ${headers.upgrade || 'websocket'}`,
+              `Connection: ${headers.connection || 'Upgrade'}`,
+              `Sec-WebSocket-Accept: ${headers['sec-websocket-accept'] || ''}`,
+              '',
+              ''
+            ];
+
+            // Write response - set flag synchronously before async write
+            upgradeResponseReceived = true;
+            socket.write(headerLines.join('\r\n'), (err) => {
+              if (err) cleanup();
+            });
+          } catch (err) {
+            console.error('Invalid UPGRADE response:', err.message);
+            cleanup();
+          }
+        } else if (frame.type === FrameType.DATA && upgradeResponseReceived) {
+          // Forward WebSocket frame to browser
+          // frame.payload is already a WebSocket frame from the target
+          socket.write(frame.payload, (err) => {
+            if (err) cleanup();
+          });
+        } else if (frame.type === FrameType.FIN) {
+          // Client signaled end - close browser connection
+          cleanup();
+        } else if (frame.type === FrameType.ERROR) {
+          cleanup();
+        }
+      },
+      errorHandler: (err) => {
+        console.error('WebSocket stream error:', err.message);
+        cleanup();
+      }
+    });
+
+    // Handle WebSocket frames from browser
+    socket.on('data', (chunk) => {
+      wsBuffer = Buffer.concat([wsBuffer, chunk]);
+      
+      // Parse frame boundaries but forward RAW BYTES (preserves masking)
+      // RFC 6455 requires client->server frames to be masked
+      while (wsBuffer.length >= 2) {
+        const result = parseWebSocketFrame(wsBuffer, true); // true = boundaries only
+        if (!result) break; // Need more data
+        
+        const { frameSize, remaining, opcode } = result;
+        
+        // Slice the raw frame (preserves original masking)
+        const rawFrame = Buffer.from(wsBuffer.subarray(0, frameSize));
+        wsBuffer = remaining;
+        
+        // Forward raw frame in DATA frame
+        const canWrite = client.write(encodeFrame(streamId, FrameType.DATA, rawFrame));
+        
+        if (!canWrite) {
+          // Backpressure - pause reading
+          socket.pause();
+          clientSocket.once('drain', () => {
+            socket.resume();
+          });
+        }
+        
+        // Handle close frame - forward it and stop reading, but don't cleanup yet.
+        // The target will respond with its own close frame, which flows back:
+        // target → client → DATA → server → browser. Cleanup happens when
+        // the client sends FIN (target closed) or the browser socket closes.
+        if (opcode === 0x08) {
+          return;
+        }
+      }
+    });
+
+    socket.on('close', () => {
+      if (!cleanupCalled) {
+        // Browser closed - signal to client
+        client.write(encodeFrame(streamId, FrameType.FIN, Buffer.alloc(0)));
+        cleanup();
+      }
+    });
+
+    socket.on('error', (err) => {
+      console.error('WebSocket socket error:', err.message);
+      cleanup();
+    });
+
+    // No stream timeout for WebSocket streams - they're long-lived
+    // Connection health is managed via WebSocket ping/pong or TLS keepalive
+  });
+
   return server;
 }
 
-module.exports = { createHTTPServer };
+module.exports = { createHTTPServer, isWebSocketUpgrade, buildWebSocketFrame, parseWebSocketFrame };

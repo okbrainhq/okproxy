@@ -11,7 +11,8 @@ const FrameType = {
   ERROR: 0x04,
   INIT: 0x05,
   PING: 0x06,
-  PONG: 0x07
+  PONG: 0x07,
+  UPGRADE: 0x08  // WebSocket protocol upgrade
 };
 
 /**
