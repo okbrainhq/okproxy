@@ -197,6 +197,7 @@ function createHTTPServer(clientManager, tcpServer, options = {}) {
   const server = createServer((req, res) => {
     const client = clientManager.get();
     if (!client) {
+      console.error(`[502] No tunnel client connected for ${req.method} ${req.url} from ${req.socket.remoteAddress}`);
       res.statusCode = 502;
       res.end('Tunnel client not connected');
       return;
@@ -204,6 +205,7 @@ function createHTTPServer(clientManager, tcpServer, options = {}) {
 
     // Check max concurrent streams atomically during registration
     if (client.activeStreams && client.activeStreams.size >= maxStreams) {
+      console.error(`[503] Max concurrent streams exceeded (${client.activeStreams.size}/${maxStreams}) for ${req.method} ${req.url}`);
       res.statusCode = 503;
       res.end('Max concurrent streams exceeded');
       return;
@@ -249,6 +251,7 @@ function createHTTPServer(clientManager, tcpServer, options = {}) {
       bodySize += chunk.length;
       if (bodySize > maxBodySize) {
         // Body size exceeded - abort request
+        console.error(`[413] Request body too large: ${bodySize} bytes (max: ${maxBodySize}) for stream ${streamId}`);
         cleanup();
         if (!res.writableEnded) {
           res.statusCode = 413; // Payload Too Large
@@ -284,6 +287,7 @@ function createHTTPServer(clientManager, tcpServer, options = {}) {
 
     // Set up stream timeout
     let streamTimer = setTimeout(() => {
+      console.error(`[504] Stream timeout for ${req.method} ${req.url} (stream ${streamId}, client ${clientIp})`);
       client.write(encodeFrame(streamId, FrameType.ERROR, Buffer.from('Stream timeout')));
       cleanup();
       if (!res.writableEnded) {
@@ -295,6 +299,7 @@ function createHTTPServer(clientManager, tcpServer, options = {}) {
     function resetStreamTimeout() {
       clearTimeout(streamTimer);
       streamTimer = setTimeout(() => {
+        console.error(`[504] Stream timeout (reset) for ${req.method} ${req.url} (stream ${streamId}, client ${clientIp})`);
         client.write(encodeFrame(streamId, FrameType.ERROR, Buffer.from('Stream timeout')));
         cleanup();
         if (!res.writableEnded) {
@@ -363,6 +368,8 @@ function createHTTPServer(clientManager, tcpServer, options = {}) {
             res.end();
           }
         } else if (frame.type === FrameType.ERROR) {
+          const errorMsg = frame.payload?.toString() || 'Unknown error';
+          console.error(`[502] Client sent ERROR frame for ${req.method} ${req.url} (stream ${streamId}): ${errorMsg}`);
           cleanup();
           if (!res.writableEnded) {
             res.statusCode = 502;
@@ -373,7 +380,7 @@ function createHTTPServer(clientManager, tcpServer, options = {}) {
       },
       errorHandler: (err) => {
         // Log error internally but don't leak details to client
-        console.error('Stream error:', err.message);
+        console.error(`[502] Stream error for ${req.method} ${req.url} (stream ${streamId}):`, err.message);
         cleanup();
         if (!res.writableEnded) {
           res.statusCode = 502;
@@ -387,6 +394,7 @@ function createHTTPServer(clientManager, tcpServer, options = {}) {
     res.on('close', () => {
       if (!res.writableEnded) {
         // Client closed connection early
+        console.error(`[INFO] Client closed connection early for ${req.method} ${req.url} (stream ${streamId})`);
         cleanup();
       }
     });

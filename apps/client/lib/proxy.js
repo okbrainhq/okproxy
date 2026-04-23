@@ -387,15 +387,16 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
         });
 
         proxySocket.on('error', (err) => {
-          console.error('WebSocket target error:', err.message);
+          console.error(`[CLIENT WS ERROR] WebSocket target error:`, err.message, `(code: ${err.code || 'none'})`);
           cleanup();
         });
       });
 
       proxyReq.on('error', (err) => {
         if (upgradeTimeoutTriggered) return;
-        console.error('WebSocket upgrade request error:', err.message);
-        connection.write(encodeFrame(streamId, FrameType.ERROR, Buffer.from('Upgrade failed')));
+        console.error(`[CLIENT WS ERROR] WebSocket upgrade failed for ${upgradeInfo.path}:`, err.message, `(code: ${err.code || 'none'})`);
+        const errorDetail = err.code ? `Upgrade failed: ${err.code}` : 'Upgrade failed';
+        connection.write(encodeFrame(streamId, FrameType.ERROR, Buffer.from(errorDetail)));
       });
 
       // No response means upgrade was successful (handled by 'upgrade' event)
@@ -477,10 +478,12 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
         });
 
         proxyRes.on('error', (err) => {
+          console.error(`[CLIENT ERROR] Target response error for ${reqInfo.method} ${reqInfo.path}:`, err.message, `(code: ${err.code || 'none'})`);
           connectionSocket.removeListener('drain', onDrain);
           drainListeners.delete(streamId);
-          // Use generic error message to avoid leaking internal details to server
-          connection.write(encodeFrame(streamId, FrameType.ERROR, Buffer.from('Target error')));
+          // Include error code in message for debugging
+          const errorDetail = err.code ? `Target error: ${err.code}` : 'Target error';
+          connection.write(encodeFrame(streamId, FrameType.ERROR, Buffer.from(errorDetail)));
           activeStreams.delete(streamId);
         });
       });
@@ -489,6 +492,7 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
 
       // Handle errors
       proxyReq.on('error', (err) => {
+        console.error(`[CLIENT ERROR] Target error for ${reqInfo.method} ${reqInfo.path}:`, err.message, `(code: ${err.code || 'none'})`);
         // Check if it's a connection refused error
         if (err.code === 'ECONNREFUSED') {
           connection.write(encodeFrame(streamId, FrameType.HEADERS, JSON.stringify({
@@ -497,8 +501,9 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
           })));
           connection.write(encodeFrame(streamId, FrameType.DATA, Buffer.from('Target service not available')));
         } else {
-          // Use generic error message to avoid leaking internal details to server
-          connection.write(encodeFrame(streamId, FrameType.ERROR, Buffer.from('Target error')));
+          // Include error code in message for debugging (safe - no sensitive data)
+          const errorDetail = err.code ? `Target error: ${err.code}` : 'Target error';
+          connection.write(encodeFrame(streamId, FrameType.ERROR, Buffer.from(errorDetail)));
         }
         activeStreams.delete(streamId);
       });
