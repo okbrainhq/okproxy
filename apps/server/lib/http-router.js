@@ -5,6 +5,21 @@ const { encodeFrame, FrameType, MAX_FRAME_SIZE } = require('../../../packages/fr
 
 const STREAM_TIMEOUT = 30000; // 30 seconds
 const DEFAULT_MAX_BODY_SIZE = 10 * 1024 * 1024; // 10MB default
+const MAX_WS_BUFFER_SIZE = 16 * 1024 * 1024; // 16MB max WebSocket buffer to prevent OOM
+
+// Common HTTP status texts for error responses
+const STATUS_TEXTS = {
+  400: 'Bad Request',
+  403: 'Forbidden',
+  404: 'Not Found',
+  502: 'Bad Gateway',
+  503: 'Service Unavailable',
+  504: 'Gateway Timeout'
+};
+
+function getStatusText(code) {
+  return STATUS_TEXTS[code] || 'Error';
+}
 
 // Hop-by-hop headers that should not be forwarded (RFC 2616)
 const HOP_BY_HOP_HEADERS = new Set([
@@ -128,9 +143,8 @@ function parseWebSocketFrame(buffer, boundariesOnly = false) {
   } else if (payloadLen === 127) {
     if (buffer.length < 10) return null;
     const high = buffer.readUInt32BE(2);
-    const low = buffer.readUInt32BE(6);
-    if (high !== 0) throw new Error('Payload too large (>4GB)');
-    payloadLen = low;
+    if (high !== 0) return null; // Payload too large (>4GB)
+    payloadLen = buffer.readUInt32BE(6);
     offset = 10;
   }
   
@@ -151,7 +165,7 @@ function parseWebSocketFrame(buffer, boundariesOnly = false) {
   }
   
   // Full parsing with unmasking
-  let payload = buffer.subarray(offset - (masked ? 4 : 0), frameSize);
+  let payload = buffer.subarray(offset, frameSize);
   
   // Unmask if needed
   if (masked) {
@@ -174,7 +188,11 @@ function parseWebSocketFrame(buffer, boundariesOnly = false) {
 function createHTTPServer(clientManager, tcpServer, options = {}) {
   const streamTimeout = options.streamTimeout || STREAM_TIMEOUT;
   const maxStreams = options.maxConcurrentStreams || 100;
+  const maxWebSocketStreams = options.maxWebSocketStreams || 50; // Separate cap for WS
   const maxBodySize = options.maxBodySize || DEFAULT_MAX_BODY_SIZE;
+
+  // Track WebSocket connections separately from HTTP streams
+  const activeWebSockets = new Set();
 
   const server = createServer((req, res) => {
     const client = clientManager.get();
@@ -382,22 +400,31 @@ function createHTTPServer(clientManager, tcpServer, options = {}) {
       return;
     }
 
-    // Check max concurrent streams
-    if (client.activeStreams && client.activeStreams.size >= maxStreams) {
+    // Re-inject any early data received during upgrade handshake (bug #19 fix)
+    // The 'head' buffer may contain early WebSocket frames from fast clients/pipelining
+    let headBuffer = head && head.length > 0 ? head : Buffer.alloc(0);
+
+    // Check max WebSocket concurrent streams (separate from HTTP)
+    if (activeWebSockets.size >= maxWebSocketStreams) {
+      socket.write('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n');
       socket.destroy();
       return;
     }
 
     // Verify this is actually a WebSocket upgrade
     if (!isWebSocketUpgrade(req)) {
+      socket.write('HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n');
       socket.destroy();
       return;
     }
 
     const streamId = tcpServer.allocateStreamId();
 
+    // Track this WebSocket connection
+    activeWebSockets.add(streamId);
+
     // Increase max listeners
-    client.socket.setMaxListeners(maxStreams + 10);
+    client.socket.setMaxListeners(maxStreams + maxWebSocketStreams + 10);
     const clientSocket = client.socket;
 
     // Send UPGRADE frame to client with original request info
@@ -416,34 +443,69 @@ function createHTTPServer(clientManager, tcpServer, options = {}) {
       return;
     }
 
-    // WebSocket frame buffer for parsing
+    // WebSocket frame buffer for parsing (browser -> target)
     let wsBuffer = Buffer.alloc(0);
+    // Buffer for reassembling fragmented frames (target -> browser)
+    let targetToBrowserBuffer = Buffer.alloc(0);
     let upgradeResponseReceived = false;
     let cleanupCalled = false;
+    let closeFramePending = false;
+    const WS_IDLE_TIMEOUT = 300000; // 5 minutes
+    let idleTimer = null;
+
+    function resetIdleTimer() {
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        if (!cleanupCalled) {
+          if (upgradeResponseReceived) {
+            const closeFrame = buildWebSocketFrame(0x08, Buffer.from([0x03, 0xe9]));
+            socket.write(closeFrame, (err) => {
+              cleanup();
+            });
+          } else {
+            cleanup();
+          }
+        }
+      }, WS_IDLE_TIMEOUT);
+    }
 
     function cleanup() {
       if (cleanupCalled) return;
       cleanupCalled = true;
+      if (idleTimer) clearTimeout(idleTimer);
+      activeWebSockets.delete(streamId);
       clientManager.unregisterStream(streamId);
       tcpServer.releaseStreamId(streamId);
       socket.destroy();
     }
 
+    resetIdleTimer();
+
     // Register stream handler for client's response
     clientManager.registerStream(streamId, {
       frameHandler: (frame) => {
         if (frame.type === FrameType.UPGRADE) {
-          // Client is sending the target's upgrade response
+          resetIdleTimer();
           try {
             const response = JSON.parse(frame.payload.toString());
             
             if (response.status !== 101) {
-              // Upgrade rejected
-              cleanup();
+              const errorStatus = response.status || 502;
+              const errorHeaders = response.headers || {};
+              const errorBody = errorHeaders['content-length'] ? '' : `WebSocket upgrade failed: ${errorStatus}\r\n`;
+              const headerLines = [
+                `HTTP/1.1 ${errorStatus} ${getStatusText(errorStatus)}`,
+                'Connection: close',
+                `Content-Length: ${Buffer.byteLength(errorBody)}`,
+                '',
+                ''
+              ];
+              socket.write(headerLines.join('\r\n') + errorBody, (err) => {
+                cleanup();
+              });
               return;
             }
 
-            // Send 101 response to browser
             const headers = response.headers || {};
             const headerLines = [
               'HTTP/1.1 101 Switching Protocols',
@@ -454,7 +516,6 @@ function createHTTPServer(clientManager, tcpServer, options = {}) {
               ''
             ];
 
-            // Write response - set flag synchronously before async write
             upgradeResponseReceived = true;
             socket.write(headerLines.join('\r\n'), (err) => {
               if (err) cleanup();
@@ -464,14 +525,46 @@ function createHTTPServer(clientManager, tcpServer, options = {}) {
             cleanup();
           }
         } else if (frame.type === FrameType.DATA && upgradeResponseReceived) {
-          // Forward WebSocket frame to browser
-          // frame.payload is already a WebSocket frame from the target
-          socket.write(frame.payload, (err) => {
-            if (err) cleanup();
-          });
+          resetIdleTimer();
+
+          targetToBrowserBuffer = Buffer.concat([targetToBrowserBuffer, frame.payload]);
+
+          while (targetToBrowserBuffer.length >= 2 && !closeFramePending) {
+            const result = parseWebSocketFrame(targetToBrowserBuffer, true);
+            if (!result) break;
+
+            const { frameSize, opcode, remaining } = result;
+
+            const completeFrame = targetToBrowserBuffer.subarray(0, frameSize);
+            targetToBrowserBuffer = remaining;
+
+            const isCloseFrame = opcode === 0x08;
+            if (isCloseFrame) {
+              closeFramePending = true;
+            }
+
+            socket.write(completeFrame, (err) => {
+              if (err) {
+                cleanup();
+              } else if (isCloseFrame) {
+                cleanup();
+              }
+            });
+
+            if (isCloseFrame) {
+              break;
+            }
+          }
+
+          if (targetToBrowserBuffer.length > MAX_WS_BUFFER_SIZE) {
+            console.error('WebSocket reassembly buffer overflow - closing connection');
+            cleanup();
+            return;
+          }
         } else if (frame.type === FrameType.FIN) {
-          // Client signaled end - close browser connection
-          cleanup();
+          if (!closeFramePending) {
+            cleanup();
+          }
         } else if (frame.type === FrameType.ERROR) {
           cleanup();
         }
@@ -483,36 +576,70 @@ function createHTTPServer(clientManager, tcpServer, options = {}) {
     });
 
     // Handle WebSocket frames from browser
+    let pendingLargeFrame = null;
+    let pendingOffset = 0;
+    let headBufferConsumed = false;
+
+    function sendLargeFrameChunk() {
+      while (pendingOffset < pendingLargeFrame.length) {
+        const end = Math.min(pendingOffset + MAX_FRAME_SIZE, pendingLargeFrame.length);
+        const chunk = pendingLargeFrame.subarray(pendingOffset, end);
+        const canWrite = client.write(encodeFrame(streamId, FrameType.DATA, chunk));
+        if (!canWrite) {
+          socket.pause();
+          pendingOffset = end;
+          clientSocket.once('drain', sendLargeFrameChunk);
+          return;
+        }
+        pendingOffset = end;
+      }
+      pendingLargeFrame = null;
+      pendingOffset = 0;
+      socket.resume();
+    }
+
     socket.on('data', (chunk) => {
+      resetIdleTimer();
+
+      if (!headBufferConsumed && headBuffer.length > 0) {
+        chunk = Buffer.concat([headBuffer, chunk]);
+        headBuffer = Buffer.alloc(0);
+        headBufferConsumed = true;
+      }
+
+      if (wsBuffer.length + chunk.length > MAX_WS_BUFFER_SIZE) {
+        console.error('WebSocket buffer overflow - destroying connection');
+        cleanup();
+        return;
+      }
       wsBuffer = Buffer.concat([wsBuffer, chunk]);
-      
-      // Parse frame boundaries but forward RAW BYTES (preserves masking)
-      // RFC 6455 requires client->server frames to be masked
+
       while (wsBuffer.length >= 2) {
-        const result = parseWebSocketFrame(wsBuffer, true); // true = boundaries only
-        if (!result) break; // Need more data
-        
+        if (pendingLargeFrame) break;
+
+        const result = parseWebSocketFrame(wsBuffer, true);
+        if (!result) break;
+
         const { frameSize, remaining, opcode } = result;
-        
-        // Slice the raw frame (preserves original masking)
+
         const rawFrame = Buffer.from(wsBuffer.subarray(0, frameSize));
         wsBuffer = remaining;
-        
-        // Forward raw frame in DATA frame
-        const canWrite = client.write(encodeFrame(streamId, FrameType.DATA, rawFrame));
-        
-        if (!canWrite) {
-          // Backpressure - pause reading
-          socket.pause();
-          clientSocket.once('drain', () => {
-            socket.resume();
-          });
+
+        if (rawFrame.length <= MAX_FRAME_SIZE) {
+          const canWrite = client.write(encodeFrame(streamId, FrameType.DATA, rawFrame));
+          if (!canWrite) {
+            socket.pause();
+            clientSocket.once('drain', () => {
+              socket.resume();
+            });
+          }
+        } else {
+          pendingLargeFrame = rawFrame;
+          pendingOffset = 0;
+          sendLargeFrameChunk();
+          if (pendingLargeFrame) break;
         }
-        
-        // Handle close frame - forward it and stop reading, but don't cleanup yet.
-        // The target will respond with its own close frame, which flows back:
-        // target → client → DATA → server → browser. Cleanup happens when
-        // the client sends FIN (target closed) or the browser socket closes.
+
         if (opcode === 0x08) {
           return;
         }
@@ -520,7 +647,6 @@ function createHTTPServer(clientManager, tcpServer, options = {}) {
     });
 
     socket.on('end', () => {
-      // Browser half-closed connection (readable side ended)
       if (!cleanupCalled) {
         client.write(encodeFrame(streamId, FrameType.FIN, Buffer.alloc(0)));
         cleanup();
@@ -529,7 +655,6 @@ function createHTTPServer(clientManager, tcpServer, options = {}) {
 
     socket.on('close', () => {
       if (!cleanupCalled) {
-        // Browser closed - signal to client
         client.write(encodeFrame(streamId, FrameType.FIN, Buffer.alloc(0)));
         cleanup();
       }
@@ -539,9 +664,6 @@ function createHTTPServer(clientManager, tcpServer, options = {}) {
       console.error('WebSocket socket error:', err.message);
       cleanup();
     });
-
-    // No stream timeout for WebSocket streams - they're long-lived
-    // Connection health is managed via WebSocket ping/pong or TLS keepalive
   });
 
   return server;

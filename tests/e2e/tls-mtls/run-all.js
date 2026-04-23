@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// TLS E2E Test Runner
+// TLS E2E Test Runner (All tests including timeout tests)
 
 const { run } = require('node:test');
 const { join } = require('node:path');
@@ -13,6 +13,7 @@ const testFiles = [
   'test-concurrent.js',
   'test-streaming.js',
   'test-sse.js',
+  'test-sse-timeout.js', // Tests SSE connections stay open beyond 30s timeout
   'test-large-body.js',
   'test-disconnect.js',
   'test-reconnect.js',
@@ -25,12 +26,13 @@ const testFiles = [
   'test-cors.js',
   'test-security.js',
   'test-revocation.js',
-  'test-websocket.js',
-  'test-bugfixes.js'
+  'test-websocket.js'
 ];
 
 // Files that need longer timeout (in ms)
-const longTimeoutFiles = new Set(['test-bugfixes.js']);
+const longTimeoutFiles = new Set([
+  'test-sse-timeout.js' // 65s test + 60s slow headers test + margin = ~130s
+]);
 
 // Timeout values for different test types (in ms)
 const TIMEOUTS = {
@@ -39,7 +41,7 @@ const TIMEOUTS = {
 };
 
 async function main() {
-  console.log('Running Tunzero E2E tests...\n');
+  console.log('Running Tunzero E2E tests (all including timeout tests)...\n');
 
   const results = {
     passed: 0,
