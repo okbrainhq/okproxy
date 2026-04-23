@@ -681,30 +681,39 @@ function createHTTPServer(clientManager, tcpServer, options = {}) {
     const WS_IDLE_TIMEOUT = 300000; // 5 minutes
     let idleTimer = setTimeout(() => {
       if (!cleanupCalled) {
-        // Send close frame before cleanup (if upgrade completed)
+        // Send close frame before cleanup (if upgrade completed) - bug #22 fix
+        // Wait for write callback to ensure close frame is flushed before destroying socket
         if (upgradeResponseReceived) {
           const closeFrame = buildWebSocketFrame(0x08, Buffer.from([0x03, 0xe9])); // 1001 = going away
-          socket.write(closeFrame);
+          socket.write(closeFrame, (err) => {
+            // Cleanup after close frame is sent (or on error)
+            cleanup();
+          });
+        } else {
+          cleanup();
         }
-        cleanup();
       }
     }, WS_IDLE_TIMEOUT);
 
     // Reset idle timer on any data activity
-    const originalOnData = socket.listeners('data')[0];
-    socket.removeListener('data', originalOnData);
-    socket.on('data', (chunk) => {
+    // Use prependListener to intercept data without assuming listener order
+    socket.prependListener('data', () => {
       clearTimeout(idleTimer);
       idleTimer = setTimeout(() => {
         if (!cleanupCalled) {
+          // Send close frame before cleanup (if upgrade completed) - bug #22 fix
+          // Wait for write callback to ensure close frame is flushed before destroying socket
           if (upgradeResponseReceived) {
             const closeFrame = buildWebSocketFrame(0x08, Buffer.from([0x03, 0xe9]));
-            socket.write(closeFrame);
+            socket.write(closeFrame, (err) => {
+              // Cleanup after close frame is sent (or on error)
+              cleanup();
+            });
+          } else {
+            cleanup();
           }
-          cleanup();
         }
       }, WS_IDLE_TIMEOUT);
-      originalOnData(chunk);
     });
 
     // Clean up idle timer on cleanup

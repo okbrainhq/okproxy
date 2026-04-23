@@ -25,11 +25,12 @@ const testFiles = [
   'test-cors.js',
   'test-security.js',
   'test-revocation.js',
-  'test-websocket.js'
+  'test-websocket.js',
+  'test-bugfixes.js'
 ];
 
 // Files that need longer timeout (in ms)
-const longTimeoutFiles = new Set([]);
+const longTimeoutFiles = new Set(['test-bugfixes.js']);
 
 // Timeout values for different test types (in ms)
 const TIMEOUTS = {

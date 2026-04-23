@@ -227,6 +227,12 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
         headers: proxyHeaders
       });
 
+      // Set timeout on upgrade request to prevent hanging if target never responds
+      proxyReq.setTimeout(30000, () => {
+        proxyReq.destroy();
+        connection.write(encodeFrame(streamId, FrameType.ERROR, Buffer.from('Upgrade timeout')));
+      });
+
       let cleanupCalled = false;
 
       // Pre-declare wsState so cleanup can reference it
@@ -267,9 +273,12 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
           'sec-websocket-accept': proxyRes.headers['sec-websocket-accept']
         };
 
-        // Forward any other relevant headers
+        // Forward any other relevant headers (case-insensitive check to avoid duplicates)
+        const responseHeadersLower = Object.fromEntries(
+          Object.entries(responseHeaders).map(([k, v]) => [k.toLowerCase(), v])
+        );
         for (const [key, value] of Object.entries(proxyRes.headers)) {
-          if (!responseHeaders[key]) {
+          if (!(key.toLowerCase() in responseHeadersLower)) {
             responseHeaders[key] = value;
           }
         }
