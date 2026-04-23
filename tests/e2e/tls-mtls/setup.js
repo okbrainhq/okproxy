@@ -172,7 +172,7 @@ async function createTestEnv(options = {}) {
 
   async function cleanup() {
     stopClient();
-    // Force close all upgrade sockets on mock target
+    // Force close all upgrade sockets on mock target (WebSocket cleanup)
     mockTarget.forceCloseAllSockets?.();
     await Promise.all([
       new Promise(r => tlsServer.close(r)),

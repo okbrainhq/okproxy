@@ -519,6 +519,14 @@ function createHTTPServer(clientManager, tcpServer, options = {}) {
       }
     });
 
+    socket.on('end', () => {
+      // Browser half-closed connection (readable side ended)
+      if (!cleanupCalled) {
+        client.write(encodeFrame(streamId, FrameType.FIN, Buffer.alloc(0)));
+        cleanup();
+      }
+    });
+
     socket.on('close', () => {
       if (!cleanupCalled) {
         // Browser closed - signal to client
