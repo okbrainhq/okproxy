@@ -21,7 +21,7 @@ function parseArgs() {
     caDir: DEFAULT_CA_DIR,
     maxConcurrentStreams: 100,
     streamTimeout: 30000,
-    keepaliveInterval: 30000,
+    keepaliveInterval: 15000,
     keepaliveTimeout: 10000
   };
 
@@ -81,7 +81,7 @@ Options:
   --ca-dir <path>             CA directory for revocation checks (default: ${DEFAULT_CA_DIR})
   --max-streams <n>           Max concurrent streams per client (default: 100)
   --stream-timeout <ms>       Stream inactivity timeout (default: 30000)
-  --keepalive-interval <ms>   PING interval (default: 30000)
+  --keepalive-interval <ms>   PING interval (default: 15000)
   --keepalive-timeout <ms>    PONG timeout (default: 10000)
   --help                      Show this help
 

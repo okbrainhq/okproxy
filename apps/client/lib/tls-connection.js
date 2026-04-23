@@ -4,9 +4,9 @@ const { connect } = require('node:tls');
 const { readFileSync } = require('node:fs');
 const { encodeFrame, createFrameDecoder, FrameType } = require('../../../packages/frame-protocol');
 
-const INITIAL_RECONNECT_DELAY = 1000;
-const MAX_RECONNECT_DELAY = 15000; // Max 15 seconds between retries
-const WATCHDOG_TIMEOUT = 30000; // 30 seconds - should receive at least one PING in this time
+const INITIAL_RECONNECT_DELAY = 500; // 0.5 seconds
+const MAX_RECONNECT_DELAY = 3000; // Max 3 seconds between retries
+const WATCHDOG_TIMEOUT = 25000; // 25 seconds - should receive at least one PING in this time (server sends every 15s)
 
 function createTLSConnection(config, onFrame, onConnect, onDisconnect) {
   let socket = null;
@@ -142,7 +142,7 @@ function createTLSConnection(config, onFrame, onConnect, onDisconnect) {
         console.log(`[${new Date().toISOString()}] Watchdog: no server activity for ${idleTime}ms, closing dead connection`);
         socket.destroy();
       }
-    }, 30000); // Check every 30 seconds
+    }, 5000); // Check every 5 seconds
   }
 
   function stopWatchdog() {
