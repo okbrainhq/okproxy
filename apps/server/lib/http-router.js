@@ -5,6 +5,7 @@ const { encodeFrame, FrameType, MAX_FRAME_SIZE } = require('../../../packages/fr
 
 const STREAM_TIMEOUT = 30000; // 30 seconds
 const DEFAULT_MAX_BODY_SIZE = 10 * 1024 * 1024; // 10MB default
+const MAX_WS_BUFFER_SIZE = 16 * 1024 * 1024; // 16MB max WebSocket buffer to prevent OOM
 
 // Hop-by-hop headers that should not be forwarded (RFC 2616)
 const HOP_BY_HOP_HEADERS = new Set([
@@ -128,9 +129,8 @@ function parseWebSocketFrame(buffer, boundariesOnly = false) {
   } else if (payloadLen === 127) {
     if (buffer.length < 10) return null;
     const high = buffer.readUInt32BE(2);
-    const low = buffer.readUInt32BE(6);
-    if (high !== 0) throw new Error('Payload too large (>4GB)');
-    payloadLen = low;
+    if (high !== 0) return null; // Payload too large (>4GB)
+    payloadLen = buffer.readUInt32BE(6);
     offset = 10;
   }
   
@@ -151,7 +151,7 @@ function parseWebSocketFrame(buffer, boundariesOnly = false) {
   }
   
   // Full parsing with unmasking
-  let payload = buffer.subarray(offset - (masked ? 4 : 0), frameSize);
+  let payload = buffer.subarray(offset, frameSize);
   
   // Unmask if needed
   if (masked) {
@@ -484,6 +484,12 @@ function createHTTPServer(clientManager, tcpServer, options = {}) {
 
     // Handle WebSocket frames from browser
     socket.on('data', (chunk) => {
+      // Check for unbounded buffer growth attack
+      if (wsBuffer.length + chunk.length > MAX_WS_BUFFER_SIZE) {
+        console.error('WebSocket buffer overflow - destroying connection');
+        cleanup();
+        return;
+      }
       wsBuffer = Buffer.concat([wsBuffer, chunk]);
       
       // Parse frame boundaries but forward RAW BYTES (preserves masking)

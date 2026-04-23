@@ -64,6 +64,8 @@ function filterWebSocketHeaders(headers) {
   return filtered;
 }
 
+const MAX_WS_BUFFER_SIZE = 16 * 1024 * 1024; // 16MB max WebSocket buffer to prevent OOM
+
 function createProxy(connection, targetPort, targetHost = 'localhost', maxStreams = 100) {
   const activeStreams = new Map(); // streamId -> { proxyReq, onDrain }
   const drainListeners = new Map(); // streamId -> onDrain function
@@ -218,6 +220,12 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
         let buffer = Buffer.alloc(0);
         
         proxySocket.on('data', (chunk) => {
+          // Check for unbounded buffer growth attack
+          if (buffer.length + chunk.length > MAX_WS_BUFFER_SIZE) {
+            console.error('WebSocket buffer overflow - destroying connection');
+            cleanup();
+            return;
+          }
           buffer = Buffer.concat([buffer, chunk]);
           
           // Parse frame boundaries but forward RAW BYTES
@@ -426,7 +434,7 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
     }
     
     // Full parsing with unmasking
-    let payload = buffer.subarray(offset - (masked ? 4 : 0), frameSize);
+    let payload = buffer.subarray(offset, frameSize);
     
     if (masked) {
       const maskKey = buffer.subarray(offset - 4, offset);
