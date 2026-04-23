@@ -7,6 +7,7 @@ function createMockTarget(options = {}) {
   let requestCount = 0;
   let sseClients = new Set();
   let wsClients = new Map(); // Store WebSocket clients by path
+  let activeSockets = new Set(); // Track all upgrade sockets for cleanup
 
   const server = createServer((req, res) => {
     requestCount++;
@@ -203,6 +204,9 @@ function createMockTarget(options = {}) {
     
     socket.write(headers);
     
+    // Track socket for cleanup
+    activeSockets.add(socket);
+    
     // Store client
     const clientId = Math.random().toString(36).substring(7);
     wsClients.set(clientId, { socket, path: urlPath });
@@ -253,10 +257,12 @@ function createMockTarget(options = {}) {
     
     socket.on('close', () => {
       wsClients.delete(clientId);
+      activeSockets.delete(socket);
     });
     
     socket.on('error', () => {
       wsClients.delete(clientId);
+      activeSockets.delete(socket);
     });
   });
 
@@ -337,6 +343,14 @@ function createMockTarget(options = {}) {
 
   // Get request count
   server.getRequestCount = () => requestCount;
+
+  // Force close all sockets (for cleanup)
+  server.forceCloseAllSockets = () => {
+    for (const socket of activeSockets) {
+      socket.destroy();
+    }
+    activeSockets.clear();
+  };
 
   return server;
 }
