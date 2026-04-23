@@ -45,9 +45,22 @@ function filterRequestHeaders(headers) {
   return filtered;
 }
 
+// Hop-by-hop headers to strip for WebSocket (RFC 2616)
+// Note: upgrade and connection are preserved for WebSocket handshake
+const WS_HOP_BY_HOP_HEADERS = new Set([
+  'keep-alive',
+  'proxy-authenticate',
+  'proxy-authorization',
+  'te',
+  'trailer',
+  'transfer-encoding',
+  'content-length' // Strip content-length - let Node.js recalculate
+]);
+
 /**
  * Filter headers for WebSocket upgrade requests
  * For WebSocket, we need to preserve Upgrade and Connection headers
+ * but strip other hop-by-hop headers (te, trailer, keep-alive, etc.)
  * @param {Object} headers - Raw headers
  * @returns {Object} Filtered headers for WebSocket upgrade
  */
@@ -55,9 +68,8 @@ function filterWebSocketHeaders(headers) {
   const filtered = {};
   for (const [key, value] of Object.entries(headers)) {
     const lowerKey = key.toLowerCase();
-    // For WebSocket, preserve upgrade/connection headers
-    // Strip X-Forwarded headers only
-    if (!X_FORWARDED_HEADERS.has(lowerKey)) {
+    // Strip both hop-by-hop (except upgrade/connection) and X-Forwarded headers
+    if (!WS_HOP_BY_HOP_HEADERS.has(lowerKey) && !X_FORWARDED_HEADERS.has(lowerKey)) {
       filtered[key] = value;
     }
   }
@@ -127,15 +139,37 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
     if (!wsState) return;
 
     if (frame.type === FrameType.DATA) {
-      // Forward WebSocket frame to target
-      // frame.payload contains the raw WebSocket frame
-      const canWrite = wsState.socket.write(frame.payload);
-      if (!canWrite) {
-        // Backpressure
-        wsState.socket.pause();
-        connection.socket.once('drain', () => {
-          wsState.socket.resume();
-        });
+      // Buffer and reassemble fragmented WebSocket frames
+      // Large frames are split across multiple DATA frames, so we need to
+      // accumulate until we have a complete WebSocket frame
+      wsState.reassemblyBuffer = Buffer.concat([wsState.reassemblyBuffer, frame.payload]);
+
+      // Try to extract complete WebSocket frames from buffer
+      while (wsState.reassemblyBuffer.length >= 2) {
+        const result = parseWebSocketFrame(wsState.reassemblyBuffer, true);
+        if (!result) break; // Need more data for complete frame
+
+        const { frameSize, remaining } = result;
+
+        // Extract complete frame and write to target
+        const completeFrame = wsState.reassemblyBuffer.subarray(0, frameSize);
+        wsState.reassemblyBuffer = remaining;
+
+        const canWrite = wsState.socket.write(completeFrame);
+        if (!canWrite) {
+          // Backpressure
+          wsState.socket.pause();
+          connection.socket.once('drain', () => {
+            wsState.socket.resume();
+          });
+        }
+      }
+
+      // Safety check: prevent unbounded buffer growth
+      if (wsState.reassemblyBuffer.length > MAX_WS_BUFFER_SIZE) {
+        console.error('WebSocket reassembly buffer overflow - closing connection');
+        wsState.cleanup();
+        return;
       }
     } else if (frame.type === FrameType.FIN) {
       // Server signaled end - close WebSocket
@@ -173,24 +207,28 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
 
       let cleanupCalled = false;
 
+      // Pre-declare wsState so cleanup can reference it
+      const wsState = {
+        socket: null,
+        cleanup: null, // Will be set below
+        reassemblyBuffer: Buffer.alloc(0) // For reassembling fragmented WS frames
+      };
+
       function cleanup() {
         if (cleanupCalled) return;
         cleanupCalled = true;
-        
+
         activeWebSockets.delete(streamId);
-        
+
         if (wsState.socket && !wsState.socket.destroyed) {
           wsState.socket.destroy();
         }
-        
+
         // Signal to server that stream is done
         connection.write(encodeFrame(streamId, FrameType.FIN, Buffer.alloc(0)));
       }
 
-      const wsState = {
-        socket: null,
-        cleanup
-      };
+      wsState.cleanup = cleanup;
 
       proxyReq.on('upgrade', (proxyRes, proxySocket, proxyHead) => {
         // Target accepted upgrade
@@ -218,7 +256,30 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
 
         // Handle data from target - forward RAW BYTES (preserves unmasked server frames)
         let buffer = Buffer.alloc(0);
-        
+        let pendingLargeFrame = null; // For fragmented sending across backpressure
+        let pendingOffset = 0;
+
+        function sendLargeFrameChunk() {
+          // Continue sending pending large frame from pendingOffset
+          while (pendingOffset < pendingLargeFrame.length) {
+            const end = Math.min(pendingOffset + MAX_FRAME_SIZE, pendingLargeFrame.length);
+            const chunk = pendingLargeFrame.subarray(pendingOffset, end);
+            const canWrite = connection.write(encodeFrame(streamId, FrameType.DATA, chunk));
+            if (!canWrite) {
+              // Backpressure - pause and wait for drain
+              proxySocket.pause();
+              pendingOffset = end;
+              connection.socket.once('drain', sendLargeFrameChunk);
+              return;
+            }
+            pendingOffset = end;
+          }
+          // Finished sending this frame
+          pendingLargeFrame = null;
+          pendingOffset = 0;
+          proxySocket.resume();
+        }
+
         proxySocket.on('data', (chunk) => {
           // Check for unbounded buffer growth attack
           if (buffer.length + chunk.length > MAX_WS_BUFFER_SIZE) {
@@ -227,28 +288,41 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
             return;
           }
           buffer = Buffer.concat([buffer, chunk]);
-          
+
           // Parse frame boundaries but forward RAW BYTES
           while (buffer.length >= 2) {
+            // If we're in the middle of sending a large frame, skip new frames until done
+            if (pendingLargeFrame) break;
+
             const frameInfo = parseWebSocketFrame(buffer, true); // true = boundaries only
             if (!frameInfo) break;
-            
+
             const { frameSize, opcode, remaining } = frameInfo;
-            
+
             // Slice the raw frame (preserves original format)
             const rawFrame = Buffer.from(buffer.subarray(0, frameSize));
             buffer = remaining;
-            
-            // Forward raw frame in DATA frame
-            const canWrite = connection.write(encodeFrame(streamId, FrameType.DATA, rawFrame));
-            
-            if (!canWrite) {
-              proxySocket.pause();
-              connection.socket.once('drain', () => {
-                proxySocket.resume();
-              });
+
+            // Fragment large WebSocket frames to avoid tunnel frame size limit (MAX_FRAME_SIZE = 1MB)
+            // This prevents the tunnel-wide kill switch when WS frames exceed 1MB
+            if (rawFrame.length <= MAX_FRAME_SIZE) {
+              // Small frame: send in single DATA frame
+              const canWrite = connection.write(encodeFrame(streamId, FrameType.DATA, rawFrame));
+              if (!canWrite) {
+                proxySocket.pause();
+                connection.socket.once('drain', () => {
+                  proxySocket.resume();
+                });
+              }
+            } else {
+              // Large frame: start fragmenting
+              pendingLargeFrame = rawFrame;
+              pendingOffset = 0;
+              sendLargeFrameChunk();
+              // If backpressure hit, sendLargeFrameChunk will pause and break via pendingLargeFrame check
+              if (pendingLargeFrame) break;
             }
-            
+
             // Handle close from target
             if (opcode === 0x08) {
               cleanup();
