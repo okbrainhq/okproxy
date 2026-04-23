@@ -5,7 +5,8 @@
   "private": true,
   "scripts": {
     "server": "node apps/server/index.js",
-    "client": "node apps/client/index.js"
+    "client": "node apps/client/index.js",
+    "test": "node tests/e2e/tls-mtls/run.js"
   },
   "bin": {
     "ca": "apps/server/bin/tunnel-ca.js"
