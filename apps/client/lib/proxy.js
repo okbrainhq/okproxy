@@ -162,23 +162,19 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
         wsState.reassemblyBuffer = remaining;
 
         const canWrite = wsState.socket.write(completeFrame);
-        if (!canWrite) {
-          // Backpressure
+        if (!canWrite && !isCloseFrame) {
           wsState.socket.pause();
           connection.socket.once('drain', () => {
             wsState.socket.resume();
           });
         }
 
-        // After sending close frame to target, clean up
         if (isCloseFrame) {
-          // Give the target time to respond, but cleanup will happen
-          // when the target's close frame comes back or socket closes
           setTimeout(() => {
             if (!wsState.cleanupCalled) {
               wsState.cleanup();
             }
-          }, 1000);
+          }, 5000);
           break;
         }
       }
@@ -228,7 +224,9 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
       });
 
       // Set timeout on upgrade request to prevent hanging if target never responds
+      let upgradeTimeoutTriggered = false;
       proxyReq.setTimeout(30000, () => {
+        upgradeTimeoutTriggered = true;
         proxyReq.destroy();
         connection.write(encodeFrame(streamId, FrameType.ERROR, Buffer.from('Upgrade timeout')));
       });
@@ -395,6 +393,7 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
       });
 
       proxyReq.on('error', (err) => {
+        if (upgradeTimeoutTriggered) return;
         console.error('WebSocket upgrade request error:', err.message);
         connection.write(encodeFrame(streamId, FrameType.ERROR, Buffer.from('Upgrade failed')));
       });
