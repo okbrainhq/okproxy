@@ -145,11 +145,17 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
       wsState.reassemblyBuffer = Buffer.concat([wsState.reassemblyBuffer, frame.payload]);
 
       // Try to extract complete WebSocket frames from buffer
-      while (wsState.reassemblyBuffer.length >= 2) {
+      while (wsState.reassemblyBuffer.length >= 2 && !wsState.closeFramePending) {
         const result = parseWebSocketFrame(wsState.reassemblyBuffer, true);
         if (!result) break; // Need more data for complete frame
 
-        const { frameSize, remaining } = result;
+        const { frameSize, opcode, remaining } = result;
+
+        // Check if this is a close frame (bug #21 fix)
+        const isCloseFrame = opcode === 0x08;
+        if (isCloseFrame) {
+          wsState.closeFramePending = true;
+        }
 
         // Extract complete frame and write to target
         const completeFrame = wsState.reassemblyBuffer.subarray(0, frameSize);
@@ -163,6 +169,18 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
             wsState.socket.resume();
           });
         }
+
+        // After sending close frame to target, clean up
+        if (isCloseFrame) {
+          // Give the target time to respond, but cleanup will happen
+          // when the target's close frame comes back or socket closes
+          setTimeout(() => {
+            if (!wsState.cleanupCalled) {
+              wsState.cleanup();
+            }
+          }, 1000);
+          break;
+        }
       }
 
       // Safety check: prevent unbounded buffer growth
@@ -173,7 +191,11 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
       }
     } else if (frame.type === FrameType.FIN) {
       // Server signaled end - close WebSocket
-      wsState.cleanup();
+      // Wait for any pending close frame to be sent before cleanup (bug #21 fix)
+      if (!wsState.closeFramePending) {
+        wsState.cleanup();
+      }
+      // If close frame is pending, cleanup will be called after it's sent
     } else if (frame.type === FrameType.ERROR) {
       wsState.cleanup();
     }
@@ -211,12 +233,15 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
       const wsState = {
         socket: null,
         cleanup: null, // Will be set below
-        reassemblyBuffer: Buffer.alloc(0) // For reassembling fragmented WS frames
+        reassemblyBuffer: Buffer.alloc(0), // For reassembling fragmented WS frames
+        closeFramePending: false, // Track if close frame is being sent (bug #21 fix)
+        cleanupCalled: false // Track cleanup state for race condition handling
       };
 
       function cleanup() {
-        if (cleanupCalled) return;
+        if (cleanupCalled || wsState.cleanupCalled) return;
         cleanupCalled = true;
+        wsState.cleanupCalled = true;
 
         activeWebSockets.delete(streamId);
 
@@ -255,7 +280,8 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
         })));
 
         // Handle data from target - forward RAW BYTES (preserves unmasked server frames)
-        let buffer = Buffer.alloc(0);
+        // Include any early data received during upgrade (bug #20 fix)
+        let buffer = proxyHead && proxyHead.length > 0 ? proxyHead : Buffer.alloc(0);
         let pendingLargeFrame = null; // For fragmented sending across backpressure
         let pendingOffset = 0;
 
@@ -303,6 +329,12 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
             const rawFrame = Buffer.from(buffer.subarray(0, frameSize));
             buffer = remaining;
 
+            // Check if this is a close frame (bug #21 fix)
+            const isCloseFrame = opcode === 0x08;
+            if (isCloseFrame) {
+              wsState.closeFramePending = true;
+            }
+
             // Fragment large WebSocket frames to avoid tunnel frame size limit (MAX_FRAME_SIZE = 1MB)
             // This prevents the tunnel-wide kill switch when WS frames exceed 1MB
             if (rawFrame.length <= MAX_FRAME_SIZE) {
@@ -323,18 +355,28 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
               if (pendingLargeFrame) break;
             }
 
-            // Handle close from target
-            if (opcode === 0x08) {
-              cleanup();
+            // Handle close from target - wait for write to complete before cleanup (bug #21 fix)
+            if (isCloseFrame) {
+              // Use setImmediate to ensure the write has been queued before we check/drain
+              setImmediate(() => {
+                // Wait for drain if backpressure, then cleanup
+                if (!connection.write(encodeFrame(streamId, FrameType.FIN, Buffer.alloc(0)))) {
+                  connection.socket.once('drain', cleanup);
+                } else {
+                  cleanup();
+                }
+              });
               return;
             }
           }
         });
 
         proxySocket.on('close', () => {
-          if (!cleanupCalled) {
+          // Wait for any pending close frame to be sent before cleanup (bug #21 fix)
+          if (!cleanupCalled && !wsState.closeFramePending) {
             cleanup();
           }
+          // If close frame is pending, cleanup will be called after it's sent
         });
 
         proxySocket.on('error', (err) => {

@@ -400,6 +400,10 @@ function createHTTPServer(clientManager, tcpServer, options = {}) {
       return;
     }
 
+    // Re-inject any early data received during upgrade handshake (bug #19 fix)
+    // The 'head' buffer may contain early WebSocket frames from fast clients/pipelining
+    let headBuffer = head && head.length > 0 ? head : Buffer.alloc(0);
+
     // Check max WebSocket concurrent streams (separate from HTTP)
     if (activeWebSockets.size >= maxWebSocketStreams) {
       socket.write('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n');
@@ -445,6 +449,7 @@ function createHTTPServer(clientManager, tcpServer, options = {}) {
     let targetToBrowserBuffer = Buffer.alloc(0);
     let upgradeResponseReceived = false;
     let cleanupCalled = false;
+    let closeFramePending = false; // Track if close frame is being sent (bug #21 fix)
 
     function cleanup() {
       if (cleanupCalled) return;
@@ -508,19 +513,35 @@ function createHTTPServer(clientManager, tcpServer, options = {}) {
           targetToBrowserBuffer = Buffer.concat([targetToBrowserBuffer, frame.payload]);
 
           // Try to extract complete WebSocket frames from buffer
-          while (targetToBrowserBuffer.length >= 2) {
+          while (targetToBrowserBuffer.length >= 2 && !closeFramePending) {
             const result = parseWebSocketFrame(targetToBrowserBuffer, true);
             if (!result) break; // Need more data for complete frame
 
-            const { frameSize, remaining } = result;
+            const { frameSize, opcode, remaining } = result;
 
             // Extract complete frame and write to browser
             const completeFrame = targetToBrowserBuffer.subarray(0, frameSize);
             targetToBrowserBuffer = remaining;
 
+            // Check if this is a close frame (bug #21 fix)
+            const isCloseFrame = opcode === 0x08;
+            if (isCloseFrame) {
+              closeFramePending = true;
+            }
+
             socket.write(completeFrame, (err) => {
-              if (err) cleanup();
+              if (err) {
+                cleanup();
+              } else if (isCloseFrame) {
+                // Close frame sent successfully, cleanup now
+                cleanup();
+              }
             });
+
+            // Stop processing more frames after close frame to ensure clean shutdown
+            if (isCloseFrame) {
+              break;
+            }
           }
 
           // Safety check: prevent unbounded buffer growth
@@ -531,7 +552,11 @@ function createHTTPServer(clientManager, tcpServer, options = {}) {
           }
         } else if (frame.type === FrameType.FIN) {
           // Client signaled end - close browser connection
-          cleanup();
+          // Wait for any pending close frame to be sent before cleanup (bug #21 fix)
+          if (!closeFramePending) {
+            cleanup();
+          }
+          // If close frame is pending, cleanup will be called by the write callback
         } else if (frame.type === FrameType.ERROR) {
           cleanup();
         }
@@ -545,6 +570,7 @@ function createHTTPServer(clientManager, tcpServer, options = {}) {
     // Handle WebSocket frames from browser
     let pendingLargeFrame = null; // For fragmented sending across backpressure
     let pendingOffset = 0;
+    let headBufferConsumed = false; // Track if head buffer has been processed
 
     function sendLargeFrameChunk() {
       // Continue sending pending large frame from pendingOffset
@@ -568,6 +594,13 @@ function createHTTPServer(clientManager, tcpServer, options = {}) {
     }
 
     socket.on('data', (chunk) => {
+      // Prepend head buffer on first data event if any early data was received (bug #19 fix)
+      if (!headBufferConsumed && headBuffer.length > 0) {
+        chunk = Buffer.concat([headBuffer, chunk]);
+        headBuffer = Buffer.alloc(0);
+        headBufferConsumed = true;
+      }
+
       // Check for unbounded buffer growth attack
       if (wsBuffer.length + chunk.length > MAX_WS_BUFFER_SIZE) {
         console.error('WebSocket buffer overflow - destroying connection');
