@@ -80,8 +80,14 @@ describe('SSE Stream Timeout Fix', () => {
         // Keep connection open for 65 seconds (2x the 30s timeout + margin)
         setTimeout(() => {
           clearInterval(eventInterval);
-          req.destroy();
-          setTimeout(resolve, 100);
+          req.end();  // Gracefully end the request
+          // Give time for any pending data and clean close
+          setTimeout(() => {
+            if (!disconnected) {
+              req.destroy();  // Force close if still connected
+            }
+            resolve();
+          }, 500);
         }, 65000);
       });
       
@@ -161,8 +167,8 @@ describe('SSE Stream Timeout Fix', () => {
       caDir: certs.caDir,
       maxConcurrentStreams: 100,
       streamTimeout: 30000,
-      keepaliveInterval: 30000,
-      keepaliveTimeout: 10000,
+      keepaliveInterval: 10000,
+      keepaliveTimeout: 15000,
       initTimeout: 10000
     });
 

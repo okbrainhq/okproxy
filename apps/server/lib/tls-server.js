@@ -5,8 +5,8 @@ const { readFileSync } = require('node:fs');
 const { encodeFrame, createFrameDecoder, FrameType } = require('../../../packages/frame-protocol');
 const { isRevoked } = require('./ca');
 
-const KEEPALIVE_INTERVAL = 15000; // 15 seconds (client watchdog is 25s)
-const KEEPALIVE_TIMEOUT = 10000; // 10 seconds
+const KEEPALIVE_INTERVAL = 10000; // 10 seconds
+const KEEPALIVE_TIMEOUT = 15000; // 15 seconds (must be > interval)
 const INIT_TIMEOUT = 10000; // 10 seconds for INIT handshake
 const MAX_CONCURRENT_STREAMS = 100;
 

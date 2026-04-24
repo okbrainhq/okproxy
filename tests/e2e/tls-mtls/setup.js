@@ -77,8 +77,8 @@ async function createTestEnv(options = {}) {
     caDir: certs.caDir,
     maxConcurrentStreams: options.maxStreams || 100,
     streamTimeout: options.streamTimeout || 30000,
-    keepaliveInterval: options.keepaliveInterval || 30000,
-    keepaliveTimeout: options.keepaliveTimeout || 10000,
+    keepaliveInterval: options.keepaliveInterval || 10000,
+    keepaliveTimeout: options.keepaliveTimeout || 15000,
     initTimeout: options.initTimeout || 10000
   });
 
