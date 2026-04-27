@@ -168,7 +168,7 @@ describe('SSE Stream Timeout Fix', () => {
       maxConcurrentStreams: 100,
       streamTimeout: 30000,
       keepaliveInterval: 10000,
-      keepaliveTimeout: 15000,
+      keepaliveTimeout: 25000,
       initTimeout: 10000
     });
 

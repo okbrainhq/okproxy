@@ -6,7 +6,7 @@ const { encodeFrame, createFrameDecoder, FrameType } = require('../../../package
 
 const INITIAL_RECONNECT_DELAY = 500; // 0.5 seconds
 const MAX_RECONNECT_DELAY = 3000; // Max 3 seconds between retries
-const WATCHDOG_TIMEOUT = 20000; // 20 seconds - should receive at least one PING in this time (server sends every 10s)
+const WATCHDOG_TIMEOUT = 35000; // 35 seconds - tolerates 3 missed PINGs (server sends every 10s)
 
 function createTLSConnection(config, onFrame, onConnect, onDisconnect) {
   let socket = null;

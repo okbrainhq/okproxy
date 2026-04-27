@@ -22,7 +22,7 @@ function parseArgs() {
     maxConcurrentStreams: 100,
     streamTimeout: 30000,
     keepaliveInterval: 10000,
-    keepaliveTimeout: 15000
+    keepaliveTimeout: 25000
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -82,7 +82,7 @@ Options:
   --max-streams <n>           Max concurrent streams per client (default: 100)
   --stream-timeout <ms>       Stream inactivity timeout (default: 30000)
   --keepalive-interval <ms>   PING interval (default: 10000)
-  --keepalive-timeout <ms>    PONG timeout (default: 15000)
+  --keepalive-timeout <ms>    PONG timeout (default: 25000)
   --help                      Show this help
 
 Examples:

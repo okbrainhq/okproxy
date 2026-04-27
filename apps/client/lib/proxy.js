@@ -90,13 +90,6 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
   }
 
   function handleFrame(frame) {
-    // Handle PING (respond with PONG)
-    if (frame.streamId === 0 && frame.type === FrameType.PING) {
-      connection.write(encodeFrame(0, FrameType.PONG, Buffer.alloc(0)));
-      return;
-    }
-
-    // Handle WebSocket streams
     if (activeWebSockets.has(frame.streamId)) {
       handleWebSocketFrame(frame);
       return;

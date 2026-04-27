@@ -78,7 +78,7 @@ async function createTestEnv(options = {}) {
     maxConcurrentStreams: options.maxStreams || 100,
     streamTimeout: options.streamTimeout || 30000,
     keepaliveInterval: options.keepaliveInterval || 10000,
-    keepaliveTimeout: options.keepaliveTimeout || 15000,
+    keepaliveTimeout: options.keepaliveTimeout || 25000,
     initTimeout: options.initTimeout || 10000
   });
 

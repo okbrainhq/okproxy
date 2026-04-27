@@ -6,7 +6,7 @@ const { encodeFrame, createFrameDecoder, FrameType } = require('../../../package
 const { isRevoked } = require('./ca');
 
 const KEEPALIVE_INTERVAL = 10000; // 10 seconds
-const KEEPALIVE_TIMEOUT = 15000; // 15 seconds (must be > interval)
+const KEEPALIVE_TIMEOUT = 25000; // 25 seconds (tolerates 2 missed PONGs)
 const INIT_TIMEOUT = 10000; // 10 seconds for INIT handshake
 const MAX_CONCURRENT_STREAMS = 100;
 
@@ -54,27 +54,23 @@ function createTLSServer(clientManager, options = {}) {
 
     console.log(`[${new Date().toISOString()}] Client connected, serial: ${serial}, remote: ${socket.remoteAddress}:${socket.remotePort}`);
 
+    socket.setKeepAlive(true, 30000);
+
     let initialized = false;
     let initTimer = null;
     let keepaliveTimer = null;
-    let keepaliveDeadline = null;
-
-    function sendPing() {
-      if (!initialized || socket.destroyed) return;
-      socket.write(encodeFrame(0, FrameType.PING, Buffer.alloc(0)));
-      keepaliveDeadline = Date.now() + keepaliveTimeout;
-    }
+    let lastPongTime = 0;
 
     function startKeepalive() {
-      // Send first PING immediately to start the keepalive cycle
-      sendPing();
+      lastPongTime = Date.now();
       keepaliveTimer = setInterval(() => {
-        if (keepaliveDeadline && Date.now() > keepaliveDeadline) {
+        if (!initialized || socket.destroyed) return;
+        if (Date.now() - lastPongTime > keepaliveTimeout) {
           console.log(`[${new Date().toISOString()}] Client keepalive timeout, serial: ${serial}`);
           socket.destroy();
           return;
         }
-        if (!keepaliveDeadline) sendPing();
+        socket.write(encodeFrame(0, FrameType.PING, Buffer.alloc(0)));
       }, keepaliveInterval);
     }
 
@@ -154,7 +150,7 @@ function createTLSServer(clientManager, options = {}) {
 
         // Handle PONG
         if (frame.streamId === 0 && frame.type === FrameType.PONG) {
-          keepaliveDeadline = null;
+          lastPongTime = Date.now();
           return;
         }
 
