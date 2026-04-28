@@ -3,6 +3,7 @@
 const { connect } = require('node:tls');
 const { readFileSync } = require('node:fs');
 const { encodeFrame, createFrameDecoder, FrameType } = require('../../../packages/frame-protocol');
+const { NetworkWatchDog } = require('./network-watchdog');
 
 const INITIAL_RECONNECT_DELAY = 500; // 0.5 seconds
 const MAX_RECONNECT_DELAY = 3000; // Max 3 seconds between retries
@@ -19,6 +20,16 @@ function createTLSConnection(config, onFrame, onConnect, onDisconnect) {
   let lastActivity = 0;
   let reconnectAttempts = 0;
   let serverSettings = { maxConcurrentStreams: 100 }; // Default until negotiated
+  let networkWatchdog = null;
+
+  // Create network watchdog instance
+  networkWatchdog = new NetworkWatchDog(
+    () => {
+      console.log(`[${new Date().toISOString()}] watchdog: destroying connection due to network change`);
+      if (socket) socket.destroy();
+    },
+    { pollInterval: 200 }
+  );
 
   function connectToServer() {
     if (destroyed) return;
@@ -45,6 +56,10 @@ function createTLSConnection(config, onFrame, onConnect, onDisconnect) {
 
       // Enable TCP keepalive to detect dead connections
       socket.setKeepAlive(true, 30000); // 30s initial delay, OS default interval
+
+      // Start network watchdog to detect interface changes
+      console.log(`[${new Date().toISOString()}] tls: connected, starting network watchdog`);
+      networkWatchdog.start();
 
       // Send INIT handshake after TLS connection is established
       socket.write(encodeFrame(0, FrameType.INIT, JSON.stringify({
@@ -113,6 +128,8 @@ function createTLSConnection(config, onFrame, onConnect, onDisconnect) {
       clearTimeout(connectionTimeout);
       initialized = false;
       stopWatchdog();
+      console.log(`[${new Date().toISOString()}] tls: connection closed, stopping network watchdog`);
+      if (networkWatchdog) networkWatchdog.stop();
       if (onDisconnect) onDisconnect();
       if (!destroyed) {
         console.log(`[${new Date().toISOString()}] Connection lost, will reconnect...`);
@@ -166,6 +183,7 @@ function createTLSConnection(config, onFrame, onConnect, onDisconnect) {
   function destroy() {
     destroyed = true;
     stopWatchdog();
+    if (networkWatchdog) networkWatchdog.stop();
     if (reconnectTimer) {
       clearTimeout(reconnectTimer);
       reconnectTimer = null;
