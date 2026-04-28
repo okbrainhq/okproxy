@@ -62,11 +62,6 @@ class NetworkWatchDog {
     const fp = getNetworkFingerprint();
     const detail = this._getDetail();
 
-    // Periodic heartbeat every 30 polls (~6 seconds at 200ms interval, ~30s at 1000ms)
-    if (this.pollCount % 30 === 0) {
-      this._log(`periodic status: poll#${this.pollCount} fingerprint="${fp}" interfaces=${JSON.stringify(detail)}`);
-    }
-
     // Detect change (but not on first poll when lastFingerprint is null)
     if (this.lastFingerprint !== null && fp !== this.lastFingerprint) {
       this._log(`NETWORK CHANGE DETECTED`);
