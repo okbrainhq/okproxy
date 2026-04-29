@@ -70,6 +70,7 @@ function createTLSServer(clientManager, options = {}) {
           socket.destroy();
           return;
         }
+        console.log(`[${new Date().toISOString()}] sending PING, serial: ${serial}`);
         socket.write(encodeFrame(0, FrameType.PING, Buffer.alloc(0)));
       }, keepaliveInterval);
     }
@@ -151,6 +152,7 @@ function createTLSServer(clientManager, options = {}) {
         // Handle PONG
         if (frame.streamId === 0 && frame.type === FrameType.PONG) {
           lastPongTime = Date.now();
+          console.log(`[${new Date().toISOString()}] received PONG, serial: ${serial}`);
           return;
         }
 

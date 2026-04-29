@@ -103,6 +103,7 @@ function createTLSConnection(config, onFrame, onConnect, onDisconnect) {
 
         // Handle PING (respond with PONG)
         if (frame.streamId === 0 && frame.type === FrameType.PING) {
+          console.log(`[${new Date().toISOString()}] received PING, sending PONG`);
           socket.write(encodeFrame(0, FrameType.PONG, Buffer.alloc(0)));
           return;
         }
