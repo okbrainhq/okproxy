@@ -8,6 +8,8 @@ const { NetworkWatchDog } = require('./network-watchdog');
 const INITIAL_RECONNECT_DELAY = 500; // 0.5 seconds
 const MAX_RECONNECT_DELAY = 3000; // Max 3 seconds between retries
 const WATCHDOG_TIMEOUT = 35000; // 35 seconds - tolerates 3 missed PINGs (server sends every 10s)
+const CLIENT_PING_INTERVAL = 15000; // 15 seconds
+const CLIENT_PONG_TIMEOUT = 20000; // 20 seconds (faster than server's 25s)
 
 function createTLSConnection(config, onFrame, onConnect, onDisconnect) {
   let socket = null;
@@ -18,6 +20,8 @@ function createTLSConnection(config, onFrame, onConnect, onDisconnect) {
   let destroyed = false;
   let watchdogTimer = null;
   let lastActivity = 0;
+  let clientKeepaliveTimer = null;
+  let clientLastPongTime = 0;
   let reconnectAttempts = 0;
   let serverSettings = { maxConcurrentStreams: 100 }; // Default until negotiated
   let networkWatchdog = null;
@@ -94,6 +98,7 @@ function createTLSConnection(config, onFrame, onConnect, onDisconnect) {
               // Use default if parsing fails
             }
             startWatchdog(); // Start monitoring connection health
+            startClientKeepalive(); // Start bidirectional keepalive (client sends PING, waits for PONG)
             if (onConnect) onConnect();
             return;
           }
@@ -105,6 +110,13 @@ function createTLSConnection(config, onFrame, onConnect, onDisconnect) {
         if (frame.streamId === 0 && frame.type === FrameType.PING) {
           console.log(`[${new Date().toISOString()}] received PING, sending PONG`);
           socket.write(encodeFrame(0, FrameType.PONG, Buffer.alloc(0)));
+          return;
+        }
+
+        // Handle PONG (response to our keepalive PING)
+        if (frame.streamId === 0 && frame.type === FrameType.PONG) {
+          clientLastPongTime = Date.now();
+          console.log(`[${new Date().toISOString()}] received PONG`);
           return;
         }
 
@@ -129,6 +141,7 @@ function createTLSConnection(config, onFrame, onConnect, onDisconnect) {
       clearTimeout(connectionTimeout);
       initialized = false;
       stopWatchdog();
+      stopClientKeepalive();
       console.log(`[${new Date().toISOString()}] tls: connection closed, stopping network watchdog`);
       if (networkWatchdog) networkWatchdog.stop();
       if (onDisconnect) onDisconnect();
@@ -170,6 +183,28 @@ function createTLSConnection(config, onFrame, onConnect, onDisconnect) {
     }
   }
 
+  function startClientKeepalive() {
+    clientLastPongTime = Date.now();
+    if (clientKeepaliveTimer) clearInterval(clientKeepaliveTimer);
+    clientKeepaliveTimer = setInterval(() => {
+      if (!initialized || !socket || socket.destroyed) return;
+      if (Date.now() - clientLastPongTime > CLIENT_PONG_TIMEOUT) {
+        console.log(`[${new Date().toISOString()}] Client keepalive: no PONG for ${Math.round((Date.now() - clientLastPongTime) / 1000)}s, reconnecting`);
+        socket.destroy();
+        return;
+      }
+      console.log(`[${new Date().toISOString()}] sending PING`);
+      socket.write(encodeFrame(0, FrameType.PING, Buffer.alloc(0)));
+    }, CLIENT_PING_INTERVAL);
+  }
+
+  function stopClientKeepalive() {
+    if (clientKeepaliveTimer) {
+      clearInterval(clientKeepaliveTimer);
+      clientKeepaliveTimer = null;
+    }
+  }
+
   function recordActivity() {
     lastActivity = Date.now();
   }
@@ -184,6 +219,7 @@ function createTLSConnection(config, onFrame, onConnect, onDisconnect) {
   function destroy() {
     destroyed = true;
     stopWatchdog();
+    stopClientKeepalive();
     if (networkWatchdog) networkWatchdog.stop();
     if (reconnectTimer) {
       clearTimeout(reconnectTimer);

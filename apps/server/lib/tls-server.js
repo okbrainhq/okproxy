@@ -149,6 +149,13 @@ function createTLSServer(clientManager, options = {}) {
           }
         }
 
+        // Handle client PING (respond with PONG)
+        if (frame.streamId === 0 && frame.type === FrameType.PING) {
+          console.log(`[${new Date().toISOString()}] received client PING, sending PONG, serial: ${serial}`);
+          socket.write(encodeFrame(0, FrameType.PONG, Buffer.alloc(0)));
+          return;
+        }
+
         // Handle PONG
         if (frame.streamId === 0 && frame.type === FrameType.PONG) {
           lastPongTime = Date.now();
