@@ -37,10 +37,11 @@ class InterfaceDetector extends EventEmitter {
     this.serverHost = options.serverHost || 'localhost';
     this.serverPort = options.serverPort || 9443;
     this.pollInterval = options.pollInterval || 2000;
-    this.probeTimeout = options.probeTimeout || 2000;
+    this.probeTimeout = options.probeTimeout || 5000;
     this.cacheTTL = options.cacheTTL || 5000;
     this.timer = null;
     this.running = false;
+    this._polling = false;
     this.lastSet = null;
     this.cache = new Map(); // interfaceName -> { ip, expiresAt }
   }
@@ -63,6 +64,9 @@ class InterfaceDetector extends EventEmitter {
   }
 
   _poll() {
+    if (this._polling) return;
+    this._polling = true;
+
     const interfaces = os.networkInterfaces();
     const candidates = [];
 
@@ -89,6 +93,8 @@ class InterfaceDetector extends EventEmitter {
         this.lastSet = key;
         this.emit('change', active);
       }
+    }).finally(() => {
+      this._polling = false;
     });
   }
 

@@ -29,6 +29,7 @@ class VirtualSocket extends EventEmitter {
     this.networkWatchdog = null;
     this.destroyed = false;
     this._readyEmitted = false;
+    this._failureCount = new Map(); // interfaceName -> consecutive failures
   }
 
   /**
@@ -49,7 +50,7 @@ class VirtualSocket extends EventEmitter {
       // Single-connection: default socket + network watchdog
       this._createRealSocket('default', null);
       this.networkWatchdog = new NetworkWatchDog(() => {
-        console.log(`[virtual-socket] network change detected, reconnecting`);
+        console.log(`[${new Date().toISOString()}] [virtual-socket] network change detected, reconnecting`);
         for (const rs of this.realSockets.values()) {
           if (rs.socket) rs.socket.destroy();
         }
@@ -65,9 +66,16 @@ class VirtualSocket extends EventEmitter {
     for (const [name, rs] of this.realSockets) {
       if (name === 'default') continue;
       if (!activeNames.has(name)) {
-        console.log(`[virtual-socket] Removing interface: ${name}`);
-        rs.destroy();
-        this.realSockets.delete(name);
+        const fails = (this._failureCount.get(name) || 0) + 1;
+        this._failureCount.set(name, fails);
+        if (fails >= 3) {
+          console.log(`[${new Date().toISOString()}] [virtual-socket] Removing interface: ${name}`);
+          rs.destroy();
+          this.realSockets.delete(name);
+          this._failureCount.delete(name);
+        }
+      } else {
+        this._failureCount.delete(name);
       }
     }
 

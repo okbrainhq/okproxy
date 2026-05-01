@@ -105,7 +105,7 @@ function main() {
   });
 
   vs.on('socketConnected', (interfaceName) => {
-    console.log(`[virtual-socket] Interface ${interfaceName} connected`);
+    console.log(`[${new Date().toISOString()}] [virtual-socket] Interface ${interfaceName} connected`);
   });
 
   vs.on('frame', (frame) => {

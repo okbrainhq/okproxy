@@ -15,11 +15,6 @@ const DEFAULT_PING_INTERVAL = 3000;
 const DEFAULT_PONG_TIMEOUT = 10000;
 const DEFAULT_BACKPRESSURE_TIMEOUT = 8000;
 
-// Relaxed keepalive for multipath (redundant connections, less urgency)
-const MULTIPATH_WATCHDOG_TIMEOUT = 60000;
-const MULTIPATH_PING_INTERVAL = 15000;
-const MULTIPATH_PONG_TIMEOUT = 45000;
-const MULTIPATH_BACKPRESSURE_TIMEOUT = 20000;
 const CONNECTION_TIMEOUT = 25000;
 const INIT_RESPONSE_TIMEOUT = 10000; // 10s for server INIT ACK
 const SEQ_RESET_THRESHOLD = 0xFFFFFF0F; // 2^32 - 1,000,000 ~ roughly
@@ -81,7 +76,7 @@ class RealSocket extends EventEmitter {
     }
 
     const connectionTimeout = setTimeout(() => {
-      console.log(`[${this.config.interfaceName}] Connection timeout (${CONNECTION_TIMEOUT/1000}s), destroying socket`);
+      console.log(`[${new Date().toISOString()}] [${this.config.interfaceName}] Connection timeout (${CONNECTION_TIMEOUT/1000}s), destroying socket`);
       if (this.socket) this.socket.destroy();
     }, CONNECTION_TIMEOUT);
 
@@ -112,7 +107,7 @@ class RealSocket extends EventEmitter {
       // Set a timeout for INIT response
       const initResponseTimer = setTimeout(() => {
         if (!this.initialized && this.socket && !this.socket.destroyed) {
-          console.log(`[${this.config.interfaceName}] INIT response timeout (${INIT_RESPONSE_TIMEOUT/1000}s)`);
+          console.log(`[${new Date().toISOString()}] [${this.config.interfaceName}] INIT response timeout (${INIT_RESPONSE_TIMEOUT/1000}s)`);
           this.socket.destroy();
         }
       }, INIT_RESPONSE_TIMEOUT);
@@ -137,7 +132,7 @@ class RealSocket extends EventEmitter {
             }
             this.reconnectDelay = INITIAL_RECONNECT_DELAY;
             if (this.reconnectAttempts > 0) {
-              console.log(`[${this.config.interfaceName}] Reconnected after ${this.reconnectAttempts} attempt(s)`);
+              console.log(`[${new Date().toISOString()}] [${this.config.interfaceName}] Reconnected after ${this.reconnectAttempts} attempt(s)`);
             }
             this.reconnectAttempts = 0;
             try {
@@ -211,7 +206,7 @@ class RealSocket extends EventEmitter {
   _scheduleReconnect() {
     if (this.reconnectTimer) return;
     this.reconnectAttempts++;
-    console.log(`[${this.config.interfaceName}] Reconnect attempt #${this.reconnectAttempts} in ${this.reconnectDelay}ms...`);
+    console.log(`[${new Date().toISOString()}] [${this.config.interfaceName}] Reconnect attempt #${this.reconnectAttempts} in ${this.reconnectDelay}ms...`);
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       this._connect();
@@ -226,7 +221,7 @@ class RealSocket extends EventEmitter {
       if (!this.initialized || !this.socket || this.socket.destroyed) return;
       const idleTime = Date.now() - this.lastActivity;
       if (idleTime > this._watchdogTimeout) {
-        console.log(`[${this.config.interfaceName}] watchdog: no activity for ${Math.round(idleTime/1000)}s, closing`);
+        console.log(`[${new Date().toISOString()}] [${this.config.interfaceName}] watchdog: no activity for ${Math.round(idleTime/1000)}s, closing`);
         this.socket.destroy();
       }
     }, 5000);
@@ -246,13 +241,13 @@ class RealSocket extends EventEmitter {
       if (!this.initialized || !this.socket || this.socket.destroyed) return;
 
       if (Date.now() - this.lastWriteOk > this._backpressureTimeout) {
-        console.log(`[${this.config.interfaceName}] backpressure: socket not drained, reconnecting`);
+        console.log(`[${new Date().toISOString()}] [${this.config.interfaceName}] backpressure: socket not drained, reconnecting`);
         this.socket.destroy();
         return;
       }
 
       if (Date.now() - this.lastPongTime > this._pongTimeout) {
-        console.log(`[${this.config.interfaceName}] keepalive: no PONG for ${Math.round((Date.now() - this.lastPongTime) / 1000)}s, reconnecting`);
+        console.log(`[${new Date().toISOString()}] [${this.config.interfaceName}] keepalive: no PONG for ${Math.round((Date.now() - this.lastPongTime) / 1000)}s, reconnecting`);
         this.socket.destroy();
         return;
       }
@@ -305,4 +300,4 @@ class RealSocket extends EventEmitter {
   }
 }
 
-module.exports = { RealSocket, SEQ_RESET_THRESHOLD, DEFAULT_PING_INTERVAL, DEFAULT_PONG_TIMEOUT, MULTIPATH_PING_INTERVAL, MULTIPATH_PONG_TIMEOUT };
+module.exports = { RealSocket, SEQ_RESET_THRESHOLD, DEFAULT_PING_INTERVAL, DEFAULT_PONG_TIMEOUT };
