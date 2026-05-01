@@ -269,6 +269,7 @@ cat > "$PLIST_PATH" <<EOF
     <array>
         <string>${NODE_PATH}</string>
         <string>${CLIENT_DIR}/index.js</string>
+        <string>--multipath</string>
         <string>--server</string>
         <string>${SERVER_HOSTNAME}:${SERVER_PORT}</string>
         <string>--target</string>
@@ -310,6 +311,8 @@ cat > "$PLIST_PATH" <<EOF
         <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
         <key>NODE_ENV</key>
         <string>production</string>
+        <key>MULTIPATH_ENABLED</key>
+        <string>true</string>
     </dict>
 </dict>
 </plist>
