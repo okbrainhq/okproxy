@@ -146,10 +146,12 @@ class RealSocket extends EventEmitter {
         // Handle control frames
         if (frame.streamId === 0) {
           if (frame.type === FrameType.PING) {
+            console.log(`[${this.config.interfaceName}] ${new Date().toISOString()} received PING, sending PONG`);
             this.socket.write(encodeFrame(0, FrameType.PONG, Buffer.alloc(0)));
             return;
           }
           if (frame.type === FrameType.PONG) {
+            console.log(`[${this.config.interfaceName}] ${new Date().toISOString()} received PONG`);
             this.lastPongTime = Date.now();
             return;
           }
@@ -196,6 +198,7 @@ class RealSocket extends EventEmitter {
   _scheduleReconnect() {
     if (this.reconnectTimer) return;
     this.reconnectAttempts++;
+    console.log(`[${this.config.interfaceName}] Reconnect attempt #${this.reconnectAttempts} in ${this.reconnectDelay}ms...`);
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
       this._connect();
@@ -210,6 +213,7 @@ class RealSocket extends EventEmitter {
       if (!this.initialized || !this.socket || this.socket.destroyed) return;
       const idleTime = Date.now() - this.lastActivity;
       if (idleTime > WATCHDOG_TIMEOUT) {
+        console.log(`[${this.config.interfaceName}] watchdog: no activity for ${Math.round(idleTime/1000)}s, closing`);
         this.socket.destroy();
       }
     }, 5000);
@@ -229,15 +233,18 @@ class RealSocket extends EventEmitter {
       if (!this.initialized || !this.socket || this.socket.destroyed) return;
 
       if (Date.now() - this.lastWriteOk > BACKPRESSURE_TIMEOUT) {
+        console.log(`[${this.config.interfaceName}] backpressure: socket not drained, reconnecting`);
         this.socket.destroy();
         return;
       }
 
       if (Date.now() - this.lastPongTime > CLIENT_PONG_TIMEOUT) {
+        console.log(`[${this.config.interfaceName}] keepalive: no PONG for ${Math.round((Date.now() - this.lastPongTime) / 1000)}s, reconnecting`);
         this.socket.destroy();
         return;
       }
 
+      console.log(`[${this.config.interfaceName}] ${new Date().toISOString()} sending PING`);
       this.socket.write(encodeFrame(0, FrameType.PING, Buffer.alloc(0)));
     }, CLIENT_PING_INTERVAL);
   }

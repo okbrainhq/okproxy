@@ -4,6 +4,7 @@
 const { encodeFrame, FrameType, CONTROL_FRAME_TYPES, DedupWindow } = require('../../../packages/frame-protocol');
 const { RealSocket, SEQ_RESET_THRESHOLD } = require('./real-socket');
 const { InterfaceDetector } = require('./interface-detector');
+const { NetworkWatchDog } = require('./network-watchdog');
 const { EventEmitter } = require('node:events');
 
 class VirtualSocket extends EventEmitter {
@@ -17,6 +18,7 @@ class VirtualSocket extends EventEmitter {
     this.seqCounters = new Map(); // streamId -> nextSeqNo
     this.dedupWindows = new Map(); // streamId -> DedupWindow
     this.detector = null;
+    this.networkWatchdog = null;
     this.destroyed = false;
     this._readyEmitted = false;
   }
@@ -25,22 +27,29 @@ class VirtualSocket extends EventEmitter {
    * Start the multipath system: detect interfaces and connect.
    */
   start() {
-    // If multipath is disabled, use a single connection without detector
-    if (process.env.MULTIPATH_ENABLED !== 'true') {
-      this._createRealSocket('default', null);
-      return;
+    // Always create at least one default connection
+    this._createRealSocket('default', null);
+
+    if (process.env.MULTIPATH_ENABLED === 'true') {
+      // Multipath: detector manages additional connections
+      this.detector = new InterfaceDetector({
+        serverHost: this.config.serverHost,
+        serverPort: this.config.serverPort
+      });
+      this.detector.on('change', (interfaces) => {
+        this._syncInterfaces(interfaces);
+      });
+      this.detector.start();
+    } else {
+      // Single-connection: watchdog detects network changes, triggers reconnect
+      this.networkWatchdog = new NetworkWatchDog(() => {
+        console.log(`[virtual-socket] network change detected, reconnecting`);
+        for (const rs of this.realSockets.values()) {
+          if (rs.socket) rs.socket.destroy();
+        }
+      }, { pollInterval: 200 });
+      this.networkWatchdog.start();
     }
-
-    this.detector = new InterfaceDetector({
-      serverHost: this.config.serverHost,
-      serverPort: this.config.serverPort
-    });
-
-    this.detector.on('change', (interfaces) => {
-      this._syncInterfaces(interfaces);
-    });
-
-    this.detector.start();
   }
 
   _syncInterfaces(interfaces) {
@@ -249,6 +258,10 @@ class VirtualSocket extends EventEmitter {
     if (this.detector) {
       this.detector.stop();
       this.detector = null;
+    }
+    if (this.networkWatchdog) {
+      this.networkWatchdog.stop();
+      this.networkWatchdog = null;
     }
     for (const rs of this.realSockets.values()) {
       rs.destroy();

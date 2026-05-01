@@ -5,7 +5,7 @@ const { describe, it } = require('node:test');
 const assert = require('node:assert');
 const { DedupWindow, FrameType } = require('../../../packages/frame-protocol');
 const { shouldSkip } = require('../../../apps/client/lib/interface-detector');
-const { createTestEnv, httpRequest } = require('./setup');
+const { createTestEnv, httpRequest, getCertPaths } = require('./setup');
 const { VirtualSocket } = require('../../../apps/client/lib/virtual-socket');
 const { ConnectionPool } = require('../../../apps/server/lib/connection-pool');
 
@@ -342,5 +342,74 @@ describe('Bugfix: ready emitted once (Bug 4)', () => {
     vs.realSockets.set('en8', fakeRS);
     vs._checkReady();
     assert.strictEqual(readyCount, 1, 'second call should not emit again');
+  });
+});
+
+describe('Bugfix: NetworkWatchDog in single-connection mode', () => {
+  it('should start NetworkWatchDog when multipath is disabled', () => {
+    const vs = new VirtualSocket({
+      serverHost: 'localhost',
+      serverPort: 9999,
+      clientKey: 'none',
+      clientCert: 'none',
+      caCert: 'none'
+    });
+
+    // Bypass start() — manually simulate what it does
+    vs._createRealSocket = () => {}; // suppress actual socket creation
+
+    vs.start();
+
+    assert.ok(vs.networkWatchdog !== null, 'NetworkWatchDog should be created');
+    assert.ok(vs.detector === null, 'InterfaceDetector should NOT be created');
+
+    vs.destroy();
+  });
+
+  it('should start InterfaceDetector when multipath is enabled', () => {
+    const vs = new VirtualSocket({
+      serverHost: 'localhost',
+      serverPort: 9999,
+      clientKey: 'none',
+      clientCert: 'none',
+      caCert: 'none'
+    });
+
+    vs._createRealSocket = () => {}; // suppress actual socket creation
+
+    process.env.MULTIPATH_ENABLED = 'true';
+    vs.start();
+
+    // Stop detector immediately to prevent probe hangs
+    if (vs.detector) vs.detector.stop();
+
+    assert.ok(vs.detector !== null, 'InterfaceDetector should be created');
+    assert.ok(vs.networkWatchdog === null, 'NetworkWatchDog should NOT be created');
+
+    vs.destroy();
+    delete process.env.MULTIPATH_ENABLED;
+  });
+
+  it('should destroy socket on network change', () => {
+    const vs = new VirtualSocket({
+      serverHost: 'localhost',
+      serverPort: 9999,
+      clientKey: 'none',
+      clientCert: 'none',
+      caCert: 'none'
+    });
+
+    vs._createRealSocket = () => {}; // suppress
+    vs.start();
+
+    const fakeSocket = { destroyed: false };
+    fakeSocket.destroy = () => { fakeSocket.destroyed = true; };
+    vs.realSockets.set('default', { socket: fakeSocket, destroy() {} });
+
+    vs.networkWatchdog.onChange();
+
+    assert.ok(fakeSocket.destroyed, 'Socket should be destroyed on network change');
+
+    vs.destroy();
   });
 });
