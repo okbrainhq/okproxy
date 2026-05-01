@@ -8,10 +8,18 @@ const { EventEmitter } = require('node:events');
 
 const INITIAL_RECONNECT_DELAY = 500;
 const MAX_RECONNECT_DELAY = 3000;
-const WATCHDOG_TIMEOUT = 35000;
-const CLIENT_PING_INTERVAL = 3000;
-const CLIENT_PONG_TIMEOUT = 10000;
-const BACKPRESSURE_TIMEOUT = 8000;
+
+// Default keepalive for single-connection (aggressive)
+const DEFAULT_WATCHDOG_TIMEOUT = 35000;
+const DEFAULT_PING_INTERVAL = 3000;
+const DEFAULT_PONG_TIMEOUT = 10000;
+const DEFAULT_BACKPRESSURE_TIMEOUT = 8000;
+
+// Relaxed keepalive for multipath (redundant connections, less urgency)
+const MULTIPATH_WATCHDOG_TIMEOUT = 60000;
+const MULTIPATH_PING_INTERVAL = 15000;
+const MULTIPATH_PONG_TIMEOUT = 45000;
+const MULTIPATH_BACKPRESSURE_TIMEOUT = 20000;
 const CONNECTION_TIMEOUT = 25000;
 const INIT_RESPONSE_TIMEOUT = 10000; // 10s for server INIT ACK
 const SEQ_RESET_THRESHOLD = 0xFFFFFF0F; // 2^32 - 1,000,000 ~ roughly
@@ -44,6 +52,11 @@ class RealSocket extends EventEmitter {
     this.lastWriteOk = 0;
     this._initResponseTimer = null;
     this.serverSettings = { maxConcurrentStreams: 100 };
+    // Keepalive timing — allows multipath to relax
+    this._pingInterval = config.pingInterval || DEFAULT_PING_INTERVAL;
+    this._pongTimeout = config.pongTimeout || DEFAULT_PONG_TIMEOUT;
+    this._watchdogTimeout = config.watchdogTimeout || DEFAULT_WATCHDOG_TIMEOUT;
+    this._backpressureTimeout = config.backpressureTimeout || DEFAULT_BACKPRESSURE_TIMEOUT;
   }
 
   start() {
@@ -212,7 +225,7 @@ class RealSocket extends EventEmitter {
     this.watchdogTimer = setInterval(() => {
       if (!this.initialized || !this.socket || this.socket.destroyed) return;
       const idleTime = Date.now() - this.lastActivity;
-      if (idleTime > WATCHDOG_TIMEOUT) {
+      if (idleTime > this._watchdogTimeout) {
         console.log(`[${this.config.interfaceName}] watchdog: no activity for ${Math.round(idleTime/1000)}s, closing`);
         this.socket.destroy();
       }
@@ -232,13 +245,13 @@ class RealSocket extends EventEmitter {
     this.keepaliveTimer = setInterval(() => {
       if (!this.initialized || !this.socket || this.socket.destroyed) return;
 
-      if (Date.now() - this.lastWriteOk > BACKPRESSURE_TIMEOUT) {
+      if (Date.now() - this.lastWriteOk > this._backpressureTimeout) {
         console.log(`[${this.config.interfaceName}] backpressure: socket not drained, reconnecting`);
         this.socket.destroy();
         return;
       }
 
-      if (Date.now() - this.lastPongTime > CLIENT_PONG_TIMEOUT) {
+      if (Date.now() - this.lastPongTime > this._pongTimeout) {
         console.log(`[${this.config.interfaceName}] keepalive: no PONG for ${Math.round((Date.now() - this.lastPongTime) / 1000)}s, reconnecting`);
         this.socket.destroy();
         return;
@@ -246,7 +259,7 @@ class RealSocket extends EventEmitter {
 
       console.log(`[${this.config.interfaceName}] ${new Date().toISOString()} sending PING`);
       this.socket.write(encodeFrame(0, FrameType.PING, Buffer.alloc(0)));
-    }, CLIENT_PING_INTERVAL);
+    }, this._pingInterval);
   }
 
   _stopKeepalive() {
@@ -292,4 +305,4 @@ class RealSocket extends EventEmitter {
   }
 }
 
-module.exports = { RealSocket, SEQ_RESET_THRESHOLD };
+module.exports = { RealSocket, SEQ_RESET_THRESHOLD, DEFAULT_PING_INTERVAL, DEFAULT_PONG_TIMEOUT, MULTIPATH_PING_INTERVAL, MULTIPATH_PONG_TIMEOUT };

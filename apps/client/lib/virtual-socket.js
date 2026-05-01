@@ -7,6 +7,14 @@ const { InterfaceDetector } = require('./interface-detector');
 const { NetworkWatchDog } = require('./network-watchdog');
 const { EventEmitter } = require('node:events');
 
+// Relaxed keepalive for multipath (redundant connections, less urgency)
+const MP_KEEPALIVE = {
+  pingInterval: 15000,
+  pongTimeout: 45000,
+  watchdogTimeout: 60000,
+  backpressureTimeout: 20000
+};
+
 class VirtualSocket extends EventEmitter {
   /**
    * @param {Object} config - Tunnel config (serverHost, serverPort, clientKey, etc.)
@@ -84,6 +92,11 @@ class VirtualSocket extends EventEmitter {
       interfaceName,
       localAddress
     };
+
+    // Use relaxed keepalive in multipath mode
+    if (process.env.MULTIPATH_ENABLED === 'true') {
+      Object.assign(rsConfig, MP_KEEPALIVE);
+    }
 
     const rs = new RealSocket(rsConfig);
 
