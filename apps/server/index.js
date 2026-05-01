@@ -1,9 +1,9 @@
 #!/usr/bin/env node
-// Server Entry Point - TLS + mTLS only
+// Server Entry Point - TLS + mTLS with multipath support
 
 const { createTLSServer } = require('./lib/tls-server');
 const { createHTTPServer } = require('./lib/http-router');
-const { ClientManager } = require('./lib/client-manager');
+const { ConnectionPool } = require('./lib/connection-pool');
 
 const DEFAULT_KEY = './.certs/server-key.pem';
 const DEFAULT_CERT = './.certs/server-cert.pem';
@@ -84,16 +84,6 @@ Options:
   --keepalive-interval <ms>   PING interval (default: 10000)
   --keepalive-timeout <ms>    PONG timeout (default: 25000)
   --help                      Show this help
-
-Examples:
-  # With default certificate paths
-  node apps/server/index.js
-
-  # With custom certificate paths
-  node apps/server/index.js \\
-    --key ./certs/server-key.pem \\
-    --cert ./certs/server-cert.pem \\
-    --ca ./.ca/ca-cert.pem
         `);
         process.exit(0);
     }
@@ -108,25 +98,20 @@ function main() {
   console.log('Starting TLS tunnel server...');
   console.log('Options:', options);
 
-  const clientManager = new ClientManager();
+  const connectionPool = new ConnectionPool();
 
-  // Create TLS server
-  const tlsServer = createTLSServer(clientManager, options);
+  const tlsServer = createTLSServer(connectionPool, options);
 
-  // Create HTTP server for public requests
-  const httpServer = createHTTPServer(clientManager, tlsServer, options);
+  const httpServer = createHTTPServer(connectionPool, tlsServer, options);
 
-  // Start TLS server
   tlsServer.listen(options.tlsPort, () => {
     console.log(`TLS tunnel server listening on port ${options.tlsPort}`);
   });
 
-  // Start HTTP server
   httpServer.listen(options.httpPort, () => {
     console.log(`HTTP server listening on port ${options.httpPort}`);
   });
 
-  // Handle graceful shutdown
   process.on('SIGINT', () => {
     console.log('\nShutting down...');
     tlsServer.close();

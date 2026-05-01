@@ -1,16 +1,17 @@
 // TLS Server - Handles tunnel client connections with mTLS
+// Supports multiple connections from the same client via ConnectionPool
 
 const { createServer } = require('node:tls');
 const { readFileSync } = require('node:fs');
 const { encodeFrame, createFrameDecoder, FrameType } = require('../../../packages/frame-protocol');
 const { isRevoked } = require('./ca');
 
-const KEEPALIVE_INTERVAL = 10000; // 10 seconds
-const KEEPALIVE_TIMEOUT = 25000; // 25 seconds (tolerates 2 missed PONGs)
-const INIT_TIMEOUT = 10000; // 10 seconds for INIT handshake
+const KEEPALIVE_INTERVAL = 10000;
+const KEEPALIVE_TIMEOUT = 25000;
+const INIT_TIMEOUT = 10000;
 const MAX_CONCURRENT_STREAMS = 100;
 
-function createTLSServer(clientManager, options = {}) {
+function createTLSServer(connectionPool, options = {}) {
   const maxStreams = options.maxConcurrentStreams || MAX_CONCURRENT_STREAMS;
   const keepaliveInterval = options.keepaliveInterval || KEEPALIVE_INTERVAL;
   const keepaliveTimeout = options.keepaliveTimeout || KEEPALIVE_TIMEOUT;
@@ -22,24 +23,21 @@ function createTLSServer(clientManager, options = {}) {
     ca: readFileSync(options.caCert),
     requestCert: true,
     rejectUnauthorized: true,
-    minVersion: 'TLSv1.2'  // Explicitly set minimum TLS version for defense in depth
+    minVersion: 'TLSv1.2'
   };
 
   let nextStreamId = 1;
 
   const server = createServer(tlsOptions, (socket) => {
-    // TLS authentication check
     if (!socket.authorized) {
       console.error('TLS auth failed:', socket.authorizationError);
       socket.destroy();
       return;
     }
 
-    // Check certificate revocation
     const cert = socket.getPeerCertificate();
     const serial = cert.serialNumber;
 
-    // Guard against edge cases where certificate info is not available
     if (!serial) {
       console.error('Client certificate serial number unavailable, rejecting connection');
       socket.destroy();
@@ -60,6 +58,7 @@ function createTLSServer(clientManager, options = {}) {
     let initTimer = null;
     let keepaliveTimer = null;
     let lastPongTime = 0;
+    let interfaceName = `conn-${serial}-${Date.now()}`; // fallback
 
     function startKeepalive() {
       lastPongTime = Date.now();
@@ -70,7 +69,6 @@ function createTLSServer(clientManager, options = {}) {
           socket.destroy();
           return;
         }
-        console.log(`[${new Date().toISOString()}] sending PING, serial: ${serial}`);
         socket.write(encodeFrame(0, FrameType.PING, Buffer.alloc(0)));
       }, keepaliveInterval);
     }
@@ -85,7 +83,6 @@ function createTLSServer(clientManager, options = {}) {
     const decoder = createFrameDecoder(
       (frame) => {
         if (!initialized) {
-          // Must receive INIT first
           if (frame.streamId !== 0 || frame.type !== FrameType.INIT) {
             socket.destroy();
             return;
@@ -97,7 +94,6 @@ function createTLSServer(clientManager, options = {}) {
               initTimer = null;
             }
 
-            // Parse and validate client INIT payload
             let clientInit;
             try {
               clientInit = JSON.parse(frame.payload.toString());
@@ -107,41 +103,33 @@ function createTLSServer(clientManager, options = {}) {
               return;
             }
 
-            // Validate protocol version
-            if (typeof clientInit.version !== 'number' || clientInit.version < 1) {
-              console.error(`[${new Date().toISOString()}] Invalid protocol version from client ${serial}:`, clientInit.version);
-              socket.destroy();
-              return;
-            }
-
-            // Validate maxFrameSize if provided (must be reasonable)
             if (clientInit.maxFrameSize !== undefined) {
               if (typeof clientInit.maxFrameSize !== 'number' ||
                   clientInit.maxFrameSize < 1024 ||
-                  clientInit.maxFrameSize > 10485760) { // Max 10MB
+                  clientInit.maxFrameSize > 10485760) {
                 console.error(`[${new Date().toISOString()}] Invalid maxFrameSize from client ${serial}:`, clientInit.maxFrameSize);
                 socket.destroy();
                 return;
               }
             }
 
-            // Send INIT ACK with server's capabilities
+            // Use interface name from client, or fallback
+            if (clientInit.interface) {
+              interfaceName = clientInit.interface;
+            }
+
+            // Send INIT ACK
             socket.write(encodeFrame(0, FrameType.INIT, JSON.stringify({
-              version: 1,
               maxFrameSize: 1048576,
               maxConcurrentStreams: maxStreams
             })));
 
-            // Register client (single client model, same as tcp-server)
-            clientManager.add({
-              socket,
-              write: (data) => socket.write(data),
-              activeStreams: new Map()
-            });
+            // Register this connection in the pool
+            connectionPool.add(interfaceName, socket);
 
             initialized = true;
             startKeepalive();
-            console.log(`[${new Date().toISOString()}] Client ready, serial: ${serial}, protocol version: ${clientInit.version}`);
+            console.log(`[${new Date().toISOString()}] Client ready, serial: ${serial}, interface: ${interfaceName}`);
             return;
           } catch (err) {
             socket.destroy();
@@ -149,9 +137,8 @@ function createTLSServer(clientManager, options = {}) {
           }
         }
 
-        // Handle client PING (respond with PONG)
+        // Handle client PING
         if (frame.streamId === 0 && frame.type === FrameType.PING) {
-          console.log(`[${new Date().toISOString()}] received client PING, sending PONG, serial: ${serial}`);
           socket.write(encodeFrame(0, FrameType.PONG, Buffer.alloc(0)));
           return;
         }
@@ -159,21 +146,17 @@ function createTLSServer(clientManager, options = {}) {
         // Handle PONG
         if (frame.streamId === 0 && frame.type === FrameType.PONG) {
           lastPongTime = Date.now();
-          console.log(`[${new Date().toISOString()}] received PONG, serial: ${serial}`);
           return;
         }
 
-        // Handle client responses (HEADERS, DATA, FIN, ERROR from client)
-        if (frame.streamId > 0) {
-          const handler = clientManager.getStreamHandler(frame.streamId);
-          if (handler) {
-            if (frame.type === FrameType.ERROR && handler.errorHandler) {
-              handler.errorHandler(new Error(frame.payload.toString()));
-            } else if (handler.frameHandler) {
-              handler.frameHandler(frame);
-            }
-          }
+        // Handle RESET_SEQ
+        if (frame.streamId === 0 && frame.type === FrameType.RESET_SEQ) {
+          connectionPool.handleResetSeq(frame);
+          return;
         }
+
+        // All other frames: dedup and route
+        connectionPool.onFrame(frame);
       },
       (err) => {
         console.error('Protocol error:', err.message);
@@ -186,15 +169,8 @@ function createTLSServer(clientManager, options = {}) {
     socket.on('close', () => {
       stopKeepalive();
       if (initTimer) clearTimeout(initTimer);
-      // Remove the client if this socket is the current one
-      if (clientManager.get() && clientManager.get().socket === socket) {
-        console.log(`[${new Date().toISOString()}] Client disconnected, serial: ${serial}`);
-        clientManager.remove();
-      } else if (initialized) {
-        console.log(`[${new Date().toISOString()}] Client connection closed (replaced), serial: ${serial}`);
-      } else {
-        console.log(`[${new Date().toISOString()}] Client disconnected before init, serial: ${serial}`);
-      }
+      console.log(`[${new Date().toISOString()}] Client disconnected, serial: ${serial}, interface: ${interfaceName}`);
+      connectionPool.remove(socket);
     });
 
     socket.on('error', (err) => {
@@ -205,16 +181,14 @@ function createTLSServer(clientManager, options = {}) {
       socket.destroy();
     });
 
-    // Timeout if INIT not received
     initTimer = setTimeout(() => {
       if (!initialized) socket.destroy();
     }, initTimeout);
   });
 
-  // Track active streams to prevent ID collision on wraparound
+  // Track active streams to prevent ID collision
   const activeStreams = new Set();
 
-  // Method to allocate a new stream ID
   server.allocateStreamId = () => {
     const attempts = maxStreams;
     for (let i = 0; i < attempts; i++) {
@@ -228,7 +202,6 @@ function createTLSServer(clientManager, options = {}) {
     throw new Error('No available stream IDs');
   };
 
-  // Method to release a stream ID when done
   server.releaseStreamId = (id) => {
     activeStreams.delete(id);
   };

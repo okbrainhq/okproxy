@@ -1,8 +1,8 @@
 #!/usr/bin/env node
-// Client Entry Point - TLS only
+// Client Entry Point - TLS with multipath support
 
 const { createProxy } = require('./lib/proxy');
-const { createTLSConnection } = require('./lib/tls-connection');
+const { VirtualSocket } = require('./lib/virtual-socket');
 
 const DEFAULT_KEY = './.certs/client-key.pem';
 const DEFAULT_CERT = './.certs/client-cert.pem';
@@ -62,6 +62,9 @@ function parseArgs() {
       case '--ca':
         options.caCert = args[++i];
         break;
+      case '--multipath':
+        process.env.MULTIPATH_ENABLED = 'true';
+        break;
       case '--help':
         console.log(`
 Usage: node index.js [options]
@@ -72,17 +75,8 @@ Options:
   --key <path>            Client private key (default: ${DEFAULT_KEY})
   --cert <path>           Client certificate (default: ${DEFAULT_CERT})
   --ca <path>             CA certificate to verify server (default: ${DEFAULT_CA})
+  --multipath             Enable multipath (multiple network interfaces)
   --help                  Show this help
-
-Examples:
-  # With default certificate paths
-  node apps/client/index.js
-
-  # With custom certificate paths
-  node apps/client/index.js \\
-    --key ./certs/client-key.pem \\
-    --cert ./certs/client-cert.pem \\
-    --ca ./.ca/ca-cert.pem
         `);
         process.exit(0);
     }
@@ -97,40 +91,50 @@ function main() {
   console.log('Starting TLS tunnel client...');
   console.log(`Server: ${config.serverHost}:${config.serverPort}`);
   console.log(`Target: ${config.targetHost}:${config.targetPort}`);
+  console.log(`Multipath: ${process.env.MULTIPATH_ENABLED === 'true' ? 'enabled' : 'disabled (use --multipath to enable)'}`);
 
   let proxy = null;
+  let isReady = false;
 
-  // Create TLS connection
-  const connection = createTLSConnection(
-    config,
-    (frame) => {
-      if (proxy) {
-        proxy.handleFrame(frame);
-      }
-    },
-    () => {
-      console.log('Connected to TLS tunnel server');
-      proxy = createProxy(connection, config.targetPort, config.targetHost, connection.maxConcurrentStreams);
-    },
-    () => {
-      console.log('Disconnected from TLS tunnel server');
-      if (proxy) {
-        proxy.destroy();
-        proxy = null;
-      }
+  const vs = new VirtualSocket(config);
+
+  vs.on('ready', () => {
+    isReady = true;
+    console.log('Connected to TLS tunnel server (multipath ready)');
+    proxy = createProxy(vs, config.targetPort, config.targetHost, vs.maxConcurrentStreams);
+  });
+
+  vs.on('socketConnected', (interfaceName) => {
+    console.log(`[virtual-socket] Interface ${interfaceName} connected`);
+  });
+
+  vs.on('frame', (frame) => {
+    if (proxy) {
+      proxy.handleFrame(frame);
     }
-  );
+  });
 
-  // Handle graceful shutdown
+  vs.on('error', (err) => {
+    console.error('VirtualSocket error:', err.message);
+    if (!isReady) {
+      console.error('Failed to connect to server. Exiting...');
+      process.exit(1);
+    }
+  });
+
+  vs.start();
+
   process.on('SIGINT', () => {
     console.log('\nShutting down...');
-    connection.destroy();
+    if (proxy) proxy.destroy();
+    vs.destroy();
     process.exit(0);
   });
 
   process.on('SIGTERM', () => {
     console.log('\nShutting down...');
-    connection.destroy();
+    if (proxy) proxy.destroy();
+    vs.destroy();
     process.exit(0);
   });
 }

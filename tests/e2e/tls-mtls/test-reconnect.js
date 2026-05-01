@@ -20,8 +20,8 @@ describe('Client Reconnection', () => {
       // Wait for reconnection (with initial 1s delay + connection time)
       await new Promise(r => setTimeout(r, 2000));
 
-      // Check via client manager that client is back
-      assert.ok(env.clientManager.has('test-reconnect'), 'Client should be registered in manager');
+      // Check via virtual socket that client is back
+      assert.ok(env.isClientConnected(), 'Client should be reconnected');
     } finally {
       await env.cleanup();
     }
@@ -39,7 +39,7 @@ describe('Client Reconnection', () => {
       await new Promise(r => setTimeout(r, 2000));
 
       // Should be reconnected and registered
-      assert.ok(env.clientManager.has('test-reconnect-init'), 'Should be reconnected');
+      assert.ok(env.isClientConnected(), 'Should be reconnected');
     } finally {
       await env.cleanup();
     }

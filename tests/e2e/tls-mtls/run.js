@@ -26,7 +26,10 @@ const testFiles = [
   'test-security.js',
   'test-revocation.js',
   'test-websocket.js',
-  'test-bugfixes.js'
+  'test-websocket-bugs.js',
+  'test-bugfixes.js',
+  'test-multipath.js',
+  'test-multipath-e2e.js'
 ];
 
 // Files that need longer timeout (in ms)
