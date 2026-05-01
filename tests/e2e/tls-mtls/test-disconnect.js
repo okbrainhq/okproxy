@@ -67,8 +67,7 @@ describe('Client Disconnection', () => {
       await env.startClient('test-cleanup');
       
       // Verify client registered
-      const client = env.clientManager.get('test-cleanup');
-      assert.ok(client, 'Client should be registered');
+      assert.ok(env.connectionPool.count > 0, 'Client should be registered');
       
       // Stop client
       env.stopClient();
@@ -76,7 +75,7 @@ describe('Client Disconnection', () => {
       await new Promise(r => setTimeout(r, 100));
       
       // Client should be unregistered
-      assert.ok(!env.clientManager.has('test-cleanup'), 'Client should be unregistered');
+      assert.ok(env.connectionPool.count === 0, 'Client should be unregistered');
     } finally {
       await env.cleanup();
     }

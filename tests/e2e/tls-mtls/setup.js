@@ -1,9 +1,9 @@
-// Shared test setup for TLS e2e tests
+// Shared test setup for TLS e2e tests (multipath-aware)
 
 const { createTLSServer } = require('../../../apps/server/lib/tls-server');
 const { createHTTPServer } = require('../../../apps/server/lib/http-router');
-const { ClientManager } = require('../../../apps/server/lib/client-manager');
-const { createTLSConnection } = require('../../../apps/client/lib/tls-connection');
+const { ConnectionPool } = require('../../../apps/server/lib/connection-pool');
+const { VirtualSocket } = require('../../../apps/client/lib/virtual-socket');
 const { createProxy } = require('../../../apps/client/lib/proxy');
 const { createMockTarget } = require('./mock-target');
 const { initCA, issueClientCertificate, issueServerCertificate } = require('../../../apps/server/lib/ca');
@@ -14,29 +14,23 @@ const { tmpdir } = require('node:os');
 let testCaDir = null;
 let testCertDir = null;
 
-// Initialize test CA and generate certificates
 function initTestCerts() {
   if (testCaDir) return;
 
-  // Create temp directories
   testCaDir = mkdtempSync(join(tmpdir(), 'tunnel-ca-'));
   testCertDir = mkdtempSync(join(tmpdir(), 'tunnel-certs-'));
 
-  // Initialize CA
   initCA(testCaDir);
 
-  // Issue server certificate for localhost
   const serverDir = join(testCertDir, 'server');
   mkdirSync(serverDir, { recursive: true });
   issueServerCertificate('localhost', serverDir, testCaDir);
 
-  // Issue client certificate
   const clientDir = join(testCertDir, 'client');
   mkdirSync(clientDir, { recursive: true });
   issueClientCertificate(clientDir, testCaDir);
 }
 
-// Get certificate paths
 function getCertPaths() {
   initTestCerts();
   return {
@@ -50,7 +44,6 @@ function getCertPaths() {
   };
 }
 
-// Get available ports
 async function getPort() {
   const { createServer } = require('node:net');
   return new Promise((resolve) => {
@@ -62,15 +55,14 @@ async function getPort() {
   });
 }
 
-// Create a test environment with TLS
 async function createTestEnv(options = {}) {
   const certs = getCertPaths();
   const tlsPort = await getPort();
   const httpPort = await getPort();
   const targetPort = await getPort();
 
-  const clientManager = new ClientManager();
-  const tlsServer = createTLSServer(clientManager, {
+  const connectionPool = new ConnectionPool();
+  const tlsServer = createTLSServer(connectionPool, {
     serverKey: certs.serverKey,
     serverCert: certs.serverCert,
     caCert: certs.caCert,
@@ -82,7 +74,7 @@ async function createTestEnv(options = {}) {
     initTimeout: options.initTimeout || 10000
   });
 
-  const httpServer = createHTTPServer(clientManager, tlsServer, {
+  const httpServer = createHTTPServer(connectionPool, tlsServer, {
     maxConcurrentStreams: options.maxStreams || 100,
     streamTimeout: options.streamTimeout || 30000,
     maxBodySize: options.maxBodySize
@@ -90,16 +82,13 @@ async function createTestEnv(options = {}) {
 
   const mockTarget = createMockTarget(options.mockTarget);
 
-  // Start all servers
   await new Promise((resolve) => tlsServer.listen(tlsPort, resolve));
   await new Promise((resolve) => httpServer.listen(httpPort, resolve));
   await new Promise((resolve) => mockTarget.listen(targetPort, resolve));
 
-  // Create client connection
-  let clientConnection = null;
+  let virtualSocket = null;
   let clientProxy = null;
-  let clientConnected = false;
-  let clientDisconnected = false;
+  let clientReady = false;
 
   function doConnect() {
     return new Promise((resolve, reject) => {
@@ -107,72 +96,69 @@ async function createTestEnv(options = {}) {
         reject(new Error('Client connection timeout'));
       }, 5000);
 
-      clientConnection = createTLSConnection(
-        {
-          serverHost: 'localhost',
-          serverPort: tlsPort,
-          clientKey: certs.clientKey,
-          clientCert: certs.clientCert,
-          caCert: certs.clientCa
-        },
-        (frame) => {
-          if (clientProxy) {
-            clientProxy.handleFrame(frame);
-          }
-        },
-        () => {
-          clearTimeout(timeout);
-          clientConnected = true;
-          clientDisconnected = false;
-          clientProxy = createProxy(clientConnection, targetPort, 'localhost', options.maxStreams || 100);
-          resolve();
-        },
-        () => {
-          clientDisconnected = true;
-          clientConnected = false;
-          if (clientProxy) {
-            clientProxy.destroy();
-            clientProxy = null;
-          }
+      virtualSocket = new VirtualSocket({
+        serverHost: 'localhost',
+        serverPort: tlsPort,
+        clientKey: certs.clientKey,
+        clientCert: certs.clientCert,
+        caCert: certs.clientCa
+      });
+
+      virtualSocket.on('ready', () => {
+        clearTimeout(timeout);
+        clientReady = true;
+        clientProxy = createProxy(virtualSocket, targetPort, 'localhost', options.maxStreams || 100);
+        resolve();
+      });
+
+      virtualSocket.on('frame', (frame) => {
+        if (clientProxy) {
+          clientProxy.handleFrame(frame);
         }
-      );
+      });
+
+      virtualSocket.on('error', (err) => {
+        clearTimeout(timeout);
+        if (!clientReady) reject(err);
+      });
+
+      virtualSocket.start();
     });
   }
 
   function startClient() {
-    clientConnected = false;
-    clientDisconnected = false;
+    clientReady = false;
     return doConnect();
   }
 
   function disconnectClient() {
-    // Kill the TLS socket but keep the connection object alive
-    // so its built-in reconnection logic kicks in
-    if (clientConnection && clientConnection.socket) {
-      clientConnection.socket.destroy();
+    // Destroy one RealSocket (there's at least one)
+    for (const rs of virtualSocket.realSockets.values()) {
+      if (rs.socket) {
+        rs.socket.destroy();
+        break;
+      }
     }
   }
 
   function stopClient() {
-    clientDisconnected = false;
-    if (clientConnection) {
-      clientConnection.destroy();
-      clientConnection = null;
-    }
     if (clientProxy) {
       clientProxy.destroy();
       clientProxy = null;
     }
-    clientConnected = false;
+    if (virtualSocket) {
+      virtualSocket.destroy();
+      virtualSocket = null;
+    }
+    clientReady = false;
   }
 
   function isClientConnected() {
-    return clientConnection && clientConnection.isConnected();
+    return virtualSocket && virtualSocket.isConnected();
   }
 
   async function cleanup() {
     stopClient();
-    // Force close all upgrade sockets on mock target (WebSocket cleanup)
     mockTarget.forceCloseAllSockets?.();
     await Promise.all([
       new Promise(r => tlsServer.close(r)),
@@ -185,20 +171,18 @@ async function createTestEnv(options = {}) {
     ports: { tlsPort, httpPort, targetPort },
     certs,
     servers: { tlsServer, httpServer, mockTarget },
-    clientManager,
-    clientConnection: () => clientConnection,
+    connectionPool,
+    virtualSocket: () => virtualSocket,
     clientProxy: () => clientProxy,
     startClient,
     stopClient,
     disconnectClient,
     isClientConnected,
-    isConnected: () => clientConnected,
-    isDisconnected: () => clientDisconnected,
+    isConnected: () => clientReady,
     cleanup
   };
 }
 
-// HTTP request helper
 function httpRequest(options) {
   const { request } = require('node:http');
   return new Promise((resolve, reject) => {
@@ -222,7 +206,6 @@ function httpRequest(options) {
   });
 }
 
-// Streaming HTTP request helper
 function httpRequestStream(options, onData) {
   const { request } = require('node:http');
   return new Promise((resolve, reject) => {

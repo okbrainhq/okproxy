@@ -148,19 +148,19 @@ describe('SSE Stream Timeout Fix', () => {
     const slowTargetPort = slowMockTarget.address().port;
     
     // Create test env with custom target port
-    // We need to manually set up since createTestEnv creates its own mock target
-    const { getPort, getCertPaths, ClientManager } = require('./setup');
+    const { getPort, getCertPaths } = require('./setup');
     const { createTLSServer } = require('../../../apps/server/lib/tls-server');
     const { createHTTPServer } = require('../../../apps/server/lib/http-router');
-    const { createTLSConnection } = require('../../../apps/client/lib/tls-connection');
+    const { ConnectionPool } = require('../../../apps/server/lib/connection-pool');
+    const { VirtualSocket } = require('../../../apps/client/lib/virtual-socket');
     const { createProxy } = require('../../../apps/client/lib/proxy');
     
     const certs = getCertPaths();
     const tlsPort = await getPort();
     const httpPort = await getPort();
     
-    const clientManager = new (require('../../../apps/server/lib/client-manager').ClientManager)();
-    const tlsServer = createTLSServer(clientManager, {
+    const connectionPool = new ConnectionPool();
+    const tlsServer = createTLSServer(connectionPool, {
       serverKey: certs.serverKey,
       serverCert: certs.serverCert,
       caCert: certs.caCert,
@@ -172,7 +172,7 @@ describe('SSE Stream Timeout Fix', () => {
       initTimeout: 10000
     });
 
-    const httpServer = createHTTPServer(clientManager, tlsServer, {
+    const httpServer = createHTTPServer(connectionPool, tlsServer, {
       maxConcurrentStreams: 100,
       streamTimeout: 30000
     });
@@ -182,42 +182,42 @@ describe('SSE Stream Timeout Fix', () => {
     await new Promise(resolve => httpServer.listen(httpPort, resolve));
     
     // Create client connection
-    let clientConnection = null;
+    let virtualSocket = null;
     let clientProxy = null;
-    let clientConnected = false;
+    let clientReady = false;
     
     await new Promise((resolve, reject) => {
       const timeout = setTimeout(() => {
         reject(new Error('Client connection timeout'));
       }, 5000);
 
-      clientConnection = createTLSConnection(
-        {
-          serverHost: 'localhost',
-          serverPort: tlsPort,
-          clientKey: certs.clientKey,
-          clientCert: certs.clientCert,
-          caCert: certs.clientCa
-        },
-        (frame) => {
-          if (clientProxy) {
-            clientProxy.handleFrame(frame);
-          }
-        },
-        () => {
-          clearTimeout(timeout);
-          clientConnected = true;
-          clientProxy = createProxy(clientConnection, slowTargetPort, 'localhost', 100);
-          resolve();
-        },
-        () => {
-          clientConnected = false;
-          if (clientProxy) {
-            clientProxy.destroy();
-            clientProxy = null;
-          }
+      virtualSocket = new VirtualSocket({
+        serverHost: 'localhost',
+        serverPort: tlsPort,
+        clientKey: certs.clientKey,
+        clientCert: certs.clientCert,
+        caCert: certs.clientCa
+      });
+
+      virtualSocket.on('ready', () => {
+        clearTimeout(timeout);
+        clientReady = true;
+        clientProxy = createProxy(virtualSocket, slowTargetPort, 'localhost', 100);
+        resolve();
+      });
+
+      virtualSocket.on('frame', (frame) => {
+        if (clientProxy) {
+          clientProxy.handleFrame(frame);
         }
-      );
+      });
+
+      virtualSocket.on('error', (err) => {
+        clearTimeout(timeout);
+        if (!clientReady) reject(err);
+      });
+
+      virtualSocket.start();
     });
     
     try {
@@ -269,9 +269,9 @@ describe('SSE Stream Timeout Fix', () => {
       
       console.log(`  ✓ Slow headers test passed - received ${chunks.length} chunks`);
     } finally {
-      // Cleanup - must destroy connection to stop reconnection loop
+      // Cleanup
       if (clientProxy) clientProxy.destroy();
-      if (clientConnection) clientConnection.destroy();
+      if (virtualSocket) virtualSocket.destroy();
       await Promise.all([
         new Promise(r => tlsServer.close(r)),
         new Promise(r => httpServer.close(r)),

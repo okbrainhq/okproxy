@@ -51,8 +51,7 @@ describe('PING/PONG Keepalive', () => {
       await new Promise((resolve) => {
         socket.on('connect', () => {
           socket.write(encodeFrame(0, FrameType.INIT, JSON.stringify({
-            version: 1,
-            clientId: 'test-no-pong'
+            interface: 'test-no-pong'
           })));
           
           setTimeout(() => {
@@ -103,21 +102,20 @@ describe('PING/PONG Keepalive', () => {
       await new Promise((resolve) => {
         socket.on('connect', () => {
           socket.write(encodeFrame(0, FrameType.INIT, JSON.stringify({
-            version: 1,
-            clientId: 'test-timeout-cleanup'
+            interface: 'test-timeout-cleanup'
           })));
           setTimeout(resolve, 300);
         });
       });
       
       // Verify client registered
-      assert.ok(env.clientManager.has(), 'Client should be registered');
+      assert.ok(env.connectionPool.count > 0, 'Client should be registered');
       
       // Wait for timeout
       await new Promise(r => setTimeout(r, 1000));
       
       // Client should be cleaned up
-      assert.ok(!env.clientManager.has(), 'Client should be unregistered after timeout');
+      assert.ok(env.connectionPool.count === 0, 'Client should be unregistered after timeout');
     } finally {
       await env.cleanup();
     }

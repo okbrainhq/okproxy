@@ -1,7 +1,14 @@
 // Frame Protocol - Shared encoder/decoder for tunnel communication
 // Zero dependencies - uses only Node.js built-in Buffer
+//
+// Frame format (13-byte header):
+// ┌──────────────┬─────────┬──────────────┬──────────┬─────────────┐
+// │ Stream ID    │ Type    │ Seq Number   │ Length   │ Payload     │
+// │ 4 bytes BE   │ 1 byte  │ 4 bytes BE   │ 4 bytes  │ N bytes     │
+// └──────────────┴─────────┴──────────────┴──────────┴─────────────┘
 
 const MAX_FRAME_SIZE = 1048576; // 1MB default
+const HEADER_SIZE = 13;
 
 // Frame Types
 const FrameType = {
@@ -12,17 +19,27 @@ const FrameType = {
   INIT: 0x05,
   PING: 0x06,
   PONG: 0x07,
-  UPGRADE: 0x08  // WebSocket protocol upgrade
+  UPGRADE: 0x08,
+  RESET_SEQ: 0x09   // Sequence counter reset for long-lived streams
 };
+
+// Control frame types (connection-local, not duplicated)
+const CONTROL_FRAME_TYPES = new Set([
+  FrameType.INIT,
+  FrameType.PING,
+  FrameType.PONG,
+  FrameType.RESET_SEQ
+]);
 
 /**
  * Encode a frame into a Buffer
  * @param {number} streamId - Stream identifier (0 for connection-level frames)
  * @param {number} type - Frame type (see FrameType)
  * @param {Buffer|string} payload - Frame payload
+ * @param {number} seqNo - Per-stream sequence number (0 for control frames)
  * @returns {Buffer} Encoded frame
  */
-function encodeFrame(streamId, type, payload) {
+function encodeFrame(streamId, type, payload, seqNo = 0) {
   if (typeof payload === 'string') {
     payload = Buffer.from(payload);
   }
@@ -30,17 +47,17 @@ function encodeFrame(streamId, type, payload) {
     throw new Error('Payload must be a Buffer or string');
   }
 
-  const header = Buffer.alloc(9);
+  const header = Buffer.alloc(HEADER_SIZE);
   header.writeUInt32BE(streamId, 0);
   header.writeUInt8(type, 4);
-  header.writeUInt32BE(payload.length, 5);
+  header.writeUInt32BE(seqNo, 5);
+  header.writeUInt32BE(payload.length, 9);
   return Buffer.concat([header, payload]);
 }
 
 /**
  * Create a frame decoder that handles partial TCP reads
- * Uses a chunk list to reduce GC pressure (only concat when needed)
- * @param {Function} onFrame - Callback(frame) where frame = {streamId, type, payload}
+ * @param {Function} onFrame - Callback(frame) where frame = {streamId, type, seqNo, payload}
  * @param {Function} onError - Callback(error) for protocol errors
  * @param {number} maxFrameSize - Maximum allowed frame size
  * @returns {Function} Decoder function(chunk)
@@ -52,16 +69,14 @@ function createFrameDecoder(onFrame, onError, maxFrameSize = MAX_FRAME_SIZE) {
   return function decoder(chunk) {
     if (destroyed) return;
 
-    // Append new chunk efficiently - single concat per chunk
     buffer = buffer.length === 0 ? chunk : Buffer.concat([buffer, chunk]);
 
-    while (buffer.length >= 9) {
-      // Read header directly from buffer (no concat needed per iteration)
+    while (buffer.length >= HEADER_SIZE) {
       const streamId = buffer.readUInt32BE(0);
       const type = buffer.readUInt8(4);
-      const length = buffer.readUInt32BE(5);
+      const seqNo = buffer.readUInt32BE(5);
+      const length = buffer.readUInt32BE(9);
 
-      // Check for oversized frame
       if (length > maxFrameSize) {
         destroyed = true;
         buffer = Buffer.alloc(0);
@@ -69,18 +84,14 @@ function createFrameDecoder(onFrame, onError, maxFrameSize = MAX_FRAME_SIZE) {
         return;
       }
 
-      // Wait for complete payload
-      if (buffer.length < 9 + length) return;
+      if (buffer.length < HEADER_SIZE + length) return;
 
-      // Extract payload as a copy to prevent use-after-free if consumers hold the reference
-      const payload = Buffer.from(buffer.subarray(9, 9 + length));
-      const remaining = buffer.subarray(9 + length);
+      const payload = Buffer.from(buffer.subarray(HEADER_SIZE, HEADER_SIZE + length));
+      const remaining = buffer.subarray(HEADER_SIZE + length);
 
-      // Update state - use subarray result directly, only alloc if needed
       buffer = remaining.length > 0 ? remaining : Buffer.alloc(0);
 
-      // Emit frame (payload is a view into original buffer, no copy)
-      onFrame({ streamId, type, payload });
+      onFrame({ streamId, type, seqNo, payload });
     }
   };
 }
@@ -89,5 +100,7 @@ module.exports = {
   encodeFrame,
   createFrameDecoder,
   FrameType,
-  MAX_FRAME_SIZE
+  MAX_FRAME_SIZE,
+  HEADER_SIZE,
+  CONTROL_FRAME_TYPES
 };
