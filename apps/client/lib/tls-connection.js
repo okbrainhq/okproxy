@@ -8,8 +8,9 @@ const { NetworkWatchDog } = require('./network-watchdog');
 const INITIAL_RECONNECT_DELAY = 500; // 0.5 seconds
 const MAX_RECONNECT_DELAY = 3000; // Max 3 seconds between retries
 const WATCHDOG_TIMEOUT = 35000; // 35 seconds - tolerates 3 missed PINGs (server sends every 10s)
-const CLIENT_PING_INTERVAL = 15000; // 15 seconds
-const CLIENT_PONG_TIMEOUT = 20000; // 20 seconds (faster than server's 25s)
+const CLIENT_PING_INTERVAL = 3000; // 3 seconds (detect broken uplink quickly)
+const CLIENT_PONG_TIMEOUT = 10000; // 10 seconds
+const BACKPRESSURE_TIMEOUT = 8000; // 8 seconds (uplink stalled)
 
 function createTLSConnection(config, onFrame, onConnect, onDisconnect) {
   let socket = null;
@@ -22,6 +23,7 @@ function createTLSConnection(config, onFrame, onConnect, onDisconnect) {
   let lastActivity = 0;
   let clientKeepaliveTimer = null;
   let clientLastPongTime = 0;
+  let lastWriteOk = 0;
   let reconnectAttempts = 0;
   let serverSettings = { maxConcurrentStreams: 100 }; // Default until negotiated
   let networkWatchdog = null;
@@ -60,6 +62,20 @@ function createTLSConnection(config, onFrame, onConnect, onDisconnect) {
 
       // Enable TCP keepalive to detect dead connections
       socket.setKeepAlive(true, 30000); // 30s initial delay, OS default interval
+
+      // Intercept socket.write to detect persistent backpressure (stalled uplink)
+      lastWriteOk = Date.now();
+      const originalWrite = socket.write.bind(socket);
+      socket.write = function(data, encoding, cb) {
+        const result = originalWrite(data, encoding, cb);
+        if (result) {
+          lastWriteOk = Date.now();
+        }
+        return result;
+      };
+      socket.on('drain', () => {
+        lastWriteOk = Date.now();
+      });
 
       // Start network watchdog to detect interface changes
       console.log(`[${new Date().toISOString()}] tls: connected, starting network watchdog`);
@@ -188,6 +204,15 @@ function createTLSConnection(config, onFrame, onConnect, onDisconnect) {
     if (clientKeepaliveTimer) clearInterval(clientKeepaliveTimer);
     clientKeepaliveTimer = setInterval(() => {
       if (!initialized || !socket || socket.destroyed) return;
+
+      // Check for stalled uplink (persistent backpressure)
+      if (Date.now() - lastWriteOk > BACKPRESSURE_TIMEOUT) {
+        console.log(`[${new Date().toISOString()}] Backpressure: socket not drained for ${Math.round((Date.now() - lastWriteOk) / 1000)}s, reconnecting`);
+        socket.destroy();
+        return;
+      }
+
+      // Check for PONG timeout
       if (Date.now() - clientLastPongTime > CLIENT_PONG_TIMEOUT) {
         console.log(`[${new Date().toISOString()}] Client keepalive: no PONG for ${Math.round((Date.now() - clientLastPongTime) / 1000)}s, reconnecting`);
         socket.destroy();
