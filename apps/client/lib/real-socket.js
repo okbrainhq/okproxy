@@ -13,6 +13,7 @@ const CLIENT_PING_INTERVAL = 3000;
 const CLIENT_PONG_TIMEOUT = 10000;
 const BACKPRESSURE_TIMEOUT = 8000;
 const CONNECTION_TIMEOUT = 25000;
+const INIT_RESPONSE_TIMEOUT = 10000; // 10s for server INIT ACK
 const SEQ_RESET_THRESHOLD = 0xFFFFFF0F; // 2^32 - 1,000,000 ~ roughly
 
 class RealSocket extends EventEmitter {
@@ -41,6 +42,7 @@ class RealSocket extends EventEmitter {
     this.keepaliveTimer = null;
     this.lastPongTime = 0;
     this.lastWriteOk = 0;
+    this._initResponseTimer = null;
     this.serverSettings = { maxConcurrentStreams: 100 };
   }
 
@@ -93,6 +95,17 @@ class RealSocket extends EventEmitter {
         interface: this.config.interfaceName,
         maxFrameSize: 1048576
       })));
+
+      // Set a timeout for INIT response
+      const initResponseTimer = setTimeout(() => {
+        if (!this.initialized && this.socket && !this.socket.destroyed) {
+          console.log(`[${this.config.interfaceName}] INIT response timeout (${INIT_RESPONSE_TIMEOUT/1000}s)`);
+          this.socket.destroy();
+        }
+      }, INIT_RESPONSE_TIMEOUT);
+
+      // Store for cleanup
+      this._initResponseTimer = initResponseTimer;
     });
 
     this.initialized = false;
@@ -105,6 +118,10 @@ class RealSocket extends EventEmitter {
           if (frame.streamId === 0 && frame.type === FrameType.INIT) {
             this.initialized = true;
             clearTimeout(connectionTimeout);
+            if (this._initResponseTimer) {
+              clearTimeout(this._initResponseTimer);
+              this._initResponseTimer = null;
+            }
             this.reconnectDelay = INITIAL_RECONNECT_DELAY;
             if (this.reconnectAttempts > 0) {
               console.log(`[${this.config.interfaceName}] Reconnected after ${this.reconnectAttempts} attempt(s)`);
@@ -162,6 +179,10 @@ class RealSocket extends EventEmitter {
 
     this.socket.on('close', () => {
       clearTimeout(connectionTimeout);
+      if (this._initResponseTimer) {
+        clearTimeout(this._initResponseTimer);
+        this._initResponseTimer = null;
+      }
       this.initialized = false;
       this._stopWatchdog();
       this._stopKeepalive();
@@ -247,6 +268,10 @@ class RealSocket extends EventEmitter {
     this.destroyed = true;
     this._stopWatchdog();
     this._stopKeepalive();
+    if (this._initResponseTimer) {
+      clearTimeout(this._initResponseTimer);
+      this._initResponseTimer = null;
+    }
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;

@@ -3,9 +3,11 @@
 
 const { describe, it } = require('node:test');
 const assert = require('node:assert');
-const { DedupWindow } = require('../../../apps/client/lib/dedup-window');
+const { DedupWindow, FrameType } = require('../../../packages/frame-protocol');
 const { shouldSkip } = require('../../../apps/client/lib/interface-detector');
 const { createTestEnv, httpRequest } = require('./setup');
+const { VirtualSocket } = require('../../../apps/client/lib/virtual-socket');
+const { ConnectionPool } = require('../../../apps/server/lib/connection-pool');
 
 describe('DedupWindow', () => {
   it('should mark first seqNo as seen', () => {
@@ -188,5 +190,157 @@ describe('Multipath - HTTP Request', () => {
     } finally {
       await env.cleanup();
     }
+  });
+});
+
+// Bug-fix regression tests
+
+describe('Bugfix: FIN/ERROR dedup (Bug 1)', () => {
+  it('should deliver FIN only once across duplicate connections', () => {
+    const vs = new VirtualSocket({
+      serverHost: 'localhost',
+      serverPort: 9999,
+      clientKey: 'none',
+      clientCert: 'none',
+      caCert: 'none'
+    });
+
+    const finFrames = [];
+    vs.on('frame', (f) => {
+      if (f.type === FrameType.FIN || f.type === FrameType.ERROR) {
+        finFrames.push(f);
+      }
+    });
+
+    // Simulate duplicate FIN (stream 5, seqNo 7) from two connections
+    vs._onFrame({ streamId: 5, type: FrameType.FIN, seqNo: 7 });
+    vs._onFrame({ streamId: 5, type: FrameType.FIN, seqNo: 7 }); // duplicate
+
+    assert.strictEqual(finFrames.length, 1, 'FIN should be delivered only once');
+    assert.strictEqual(finFrames[0].streamId, 5);
+    assert.strictEqual(finFrames[0].type, FrameType.FIN);
+  });
+
+  it('should deliver ERROR only once across duplicate connections', () => {
+    const vs = new VirtualSocket({
+      serverHost: 'localhost',
+      serverPort: 9999,
+      clientKey: 'none',
+      clientCert: 'none',
+      caCert: 'none'
+    });
+
+    const errorFrames = [];
+    vs.on('frame', (f) => {
+      if (f.type === FrameType.ERROR) {
+        errorFrames.push(f);
+      }
+    });
+
+    vs._onFrame({ streamId: 8, type: FrameType.ERROR, seqNo: 3 });
+    vs._onFrame({ streamId: 8, type: FrameType.ERROR, seqNo: 3 }); // duplicate
+
+    assert.strictEqual(errorFrames.length, 1, 'ERROR should be delivered only once');
+  });
+});
+
+describe('Bugfix: HEADERS dedup on server (Bug 2)', () => {
+  it('should dedup duplicate HEADERS from multiple connections', () => {
+    const pool = new ConnectionPool();
+
+    let headCount = 0;
+    pool.registerStream(10, {
+      frameHandler: (f) => {
+        if (f.type === FrameType.HEADERS) headCount++;
+      }
+    });
+
+    // First HEADERS — should route
+    const result1 = pool.onFrame({ streamId: 10, type: FrameType.HEADERS, seqNo: 0 });
+    assert.strictEqual(result1, 'new');
+    assert.strictEqual(headCount, 1);
+
+    // Duplicate HEADERS — should be dedup'd
+    const result2 = pool.onFrame({ streamId: 10, type: FrameType.HEADERS, seqNo: 0 });
+    assert.strictEqual(result2, 'duplicate');
+    assert.strictEqual(headCount, 1, 'HEADERS should not be routed again');
+  });
+});
+
+describe('Bugfix: RESET_SEQ does not reset outbound (Bug 3)', () => {
+  it('should not reset outbound seqCounters when receiving RESET_SEQ', () => {
+    const vs = new VirtualSocket({
+      serverHost: 'localhost',
+      serverPort: 9999,
+      clientKey: 'none',
+      clientCert: 'none',
+      caCert: 'none'
+    });
+
+    // Set a known outbound counter
+    vs.seqCounters.set(5, 99);
+    vs.seqCounters.set(8, 200);
+
+    // Receive RESET_SEQ for stream 5
+    vs._handleResetSeq({
+      streamId: 0,
+      type: FrameType.RESET_SEQ,
+      seqNo: 0,
+      payload: Buffer.from(JSON.stringify({ streams: [5] }))
+    });
+
+    // Outbound counter for stream 5 should NOT be reset
+    assert.strictEqual(vs.seqCounters.get(5), 99,
+      'outbound counter should NOT be reset by incoming RESET_SEQ');
+    assert.strictEqual(vs.seqCounters.get(8), 200,
+      'unrelated outbound counter should be unchanged');
+    // dedup window for stream 5 should be cleared
+    assert.strictEqual(vs.dedupWindows.has(5), false,
+      'dedup window for stream 5 should be cleared');
+  });
+
+  it('server-side RESET_SEQ should not reset outbound seqCounters', () => {
+    const pool = new ConnectionPool();
+    pool.seqCounters.set(5, 77);
+
+    pool.handleResetSeq({
+      payload: Buffer.from(JSON.stringify({ streams: [5] }))
+    });
+
+    assert.strictEqual(pool.seqCounters.get(5), 77,
+      'server outbound counter should NOT be reset by incoming RESET_SEQ');
+    assert.strictEqual(pool.dedupWindows.has(5), false,
+      'server dedup window should be cleared');
+  });
+});
+
+describe('Bugfix: ready emitted once (Bug 4)', () => {
+  it('should emit ready only once', () => {
+    const vs = new VirtualSocket({
+      serverHost: 'localhost',
+      serverPort: 9999,
+      clientKey: 'none',
+      clientCert: 'none',
+      caCert: 'none'
+    });
+
+    let readyCount = 0;
+    vs.on('ready', () => readyCount++);
+
+    // Simulate multiple connections coming up
+    vs._checkReady(); // no connected sockets yet → no emit
+    assert.strictEqual(readyCount, 0);
+
+    // Add a connected socket
+    const fakeRS = { isConnected: () => true };
+    vs.realSockets.set('en0', fakeRS);
+
+    vs._checkReady();
+    assert.strictEqual(readyCount, 1, 'first call with connection should emit');
+
+    // Add another socket
+    vs.realSockets.set('en8', fakeRS);
+    vs._checkReady();
+    assert.strictEqual(readyCount, 1, 'second call should not emit again');
   });
 });

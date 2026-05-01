@@ -149,15 +149,9 @@ function createTLSServer(connectionPool, options = {}) {
           return;
         }
 
-        // Handle RESET_SEQ (idempotent — pool handles it)
+        // Handle RESET_SEQ
         if (frame.streamId === 0 && frame.type === FrameType.RESET_SEQ) {
-          try {
-            const data = JSON.parse(frame.payload.toString());
-            for (const streamId of data.streams) {
-              connectionPool.dedupWindows.delete(streamId);
-              connectionPool.seqCounters.delete(streamId);
-            }
-          } catch {}
+          connectionPool.handleResetSeq(frame);
           return;
         }
 

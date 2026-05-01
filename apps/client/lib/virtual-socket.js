@@ -1,10 +1,9 @@
 // VirtualSocket — Multipath virtual socket layer
 // Duplicates traffic across all available network interfaces
 
-const { encodeFrame, FrameType, CONTROL_FRAME_TYPES } = require('../../../packages/frame-protocol');
+const { encodeFrame, FrameType, CONTROL_FRAME_TYPES, DedupWindow } = require('../../../packages/frame-protocol');
 const { RealSocket, SEQ_RESET_THRESHOLD } = require('./real-socket');
 const { InterfaceDetector } = require('./interface-detector');
-const { DedupWindow } = require('./dedup-window');
 const { EventEmitter } = require('node:events');
 
 class VirtualSocket extends EventEmitter {
@@ -19,6 +18,7 @@ class VirtualSocket extends EventEmitter {
     this.dedupWindows = new Map(); // streamId -> DedupWindow
     this.detector = null;
     this.destroyed = false;
+    this._readyEmitted = false;
   }
 
   /**
@@ -103,8 +103,10 @@ class VirtualSocket extends EventEmitter {
   }
 
   _checkReady() {
+    if (this._readyEmitted) return;
     const connected = [...this.realSockets.values()].filter(rs => rs.isConnected());
     if (connected.length > 0) {
+      this._readyEmitted = true;
       this.emit('ready');
     }
   }
@@ -178,7 +180,9 @@ class VirtualSocket extends EventEmitter {
       const data = JSON.parse(frame.payload.toString());
       for (const streamId of data.streams) {
         this.dedupWindows.delete(streamId);
-        this.seqCounters.set(streamId, 0);
+        // Do NOT reset seqCounters — that's the outbound counter.
+        // RESET_SEQ from remote means "remote reset its outbound",
+        // so we only clear our incoming dedup window.
       }
     } catch { /* ignore malformed */ }
   }
@@ -193,9 +197,19 @@ class VirtualSocket extends EventEmitter {
     const streamId = frame.streamId;
 
     if (frame.type === FrameType.FIN || frame.type === FrameType.ERROR) {
-      // Stream cleanup
+      // Run through dedup — only deliver the first copy
+      let window = this.dedupWindows.get(streamId);
+      if (!window) {
+        window = new DedupWindow(frame.seqNo);
+        window.checkAndAdd(frame.seqNo);
+        this.dedupWindows.set(streamId, window);
+      } else {
+        const result = window.checkAndAdd(frame.seqNo);
+        if (result === 'duplicate') return;
+      }
+      // Only clean seqCounters — keep dedupWindow to catch late duplicates.
+      // It'll be cleaned up when stream ID is reused or session ends.
       this.seqCounters.delete(streamId);
-      this.dedupWindows.delete(streamId);
       this.emit('frame', frame);
       return;
     }

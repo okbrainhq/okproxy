@@ -1,8 +1,7 @@
 // ConnectionPool — Server-side multipath connection manager
 // Accepts multiple TLS connections from the same client, dedups inbound, broadcasts outbound
 
-const { encodeFrame, FrameType, CONTROL_FRAME_TYPES } = require('../../../packages/frame-protocol');
-const { DedupWindow } = require('../../client/lib/dedup-window');
+const { encodeFrame, FrameType, CONTROL_FRAME_TYPES, DedupWindow } = require('../../../packages/frame-protocol');
 
 const SEQ_RESET_THRESHOLD = 0xFFFFFF0F; // 2^32 - 1,000,000
 
@@ -59,19 +58,31 @@ class ConnectionPool {
 
     const streamId = frame.streamId;
 
-    // Stream lifecycle — FIN/ERROR always pass through
+    // Stream lifecycle — FIN/ERROR: dedup before delivery
     if (frame.type === FrameType.FIN || frame.type === FrameType.ERROR) {
-      this.dedupWindows.delete(streamId);
+      let window = this.dedupWindows.get(streamId);
+      if (!window) {
+        window = new DedupWindow(frame.seqNo);
+        window.checkAndAdd(frame.seqNo);
+        this.dedupWindows.set(streamId, window);
+      } else {
+        const result = window.checkAndAdd(frame.seqNo);
+        if (result === 'duplicate') return 'duplicate';
+      }
+      // Only clean seqCounters — keep dedupWindow for late duplicates
       this.seqCounters.delete(streamId);
       this._routeToHandler(frame);
       return 'new';
     }
 
-    // HEADERS always pass through (creates stream)
+    // HEADERS — dedup if window already exists
     if (frame.type === FrameType.HEADERS) {
-      const w = new DedupWindow(frame.seqNo);
-      w.checkAndAdd(frame.seqNo);
-      this.dedupWindows.set(streamId, w);
+      let window = this.dedupWindows.get(streamId);
+      if (!window) {
+        window = new DedupWindow(frame.seqNo);
+        this.dedupWindows.set(streamId, window);
+      }
+      if (window.checkAndAdd(frame.seqNo) === 'duplicate') return 'duplicate';
       this._routeToHandler(frame);
       return 'new';
     }
@@ -142,6 +153,21 @@ class ConnectionPool {
     }
 
     this.seqCounters.set(streamId, 0);
+  }
+
+  /**
+   * Handle an incoming RESET_SEQ from the client.
+   * Clears only dedup windows (incoming) — not outbound seqCounters.
+   */
+  handleResetSeq(frame) {
+    try {
+      const data = JSON.parse(frame.payload.toString());
+      for (const streamId of data.streams) {
+        this.dedupWindows.delete(streamId);
+        // Do NOT reset seqCounters — RESET_SEQ from client means
+        // "I reset my outbound", so we only clear our incoming dedup.
+      }
+    } catch {}
   }
 
   registerStream(streamId, handlers) {

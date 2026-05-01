@@ -82,9 +82,11 @@ class DedupWindow {
   }
 
   /**
-   * Garbage collect: advance base past any consecutive set bits at the front
+   * Garbage collect: advance base past fully-processed bytes.
+   * Skips fully-zero bytes AND fully-set bytes (all 8 seqNos processed).
    */
   compact() {
+    // Skip leading zero bytes
     let byteIdx = 0;
     while (byteIdx < this.bytes && this.bits[byteIdx] === 0) {
       byteIdx++;
@@ -95,10 +97,15 @@ class DedupWindow {
       this.base = (this.base + byteIdx * 8) >>> 0;
     }
 
-    // Trim leading 1-bits
-    while (this.bits[0] & 1) {
-      this._shiftLeft(1);
-      this.base = (this.base + 1) >>> 0;
+    // Skip fully-set bytes (all 8 consecutive seqNos delivered)
+    byteIdx = 0;
+    while (byteIdx < this.bytes && this.bits[byteIdx] === 0xFF) {
+      byteIdx++;
+    }
+    if (byteIdx > 0) {
+      this.bits.copyWithin(0, byteIdx);
+      this.bits.fill(0, this.bytes - byteIdx);
+      this.base = (this.base + byteIdx * 8) >>> 0;
     }
   }
 }

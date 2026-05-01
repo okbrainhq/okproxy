@@ -96,11 +96,14 @@ function createFrameDecoder(onFrame, onError, maxFrameSize = MAX_FRAME_SIZE) {
   };
 }
 
+const { DedupWindow } = require('./dedup-window');
+
 module.exports = {
   encodeFrame,
   createFrameDecoder,
   FrameType,
   MAX_FRAME_SIZE,
   HEADER_SIZE,
-  CONTROL_FRAME_TYPES
+  CONTROL_FRAME_TYPES,
+  DedupWindow
 };
