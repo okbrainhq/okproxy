@@ -35,11 +35,8 @@ class VirtualSocket extends EventEmitter {
    * Start the multipath system: detect interfaces and connect.
    */
   start() {
-    // Always create at least one default connection
-    this._createRealSocket('default', null);
-
     if (process.env.MULTIPATH_ENABLED === 'true') {
-      // Multipath: detector manages additional connections
+      // Multipath: detector manages all connections — no default
       this.detector = new InterfaceDetector({
         serverHost: this.config.serverHost,
         serverPort: this.config.serverPort
@@ -49,7 +46,8 @@ class VirtualSocket extends EventEmitter {
       });
       this.detector.start();
     } else {
-      // Single-connection: watchdog detects network changes, triggers reconnect
+      // Single-connection: default socket + network watchdog
+      this._createRealSocket('default', null);
       this.networkWatchdog = new NetworkWatchDog(() => {
         console.log(`[virtual-socket] network change detected, reconnecting`);
         for (const rs of this.realSockets.values()) {
