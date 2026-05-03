@@ -22,7 +22,7 @@ function createTempCAFile(caDir) {
   const caCertPath = join(caDir, 'ca-cert.pem');
   // Use random filename in tmpdir to avoid collisions and ensure cleanup on crash
   const randomSuffix = randomBytes(8).toString('hex');
-  const tempCAPath = join(tmpdir(), `.tunzero-ca-combined-${randomSuffix}.pem`);
+  const tempCAPath = join(tmpdir(), `.okproxy-ca-combined-${randomSuffix}.pem`);
   const combined = readFileSync(caCertPath, 'utf8') + readFileSync(caKeyPath, 'utf8');
   writeFileSync(tempCAPath, combined, { mode: 0o600 });
   return tempCAPath;

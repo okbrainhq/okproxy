@@ -1,4 +1,4 @@
-# tunzero
+# okproxy
 
 A secure ngrok alternative using TLS encryption with mutual TLS (mTLS) authentication. **Zero third-party dependencies** — only Node.js built-in modules.
 
@@ -101,7 +101,7 @@ Create `.deploy.server`:
 
 ```bash
 HOSTNAME=tunnel.example.com
-REPO_URL=https://github.com/arunoda/tunzero.git
+REPO_URL=https://github.com/arunoda/okproxy.git
 ```
 
 Deploy:
@@ -120,7 +120,7 @@ Create `.deploy.client`:
 ```bash
 SERVER_HOST=t0.arunoda.me:9443
 TARGET_HOST=localhost:3000
-REPO_URL=https://github.com/arunoda/tunzero.git
+REPO_URL=https://github.com/arunoda/okproxy.git
 ```
 
 Deploy:
@@ -133,9 +133,9 @@ The client runs as a LaunchAgent with `--multipath` enabled by default, auto-sta
 
 ```bash
 # Manage on the Mac
-launchctl list com.tunzero.client
-launchctl stop com.tunzero.client
-tail -f ~/.tunzero/logs/client.log
+launchctl list com.okproxy.client
+launchctl stop com.okproxy.client
+tail -f ~/.okproxy/logs/client.log
 ```
 
 ## Server Options

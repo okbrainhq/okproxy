@@ -2,7 +2,7 @@
 
 ## Overview
 
-Add WebSocket support to tunzero to enable Next.js hot code reload (HMR). This is a minimal implementation - no third-party libraries, just enough to handle the WebSocket handshake and frame relay for HMR use cases.
+Add WebSocket support to okproxy to enable Next.js hot code reload (HMR). This is a minimal implementation - no third-party libraries, just enough to handle the WebSocket handshake and frame relay for HMR use cases.
 
 **Scope:** Support WebSocket upgrade, basic frame parsing/relaying, and clean termination. Not aiming for full WebSocket spec compliance - just "good enough" for Next.js and similar development tools.
 

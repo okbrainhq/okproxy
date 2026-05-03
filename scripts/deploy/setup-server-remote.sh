@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # setup-server-remote.sh
-# Purpose: Installs dependencies and prepares the environment for tunzero on Debian.
+# Purpose: Installs dependencies and prepares the environment for okproxy on Debian.
 # Usage:
 #   Production: ./setup-server-remote.sh <HOSTNAME> <REPO_URL>
 #   Dev:        ./setup-server-remote.sh --dev
@@ -16,7 +16,7 @@ for arg in "$@"; do
     esac
 done
 
-APP_DIR="/opt/tunzero"
+APP_DIR="/opt/okproxy"
 
 if [ "$DEV_MODE" = false ]; then
     # Collect positional args (skip flags)
@@ -36,12 +36,12 @@ if [ "$DEV_MODE" = false ]; then
     fi
     HOSTNAME="${POSITIONAL[0]}"
     REPO_URL="${POSITIONAL[1]}"
-    echo "Starting setup for Tunzero (production)..."
+    echo "Starting setup for OKProxy (production)..."
     echo "Target Directory: $APP_DIR"
     echo "Repository: $REPO_URL"
     echo "Hostname: $HOSTNAME"
 else
-    echo "Starting setup for Tunzero (dev mode)..."
+    echo "Starting setup for OKProxy (dev mode)..."
 fi
 
 # Detect real user if running with sudo
@@ -71,16 +71,16 @@ sudo apt install -y curl git unzip
 # 3. Install/Update Node.js (Latest LTS)
 echo "Checking Node.js status..."
 
-# If TUNZERO_NODE_PATH is set, verify it exists and skip all detection/installation
-if [ -n "$TUNZERO_NODE_PATH" ]; then
-    if [ -x "$TUNZERO_NODE_PATH" ]; then
-        echo "Using custom Node.js path from TUNZERO_NODE_PATH: $TUNZERO_NODE_PATH"
+# If OKPROXY_NODE_PATH is set, verify it exists and skip all detection and installation
+if [ -n "$OKPROXY_NODE_PATH" ]; then
+    if [ -x "$OKPROXY_NODE_PATH" ]; then
+        echo "Using custom Node.js path from OKPROXY_NODE_PATH: $OKPROXY_NODE_PATH"
         echo "Skipping Node.js detection and installation."
-        NODE_PATH="$TUNZERO_NODE_PATH"
+        NODE_PATH="$OKPROXY_NODE_PATH"
         # Skip the entire install block - will jump to end of section
         SKIP_NODE_INSTALL=true
     else
-        echo "Error: TUNZERO_NODE_PATH is set but executable not found: $TUNZERO_NODE_PATH"
+        echo "Error: OKPROXY_NODE_PATH is set but executable not found: $OKPROXY_NODE_PATH"
         exit 1
     fi
 else
@@ -225,13 +225,12 @@ fi
 fi
 
 # Determine the Node.js executable path to use in systemd service
-# If TUNZERO_NODE_PATH wasn't set earlier, use the default location
 if [ -z "$NODE_PATH" ]; then
     NODE_PATH="/usr/local/bin/node"
 fi
 if [ ! -x "$NODE_PATH" ]; then
     echo "Error: Node.js executable not found at $NODE_PATH"
-    echo "Install Node.js first, or set TUNZERO_NODE_PATH to the correct binary"
+    echo "Install Node.js first, or set OKPROXY_NODE_PATH to the correct binary"
     exit 1
 fi
 echo "Using Node.js at: $NODE_PATH ($($NODE_PATH -v))"
@@ -255,7 +254,7 @@ if [ "$DEV_MODE" = false ]; then
     fi
 
     # 5. Clone or update repository
-    CERT_DIR="/opt/tunzero/certs"
+    CERT_DIR="/opt/okproxy/certs"
     if [ -d "$APP_DIR/.git" ]; then
         echo "App directory exists. Updating repository..."
         cd "$APP_DIR"
@@ -273,20 +272,20 @@ if [ "$DEV_MODE" = false ]; then
         echo "Repository cloned."
     fi
 
-    # Create dedicated tunzero system user if it doesn't exist
-    if ! id -u tunzero &>/dev/null; then
-        echo "Creating dedicated tunzero system user..."
-        sudo useradd --system --no-create-home --shell /usr/sbin/nologin tunzero
+    # Create dedicated okproxy system user if it doesn't exist
+    if ! id -u okproxy &>/dev/null; then
+        echo "Creating dedicated okproxy system user..."
+        sudo useradd --system --no-create-home --shell /usr/sbin/nologin okproxy
     else
-        echo "tunzero user already exists"
+        echo "okproxy user already exists"
     fi
 
     # Set proper ownership for app and cert directories
-    sudo chown -R tunzero:tunzero "$APP_DIR"
-    sudo chown -R tunzero:tunzero "$CERT_DIR"
+    sudo chown -R okproxy:okproxy "$APP_DIR"
+    sudo chown -R okproxy:okproxy "$CERT_DIR"
 
     # 6. Check/generate certificates
-    CERT_DIR="/opt/tunzero/certs"
+    CERT_DIR="/opt/okproxy/certs"
     if [ -f "$CERT_DIR/server-cert.pem" ]; then
         echo "Using uploaded certificates from $CERT_DIR"
         CERT_OPTS="--key $CERT_DIR/server-key.pem --cert $CERT_DIR/server-cert.pem --ca $CERT_DIR/ca-cert.pem"
@@ -305,16 +304,16 @@ if [ "$DEV_MODE" = false ]; then
 
     # 7. Setup systemd service
     echo "Setting up systemd service..."
-    sudo tee /etc/systemd/system/tunzero.service > /dev/null <<EOF
+    sudo tee /etc/systemd/system/okproxy.service > /dev/null <<EOF
 [Unit]
-Description=Tunzero Tunnel Server
+Description=OKProxy Tunnel Server
 After=network.target
 
 [Service]
 Type=simple
-User=tunzero
-Group=tunzero
-WorkingDirectory=/opt/tunzero
+User=okproxy
+Group=okproxy
+WorkingDirectory=/opt/okproxy
 ExecStart=$NODE_PATH apps/server/index.js --http-port 8080 --tls-port 9443 $CERT_OPTS
 Restart=always
 RestartSec=10
@@ -343,8 +342,8 @@ WantedBy=multi-user.target
 EOF
 
     sudo systemctl daemon-reload
-    sudo systemctl enable tunzero
-    sudo systemctl restart tunzero
+    sudo systemctl enable okproxy
+    sudo systemctl restart okproxy
     echo "Systemd service configured and started."
 
     # 8. Setup Caddyfile
@@ -437,19 +436,19 @@ EOF
     echo "Running health checks..."
     
     # Check systemd service
-    if systemctl is-active tunzero > /dev/null 2>&1; then
-        echo "✓ tunzero service is active"
+    if systemctl is-active okproxy > /dev/null 2>&1; then
+        echo "✓ okproxy service is active"
     else
-        echo "✗ tunzero service is NOT active"
+        echo "✗ okproxy service is NOT active"
         echo "Service logs:"
-        journalctl -u tunzero -n 20 --no-pager || true
+        journalctl -u okproxy -n 20 --no-pager || true
         exit 1
     fi
     
-    # Check HTTP endpoint
+    # Check HTTP endpoint (with 5s timeout to prevent hanging)
     HTTP_OK=false
     for i in 1 2 3; do
-        if curl -sf http://localhost:8080/ > /dev/null 2>&1 || curl -sf http://localhost:8080/health > /dev/null 2>&1; then
+        if curl -sf --connect-timeout 5 --max-time 10 http://localhost:8080/ > /dev/null 2>&1 || curl -sf --connect-timeout 5 --max-time 10 http://localhost:8080/health > /dev/null 2>&1; then
             echo "✓ HTTP endpoint is responding"
             HTTP_OK=true
             break
@@ -476,6 +475,6 @@ if [ "$DEV_MODE" = true ]; then
     echo "Dev environment is ready. Run 'npm start' in apps/server/ to start."
 else
     echo "Production deployment complete!"
-    echo "Service status: systemctl status tunzero"
-    echo "View logs: journalctl -u tunzero -f"
+    echo "Service status: systemctl status okproxy"
+    echo "View logs: journalctl -u okproxy -f"
 fi

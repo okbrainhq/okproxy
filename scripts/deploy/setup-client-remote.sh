@@ -3,7 +3,7 @@
 # setup-client-remote.sh
 # Purpose: Installs the tunnel client on macOS and configures it to run as a LaunchAgent.
 # Usage: ./setup-client-remote.sh <SERVER_HOST> <TARGET_HOST> <REPO_URL>
-# Example: ./setup-client-remote.sh t0.arunoda.me:9443 localhost:3000 https://github.com/arunoda/tunzero.git
+# Example: ./setup-client-remote.sh t0.arunoda.me:9443 localhost:3000 https://github.com/arunoda/okproxy.git
 
 set -eo pipefail
 
@@ -32,14 +32,14 @@ if [ "$TARGET_PORT" = "$TARGET_HOST" ]; then
     TARGET_PORT=3000
 fi
 
-APP_DIR="$HOME/tunzero"
+APP_DIR="$HOME/okproxy"
 CLIENT_DIR="$APP_DIR/apps/client"
-CERT_DIR="$HOME/.tunzero/certs"
-LOG_DIR="$HOME/.tunzero/logs"
-LAUNCH_LABEL="com.tunzero.client"
+CERT_DIR="$HOME/.okproxy/certs"
+LOG_DIR="$HOME/.okproxy/logs"
+LAUNCH_LABEL="com.okproxy.client"
 PLIST_PATH="$HOME/Library/LaunchAgents/${LAUNCH_LABEL}.plist"
 
-echo "Starting setup for Tunzero Client on macOS..."
+echo "Starting setup for OKProxy Client on macOS..."
 echo "App Directory: $APP_DIR"
 echo "Server: $SERVER_HOSTNAME:$SERVER_PORT"
 echo "Target: $TARGET_HOSTNAME:$TARGET_PORT"
@@ -50,14 +50,14 @@ echo "Checking for Node.js..."
 
 LOCAL_NODE="$HOME/.local/bin/node"
 
-# If TUNZERO_NODE_PATH is set and exists, skip all detection and installation
-if [ -n "$TUNZERO_NODE_PATH" ]; then
-    if [ -x "$TUNZERO_NODE_PATH" ]; then
-        echo "Using custom Node.js path from TUNZERO_NODE_PATH: $TUNZERO_NODE_PATH"
+# If OKPROXY_NODE_PATH is set and exists, skip all detection and installation
+if [ -n "$OKPROXY_NODE_PATH" ]; then
+    if [ -x "$OKPROXY_NODE_PATH" ]; then
+        echo "Using custom Node.js path from OKPROXY_NODE_PATH: $OKPROXY_NODE_PATH"
         echo "Skipping Node.js detection and installation."
-        NODE_PATH="$TUNZERO_NODE_PATH"
+        NODE_PATH="$OKPROXY_NODE_PATH"
     else
-        echo "Error: TUNZERO_NODE_PATH is set but executable not found: $TUNZERO_NODE_PATH"
+        echo "Error: OKPROXY_NODE_PATH is set but executable not found: $OKPROXY_NODE_PATH"
         exit 1
     fi
 else
@@ -183,16 +183,15 @@ if [ "$INSTALL_NODE" = true ]; then
 
 # End of INSTALL_NODE block
 fi
-# End of TUNZERO_NODE_PATH else branch
 fi
 
-# If we didn't use TUNZERO_NODE_PATH, determine the path now
+# If custom Node.js path wasn't set, use the default local installation
 if [ -z "$NODE_PATH" ]; then
     # Determine the Node.js executable path for the LaunchAgent plist
     NODE_PATH="$LOCAL_NODE"
     if [ ! -x "$NODE_PATH" ]; then
         echo "Error: Node.js executable not found at $NODE_PATH"
-        echo "Install Node.js first, or set TUNZERO_NODE_PATH to the correct binary"
+        echo "Install Node.js first, or set OKPROXY_NODE_PATH to the correct binary"
         exit 1
     fi
 fi

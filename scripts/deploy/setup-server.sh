@@ -65,7 +65,7 @@ if [ -z "$HOST" ]; then
     exit 1
 fi
 
-echo "Setting up Tunzero on $HOST..."
+echo "Setting up OKProxy on $HOST..."
 echo "Hostname: $HOSTNAME"
 echo "Repository: $REPO_URL"
 
@@ -74,7 +74,7 @@ echo "Copying setup-server-remote.sh..."
 scp "$SCRIPT_DIR/setup-server-remote.sh" "$HOST:~/setup-server-remote.sh"
 
 # 2. Upload certificates if requested (do this FIRST so they exist when service starts)
-CERT_DIR="/opt/tunzero/certs"
+CERT_DIR="/opt/okproxy/certs"
 if [ "$UPLOAD_CERTS" = true ]; then
     echo "Validating and uploading certificates..."
     
@@ -110,7 +110,7 @@ if [ "$UPLOAD_CERTS" = true ]; then
     echo "Uploading certificates to remote server..."
     
     # Create remote cert directory with secure permissions FIRST
-    ssh "$HOST" "sudo mkdir -p $CERT_DIR && sudo chown -R \$USER:\$USER /opt/tunzero && sudo chmod 700 $CERT_DIR"
+    ssh "$HOST" "sudo mkdir -p $CERT_DIR && sudo chown -R \$USER:\$USER /opt/okproxy && sudo chmod 700 $CERT_DIR"
 
     # Upload certificates using scp
     scp "$PROJECT_ROOT/.certs/server-cert.pem" "$HOST:$CERT_DIR/"

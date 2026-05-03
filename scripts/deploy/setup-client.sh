@@ -66,7 +66,7 @@ if [ -z "$HOST" ]; then
     exit 1
 fi
 
-echo "Setting up Tunzero Client on $HOST..."
+echo "Setting up OKProxy Client on $HOST..."
 echo "Server: $SERVER_HOST"
 echo "Target: $TARGET_HOST"
 echo "Repository: $REPO_URL"
@@ -77,7 +77,7 @@ scp "$SCRIPT_DIR/setup-client-remote.sh" "$HOST:~/setup-client-remote.sh"
 
 # 2. Upload certificates if requested
 # Note: Using ~ for remote home directory (will be expanded on remote side)
-REMOTE_CERT_DIR="~/.tunzero/certs"
+REMOTE_CERT_DIR="~/.okproxy/certs"
 if [ "$UPLOAD_CERTS" = true ]; then
     echo "Validating and uploading certificates..."
     
@@ -113,17 +113,17 @@ if [ "$UPLOAD_CERTS" = true ]; then
     echo "Uploading certificates to remote MacBook..."
     
     # Create remote cert directory (use ~ for remote expansion)
-    ssh "$HOST" "mkdir -p ~/.tunzero/certs"
+    ssh "$HOST" "mkdir -p ~/.okproxy/certs"
     
     # Upload certificates using scp
-    scp "$PROJECT_ROOT/.certs/client-cert.pem" "$HOST:~/.tunzero/certs/"
-    scp "$PROJECT_ROOT/.certs/client-key.pem" "$HOST:~/.tunzero/certs/"
-    scp "$PROJECT_ROOT/.ca/ca-cert.pem" "$HOST:~/.tunzero/certs/"
+    scp "$PROJECT_ROOT/.certs/client-cert.pem" "$HOST:~/.okproxy/certs/"
+    scp "$PROJECT_ROOT/.certs/client-key.pem" "$HOST:~/.okproxy/certs/"
+    scp "$PROJECT_ROOT/.ca/ca-cert.pem" "$HOST:~/.okproxy/certs/"
     
     # Fix permissions (private key should be restricted)
-    ssh "$HOST" "chmod 600 ~/.tunzero/certs/client-key.pem && chmod 644 ~/.tunzero/certs/client-cert.pem ~/.tunzero/certs/ca-cert.pem"
+    ssh "$HOST" "chmod 600 ~/.okproxy/certs/client-key.pem && chmod 644 ~/.okproxy/certs/client-cert.pem ~/.okproxy/certs/ca-cert.pem"
     
-    echo "Certificates uploaded successfully to ~/.tunzero/certs/"
+    echo "Certificates uploaded successfully to ~/.okproxy/certs/"
 fi
 
 # 3. Execute setup script remotely
@@ -138,5 +138,5 @@ echo ""
 echo "Client setup completed successfully on $HOST!"
 echo "The tunnel client will start automatically on login and restart on crashes."
 echo ""
-echo "To check status: ssh $HOST 'launchctl list com.tunzero.client'"
-echo "To view logs: ssh $HOST 'tail -f ~/.tunzero/logs/client.log'"
+echo "To check status: ssh $HOST 'launchctl list com.okproxy.client'"
+echo "To view logs: ssh $HOST 'tail -f ~/.okproxy/logs/client.log'"

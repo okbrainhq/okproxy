@@ -2,7 +2,7 @@
 
 ## Overview
 
-A deployment script to deploy the tunzero tunnel server to any Debian-based server using systemd and Caddy for SSL.
+A deployment script to deploy the okproxy tunnel server to any Debian-based server using systemd and Caddy for SSL.
 
 ## Script Location
 
@@ -18,7 +18,7 @@ Create a `.deploy.server` file in the project root to specify deployment paramet
 # HOSTNAME: The domain name for the tunnel server (used by Caddy for SSL)
 HOSTNAME=tunnel.example.com
 # REPO_URL: Git repository URL to clone the application
-REPO_URL=https://github.com/username/tunzero.git
+REPO_URL=https://github.com/username/okproxy.git
 ```
 
 The script reads this file to get `HOSTNAME` and `REPO_URL`.
@@ -125,7 +125,7 @@ This ensures:
 
 **If `--upload-certs` flag is provided:**
 - Check local `.certs/` and `.ca/` directories exist
-- Use scp to upload certificates to `/var/www/tunzero/certs/` on server
+- Use scp to upload certificates to `/var/www/okproxy/certs/` on server
 
 **If flag NOT provided (production):**
 - Run `node apps/server/bin/tunnel-ca.js init` on server
@@ -137,15 +137,15 @@ This ensures:
 
 ### 4. Application Deployment
 
-- Create `/var/www/tunzero` directory
+- Create `/var/www/okproxy` directory
 - Clone/pull repository from `$REPO_URL` **OR** if directory exists, run `git pull` to update
 - Set ownership to `$REAL_USER`
 
-**Note on monorepo structure:** The tunzero project uses a monorepo with `apps/server/` and `packages/frame-protocol/`. The server imports from `../../packages/frame-protocol/index.js`. Since `apps/server/package.json` has zero dependencies, `npm install` is not required - the code runs directly via Node.js built-in modules. The shared package is automatically available after cloning the repository.
+**Note on monorepo structure:** The okproxy project uses a monorepo with `apps/server/` and `packages/frame-protocol/`. The server imports from `../../packages/frame-protocol/index.js`. Since `apps/server/package.json` has zero dependencies, `npm install` is not required - the code runs directly via Node.js built-in modules. The shared package is automatically available after cloning the repository.
 
 ### 5. Systemd Service Setup
 
-Create `/etc/systemd/system/tunzero.service`:
+Create `/etc/systemd/system/okproxy.service`:
 
 ```ini
 [Unit]
@@ -155,7 +155,7 @@ After=network.target
 [Service]
 Type=simple
 User=<REAL_USER>
-WorkingDirectory=/var/www/tunzero/apps/server
+WorkingDirectory=/var/www/okproxy/apps/server
 ExecStart=/usr/bin/node index.js --http-port 8080 --tls-port 9443
 Restart=always
 RestartSec=10
@@ -167,8 +167,8 @@ WantedBy=multi-user.target
 
 Commands:
 - `systemctl daemon-reload`
-- `systemctl enable tunzero`
-- `systemctl restart tunzero` (idempotent: works whether service is running or not)
+- `systemctl enable okproxy`
+- `systemctl restart okproxy` (idempotent: works whether service is running or not)
 
 ### 6. Caddy Configuration
 
@@ -204,7 +204,7 @@ ufw default allow outgoing
 ufw allow 22/tcp    # SSH
 ufw allow 80/tcp    # HTTP (redirects to HTTPS)
 ufw allow 443/tcp   # HTTPS (Caddy)
-ufw allow 9443/tcp  # TLS tunnel (tunzero clients)
+ufw allow 9443/tcp  # TLS tunnel (okproxy clients)
 ufw --force enable
 ```
 
@@ -257,7 +257,7 @@ After deployment, verify the service is working:
 
 ```bash
 # Check systemd service status
-systemctl is-active tunzero || exit 1
+systemctl is-active okproxy || exit 1
 
 # Check HTTP endpoint (with retry)
 for i in 1 2 3; do
@@ -272,12 +272,12 @@ done
 ss -tlnp | grep -q ':9443' || echo "Warning: TLS port 9443 not listening"
 ```
 
-If health check fails, show logs: `journalctl -u tunzero -n 50 --no-pager`
+If health check fails, show logs: `journalctl -u okproxy -n 50 --no-pager`
 
 ## Server Directory Structure
 
 ```
-/var/www/tunzero/
+/var/www/okproxy/
 ├── apps/
 │   └── server/          # Main application code
 │       ├── index.js
@@ -299,7 +299,7 @@ If health check fails, show logs: `journalctl -u tunzero -n 50 --no-pager`
 
 ## Key Differences from Brain Script
 
-| Feature | Brain Script | Tunzero Script |
+| Feature | Brain Script | OKProxy Script |
 |---------|-------------|----------------|
 | Config source | Command line args | `.deploy.server` file |
 | Process manager | PM2 | systemd native |
@@ -310,7 +310,7 @@ If health check fails, show logs: `journalctl -u tunzero -n 50 --no-pager`
 
 ## Log Management
 
-- All logs go to systemd journal (`journalctl -u tunzero`)
+- All logs go to systemd journal (`journalctl -u okproxy`)
 - No additional log rotation needed (systemd handles it)
 - **Journal size cap** (recommended for long-running servers):
 
@@ -325,7 +325,7 @@ This prevents disk exhaustion from accumulating logs. Apply with: `systemctl res
 
 ## Certificate Renewal
 
-- Server certificates: Use `--upload-certs` to deploy new certs, then `systemctl restart tunzero`
+- Server certificates: Use `--upload-certs` to deploy new certs, then `systemctl restart okproxy`
 - Client certificates: Distributed to clients separately
 
 ## Security Considerations

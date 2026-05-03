@@ -1,5 +1,5 @@
 {
-  "name": "tunzero",
+  "name": "okproxy",
   "version": "1.0.0",
   "description": "A secure ngrok alternative using TLS encryption with mutual TLS (mTLS) authentication",
   "private": true,
