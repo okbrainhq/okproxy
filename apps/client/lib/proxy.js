@@ -104,6 +104,14 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
     if (frame.type === FrameType.DATA) {
       wsState.reassemblyBuffer = Buffer.concat([wsState.reassemblyBuffer, frame.payload]);
 
+      if (!wsState.socket) {
+        if (wsState.reassemblyBuffer.length > MAX_WS_BUFFER_SIZE) {
+          console.error('WebSocket pre-upgrade buffer overflow - closing connection');
+          wsState.cleanup();
+        }
+        return;
+      }
+
       while (wsState.reassemblyBuffer.length >= 2 && !wsState.closeFramePending) {
         const result = parseWebSocketFrame(wsState.reassemblyBuffer, true);
         if (!result) break;
@@ -177,6 +185,7 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
         upgradeTimeoutTriggered = true;
         proxyReq.destroy();
         connection.write(encodeFrame(streamId, FrameType.ERROR, Buffer.from('Upgrade timeout')));
+        cleanup(false);
       });
 
       let cleanupCalled = false;
@@ -189,7 +198,7 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
         cleanupCalled: false
       };
 
-      function cleanup() {
+      function cleanup(sendFin = true) {
         if (cleanupCalled || wsState.cleanupCalled) return;
         cleanupCalled = true;
         wsState.cleanupCalled = true;
@@ -200,14 +209,16 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
           wsState.socket.destroy();
         }
 
-        connection.write(encodeFrame(streamId, FrameType.FIN, Buffer.alloc(0)));
+        if (sendFin) {
+          connection.write(encodeFrame(streamId, FrameType.FIN, Buffer.alloc(0)));
+        }
       }
 
       wsState.cleanup = cleanup;
+      activeWebSockets.set(streamId, wsState);
 
       proxyReq.on('upgrade', (proxyRes, proxySocket, proxyHead) => {
         wsState.socket = proxySocket;
-        activeWebSockets.set(streamId, wsState);
 
         const responseHeaders = {
           upgrade: proxyRes.headers.upgrade || 'websocket',
@@ -229,7 +240,7 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
           headers: responseHeaders
         })));
 
-        let buffer = proxyHead && proxyHead.length > 0 ? proxyHead : Buffer.alloc(0);
+        let buffer = Buffer.alloc(0);
         let pendingLargeFrame = null;
         let pendingOffset = 0;
 
@@ -252,7 +263,7 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
           proxySocket.resume();
         }
 
-        proxySocket.on('data', (chunk) => {
+        function processTargetData(chunk) {
           if (buffer.length + chunk.length > MAX_WS_BUFFER_SIZE) {
             console.error('WebSocket buffer overflow - destroying connection');
             cleanup();
@@ -305,7 +316,23 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
               return;
             }
           }
+        }
+
+        proxySocket.on('data', (chunk) => {
+          processTargetData(chunk);
         });
+
+        if (proxyHead && proxyHead.length > 0) {
+          processTargetData(proxyHead);
+        }
+
+        if (wsState.reassemblyBuffer.length > 0) {
+          handleWebSocketFrame({
+            streamId,
+            type: FrameType.DATA,
+            payload: Buffer.alloc(0)
+          });
+        }
 
         proxySocket.on('close', () => {
           if (!cleanupCalled && !wsState.closeFramePending) {
@@ -324,6 +351,7 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
         console.error(`[CLIENT WS ERROR] WebSocket upgrade failed for ${upgradeInfo.path}:`, err.message, `(code: ${err.code || 'none'})`);
         const errorDetail = err.code ? `Upgrade failed: ${err.code}` : 'Upgrade failed';
         connection.write(encodeFrame(streamId, FrameType.ERROR, Buffer.from(errorDetail)));
+        cleanup(false);
       });
 
       proxyReq.end();
@@ -401,6 +429,7 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
             headers: { 'content-type': 'text/plain' }
           })));
           connection.write(encodeFrame(streamId, FrameType.DATA, Buffer.from('Target service not available')));
+          connection.write(encodeFrame(streamId, FrameType.FIN, Buffer.alloc(0)));
         } else {
           const errorDetail = err.code ? `Target error: ${err.code}` : 'Target error';
           connection.write(encodeFrame(streamId, FrameType.ERROR, Buffer.from(errorDetail)));

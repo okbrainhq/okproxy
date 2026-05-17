@@ -7,22 +7,33 @@ const SEQ_RESET_THRESHOLD = 0xFFFFFF0F; // 2^32 - 1,000,000
 
 class ConnectionPool {
   constructor() {
-    this.connections = new Map(); // interfaceName -> socket
+    this.connections = new Map(); // `${clientSerial}:${interfaceName}` -> socket
     this.dedupWindows = new Map(); // streamId -> DedupWindow
     this.seqCounters = new Map(); // streamId -> nextSeqNo
     this.activeStreams = new Map(); // streamId -> { frameHandler, errorHandler }
+    this.clientSerial = null; // Active authenticated client identity
   }
 
   /**
    * Register a new connection. Replaces existing one with same interface name.
+   * Returns false when a different client identity is already active.
    */
-  add(interfaceName, socket) {
+  add(clientSerial, interfaceName, socket) {
+    const serial = String(clientSerial);
+    if (this.clientSerial && this.clientSerial !== serial) {
+      return false;
+    }
+
+    this.clientSerial = serial;
+    const key = `${serial}:${interfaceName}`;
+
     // Replace existing connection for this interface
-    if (this.connections.has(interfaceName)) {
-      const old = this.connections.get(interfaceName);
+    if (this.connections.has(key)) {
+      const old = this.connections.get(key);
       try { old.destroy(); } catch {}
     }
-    this.connections.set(interfaceName, socket);
+    this.connections.set(key, socket);
+    return true;
   }
 
   /**
@@ -37,6 +48,7 @@ class ConnectionPool {
     }
     // If no connections left, clean up all streams
     if (this.connections.size === 0) {
+      this.clientSerial = null;
       this._cleanupAllStreams();
     }
   }

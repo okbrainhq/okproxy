@@ -177,11 +177,15 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
     })));
 
     let bodySize = 0;
+    let cleanedUp = false;
+
     req.on('data', (chunk) => {
+      if (cleanedUp) return;
+
       bodySize += chunk.length;
       if (bodySize > maxBodySize) {
         console.error(`[413] Request body too large: ${bodySize} bytes (max: ${maxBodySize}) for stream ${streamId}`);
-        cleanup();
+        abortTunnelStream('Request body too large');
         if (!res.writableEnded) {
           res.statusCode = 413;
           res.end('Request body too large');
@@ -200,7 +204,9 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
     });
 
     req.on('end', () => {
-      connectionPool.send(encodeFrame(streamId, FrameType.FIN, Buffer.alloc(0)));
+      if (!cleanedUp) {
+        connectionPool.send(encodeFrame(streamId, FrameType.FIN, Buffer.alloc(0)));
+      }
     });
 
     req.on('error', (err) => {
@@ -232,9 +238,18 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
     }
 
     function cleanup() {
+      if (cleanedUp) return;
+      cleanedUp = true;
       clearTimeout(streamTimer);
       connectionPool.unregisterStream(streamId);
       tcpServer.releaseStreamId(streamId);
+    }
+
+    function abortTunnelStream(message) {
+      if (!cleanedUp) {
+        connectionPool.send(encodeFrame(streamId, FrameType.ERROR, Buffer.from(message)));
+      }
+      cleanup();
     }
 
     let headersSent = false;
@@ -300,7 +315,7 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
     res.on('close', () => {
       if (!res.writableEnded) {
         console.error(`[INFO] Client closed connection early for ${req.method} ${req.url} (stream ${streamId})`);
-        cleanup();
+        abortTunnelStream('Public client closed connection');
       }
     });
   });
@@ -470,7 +485,6 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
 
     let pendingLargeFrame = null;
     let pendingOffset = 0;
-    let headBufferConsumed = false;
 
     function sendLargeFrameChunk() {
       while (pendingOffset < pendingLargeFrame.length) {
@@ -484,15 +498,7 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
       socket.resume();
     }
 
-    socket.on('data', (chunk) => {
-      resetIdleTimer();
-
-      if (!headBufferConsumed && headBuffer.length > 0) {
-        chunk = Buffer.concat([headBuffer, chunk]);
-        headBuffer = Buffer.alloc(0);
-        headBufferConsumed = true;
-      }
-
+    function processBrowserData(chunk) {
       if (wsBuffer.length + chunk.length > MAX_WS_BUFFER_SIZE) {
         console.error('WebSocket buffer overflow - destroying connection');
         cleanup();
@@ -523,7 +529,18 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
 
         if (opcode === 0x08) return;
       }
+    }
+
+    socket.on('data', (chunk) => {
+      resetIdleTimer();
+      processBrowserData(chunk);
     });
+
+    if (headBuffer.length > 0) {
+      resetIdleTimer();
+      processBrowserData(headBuffer);
+      headBuffer = Buffer.alloc(0);
+    }
 
     socket.on('end', () => {
       if (!cleanupCalled) {

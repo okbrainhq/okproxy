@@ -118,14 +118,18 @@ function createTLSServer(connectionPool, options = {}) {
               interfaceName = clientInit.interface;
             }
 
+            // Register this connection in the pool
+            if (!connectionPool.add(serial, interfaceName, socket)) {
+              console.error(`[${new Date().toISOString()}] Rejecting client ${serial} on ${interfaceName}: different client already connected`);
+              socket.destroy();
+              return;
+            }
+
             // Send INIT ACK
             socket.write(encodeFrame(0, FrameType.INIT, JSON.stringify({
               maxFrameSize: 1048576,
               maxConcurrentStreams: maxStreams
             })));
-
-            // Register this connection in the pool
-            connectionPool.add(interfaceName, socket);
 
             initialized = true;
             startKeepalive();
