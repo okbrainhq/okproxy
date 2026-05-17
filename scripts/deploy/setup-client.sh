@@ -71,9 +71,18 @@ echo "Server: $SERVER_HOST"
 echo "Target: $TARGET_HOST"
 echo "Repository: $REPO_URL"
 
+# Build SSH/SCP port options
+SSH_OPTS=""
+SCP_OPTS=""
+if [ -n "$SSH_PORT" ] && [ "$SSH_PORT" != "22" ]; then
+    SSH_OPTS="-p $SSH_PORT"
+    SCP_OPTS="-P $SSH_PORT"
+    echo "Using custom SSH port: $SSH_PORT"
+fi
+
 # 1. Copy setup script to remote MacBook
 echo "Copying setup-client-remote.sh..."
-scp "$SCRIPT_DIR/setup-client-remote.sh" "$HOST:~/setup-client-remote.sh"
+scp $SCP_OPTS "$SCRIPT_DIR/setup-client-remote.sh" "$HOST:~/setup-client-remote.sh"
 
 # 2. Upload certificates if requested
 # Note: Using ~ for remote home directory (will be expanded on remote side)
@@ -113,15 +122,15 @@ if [ "$UPLOAD_CERTS" = true ]; then
     echo "Uploading certificates to remote MacBook..."
     
     # Create remote cert directory (use ~ for remote expansion)
-    ssh "$HOST" "mkdir -p ~/.okproxy/certs"
+    ssh $SSH_OPTS "$HOST" "mkdir -p ~/.okproxy/certs"
     
     # Upload certificates using scp
-    scp "$PROJECT_ROOT/.certs/client-cert.pem" "$HOST:~/.okproxy/certs/"
-    scp "$PROJECT_ROOT/.certs/client-key.pem" "$HOST:~/.okproxy/certs/"
-    scp "$PROJECT_ROOT/.ca/ca-cert.pem" "$HOST:~/.okproxy/certs/"
+    scp $SCP_OPTS "$PROJECT_ROOT/.certs/client-cert.pem" "$HOST:~/.okproxy/certs/"
+    scp $SCP_OPTS "$PROJECT_ROOT/.certs/client-key.pem" "$HOST:~/.okproxy/certs/"
+    scp $SCP_OPTS "$PROJECT_ROOT/.ca/ca-cert.pem" "$HOST:~/.okproxy/certs/"
     
     # Fix permissions (private key should be restricted)
-    ssh "$HOST" "chmod 600 ~/.okproxy/certs/client-key.pem && chmod 644 ~/.okproxy/certs/client-cert.pem ~/.okproxy/certs/ca-cert.pem"
+    ssh $SSH_OPTS "$HOST" "chmod 600 ~/.okproxy/certs/client-key.pem && chmod 644 ~/.okproxy/certs/client-cert.pem ~/.okproxy/certs/ca-cert.pem"
     
     echo "Certificates uploaded successfully to ~/.okproxy/certs/"
 fi
@@ -132,11 +141,16 @@ echo "Executing setup script on remote MacBook..."
 ESCAPED_SERVER_HOST=$(printf '%q' "$SERVER_HOST")
 ESCAPED_TARGET_HOST=$(printf '%q' "$TARGET_HOST")
 ESCAPED_REPO_URL=$(printf '%q' "$REPO_URL")
-ssh "$HOST" "chmod +x ~/setup-client-remote.sh && ~/setup-client-remote.sh $ESCAPED_SERVER_HOST $ESCAPED_TARGET_HOST $ESCAPED_REPO_URL"
+ssh $SSH_OPTS "$HOST" "chmod +x ~/setup-client-remote.sh && ~/setup-client-remote.sh $ESCAPED_SERVER_HOST $ESCAPED_TARGET_HOST $ESCAPED_REPO_URL"
 
 echo ""
 echo "Client setup completed successfully on $HOST!"
 echo "The tunnel client will start automatically on login and restart on crashes."
 echo ""
-echo "To check status: ssh $HOST 'launchctl list com.okproxy.client'"
-echo "To view logs: ssh $HOST 'tail -f ~/.okproxy/logs/client.log'"
+if [ -n "$SSH_OPTS" ]; then
+    echo "To check status: ssh $SSH_OPTS $HOST 'launchctl list com.okproxy.client'"
+    echo "To view logs: ssh $SSH_OPTS $HOST 'tail -f ~/.okproxy/logs/client.log'"
+else
+    echo "To check status: ssh $HOST 'launchctl list com.okproxy.client'"
+    echo "To view logs: ssh $HOST 'tail -f ~/.okproxy/logs/client.log'"
+fi

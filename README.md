@@ -102,6 +102,9 @@ Create `.deploy.server`:
 ```bash
 HOSTNAME=tunnel.example.com
 REPO_URL=https://github.com/arunoda/okproxy.git
+
+# Optional: custom SSH port (default: 22)
+# SSH_PORT=2222
 ```
 
 Deploy:
@@ -121,6 +124,12 @@ Create `.deploy.client`:
 SERVER_HOST=t0.arunoda.me:9443
 TARGET_HOST=localhost:3000
 REPO_URL=https://github.com/arunoda/okproxy.git
+
+# Optional: custom SSH port (default: 22)
+# SSH_PORT=2222
+
+# Optional: default deploy host so you can omit it from the command
+# DEPLOY_HOST=user@192.168.0.15
 ```
 
 Deploy:
