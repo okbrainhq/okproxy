@@ -31,6 +31,20 @@ function initTestCerts() {
   issueClientCertificate(clientDir, testCaDir);
 }
 
+function issueTestClientCertificate(name, domains = []) {
+  initTestCerts();
+  const clientDir = join(testCertDir, name);
+  mkdirSync(clientDir, { recursive: true });
+  issueClientCertificate(clientDir, testCaDir, { name, domains });
+  return {
+    clientKey: join(clientDir, 'client-key.pem'),
+    clientCert: join(clientDir, 'client-cert.pem'),
+    clientCa: join(clientDir, 'ca-cert.pem'),
+    caDir: testCaDir,
+    issuedDomainIndex: join(testCaDir, 'issued-domains.json')
+  };
+}
+
 function getCertPaths() {
   initTestCerts();
   return {
@@ -230,5 +244,6 @@ module.exports = {
   getCertPaths,
   createTestEnv,
   httpRequest,
-  httpRequestStream
+  httpRequestStream,
+  issueTestClientCertificate
 };

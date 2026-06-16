@@ -141,38 +141,89 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
   const maxStreams = options.maxConcurrentStreams || 100;
   const maxWebSocketStreams = options.maxWebSocketStreams || 50;
   const maxBodySize = options.maxBodySize || DEFAULT_MAX_BODY_SIZE;
+  const certBoundDomains = Boolean(options.certBoundDomains);
 
-  const activeWebSockets = new Set();
+  function resolveRequestRoute(hostHeader) {
+    if (!certBoundDomains) {
+      if (connectionPool.count === 0) return { error: 502, message: 'Tunnel client not connected' };
+      return { pool: connectionPool, domain: null, session: null };
+    }
+
+    const route = connectionPool.resolveByHost(hostHeader);
+    if (route.status === 'invalid-host') return { error: 400, message: 'Bad Request' };
+    if (route.status === 'unknown') return { error: 404, message: 'Unknown tunnel domain' };
+    if (route.status === 'disconnected') return { error: 502, message: `Tunnel client not connected for ${route.domain}` };
+    if (!route.session || !route.session.hasConnections()) return { error: 502, message: `Tunnel client not connected for ${route.domain}` };
+    return { pool: route.session.pool, domain: route.domain, session: route.session };
+  }
+
+  function allocateStream(route) {
+    return route.session ? route.session.allocateStreamId() : tcpServer.allocateStreamId();
+  }
+
+  function releaseStream(route, streamId) {
+    if (route.session) route.session.releaseStreamId(streamId);
+    else tcpServer.releaseStreamId(streamId);
+  }
 
   const server = createServer((req, res) => {
-    if (connectionPool.count === 0) {
-      console.error(`[502] No tunnel client connected for ${req.method} ${req.url} from ${req.socket.remoteAddress}`);
-      res.statusCode = 502;
-      res.end('Tunnel client not connected');
+    if (certBoundDomains && req.url.startsWith('/_okproxy/caddy-ask')) {
+      try {
+        const url = new URL(req.url, 'http://127.0.0.1');
+        const domain = url.searchParams.get('domain');
+        if (connectionPool.isAskAllowed(domain)) {
+          res.statusCode = 200;
+          res.end('OK');
+        } else {
+          res.statusCode = 404;
+          res.end('Not Found');
+        }
+      } catch {
+        res.statusCode = 400;
+        res.end('Bad Request');
+      }
       return;
     }
 
-    if (connectionPool.activeStreams.size >= maxStreams) {
-      console.error(`[503] Max concurrent streams exceeded (${connectionPool.activeStreams.size}/${maxStreams}) for ${req.method} ${req.url}`);
+    const route = resolveRequestRoute(req.headers.host);
+    if (route.error) {
+      console.error(`[${route.error}] ${route.message} for ${req.method} ${req.url} from ${req.socket.remoteAddress}`);
+      res.statusCode = route.error;
+      res.end(route.message);
+      return;
+    }
+
+    const selectedPool = route.pool;
+    if (selectedPool.activeStreams.size >= maxStreams) {
+      console.error(`[503] Max concurrent streams exceeded (${selectedPool.activeStreams.size}/${maxStreams}) for ${req.method} ${req.url}`);
       res.statusCode = 503;
       res.end('Max concurrent streams exceeded');
       return;
     }
 
-    const streamId = tcpServer.allocateStreamId();
+    let streamId;
+    try {
+      streamId = allocateStream(route);
+    } catch {
+      res.statusCode = 503;
+      res.end('No available stream IDs');
+      return;
+    }
 
-    // Set max listeners on all pool connections
-    for (const [name, sock] of connectionPool.connections) {
+    for (const [name, sock] of selectedPool.connections) {
       sock.setMaxListeners(maxStreams + 10);
     }
 
     const clientIp = req.socket.remoteAddress || '127.0.0.1';
+    const publicProto = req.headers['x-forwarded-proto'] || (req.socket.encrypted ? 'https' : 'http');
 
-    // Send HEADERS frame using ConnectionPool
-    connectionPool.send(encodeFrame(streamId, FrameType.HEADERS, JSON.stringify({
+    selectedPool.send(encodeFrame(streamId, FrameType.HEADERS, JSON.stringify({
       method: req.method,
       path: req.url,
       headers: sanitizeRequestHeaders(req.headers),
+      clientSerial: route.session?.serial,
+      publicHost: route.domain || req.headers.host,
+      publicProto,
       remoteAddress: clientIp
     })));
 
@@ -197,16 +248,13 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
       let offset = 0;
       while (offset < chunk.length) {
         const end = Math.min(offset + MAX_FRAME_SIZE, chunk.length);
-        const frameChunk = chunk.subarray(offset, end);
-        connectionPool.send(encodeFrame(streamId, FrameType.DATA, frameChunk));
+        selectedPool.send(encodeFrame(streamId, FrameType.DATA, chunk.subarray(offset, end)));
         offset = end;
       }
     });
 
     req.on('end', () => {
-      if (!cleanedUp) {
-        connectionPool.send(encodeFrame(streamId, FrameType.FIN, Buffer.alloc(0)));
-      }
+      if (!cleanedUp) selectedPool.send(encodeFrame(streamId, FrameType.FIN, Buffer.alloc(0)));
     });
 
     req.on('error', (err) => {
@@ -216,7 +264,7 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
 
     let streamTimer = setTimeout(() => {
       console.error(`[504] Stream timeout for ${req.method} ${req.url} (stream ${streamId}, client ${clientIp})`);
-      connectionPool.send(encodeFrame(streamId, FrameType.ERROR, Buffer.from('Stream timeout')));
+      selectedPool.send(encodeFrame(streamId, FrameType.ERROR, Buffer.from('Stream timeout')));
       cleanup();
       if (!res.writableEnded) {
         res.statusCode = 504;
@@ -228,7 +276,7 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
       clearTimeout(streamTimer);
       streamTimer = setTimeout(() => {
         console.error(`[504] Stream timeout (reset) for ${req.method} ${req.url} (stream ${streamId}, client ${clientIp})`);
-        connectionPool.send(encodeFrame(streamId, FrameType.ERROR, Buffer.from('Stream timeout')));
+        selectedPool.send(encodeFrame(streamId, FrameType.ERROR, Buffer.from('Stream timeout')));
         cleanup();
         if (!res.writableEnded) {
           res.statusCode = 504;
@@ -241,19 +289,17 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
       if (cleanedUp) return;
       cleanedUp = true;
       clearTimeout(streamTimer);
-      connectionPool.unregisterStream(streamId);
-      tcpServer.releaseStreamId(streamId);
+      selectedPool.unregisterStream(streamId);
+      releaseStream(route, streamId);
     }
 
     function abortTunnelStream(message) {
-      if (!cleanedUp) {
-        connectionPool.send(encodeFrame(streamId, FrameType.ERROR, Buffer.from(message)));
-      }
+      if (!cleanedUp) selectedPool.send(encodeFrame(streamId, FrameType.ERROR, Buffer.from(message)));
       cleanup();
     }
 
     let headersSent = false;
-    connectionPool.registerStream(streamId, {
+    selectedPool.registerStream(streamId, {
       frameHandler: (frame) => {
         resetStreamTimeout();
 
@@ -264,11 +310,7 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
             if (headers.headers) {
               const filteredHeaders = filterResponseHeaders(headers.headers);
               for (const [k, v] of Object.entries(filteredHeaders)) {
-                try {
-                  res.setHeader(k, v);
-                } catch (headerErr) {
-                  console.error(`Skipping malformed header '${k}':`, headerErr.message);
-                }
+                try { res.setHeader(k, v); } catch (headerErr) { console.error(`Skipping malformed header '${k}':`, headerErr.message); }
               }
             }
             headersSent = true;
@@ -289,9 +331,7 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
         } else if (frame.type === FrameType.FIN) {
           resetStreamTimeout();
           cleanup();
-          if (!res.writableEnded) {
-            res.end();
-          }
+          if (!res.writableEnded) res.end();
         } else if (frame.type === FrameType.ERROR) {
           const errorMsg = frame.payload?.toString() || 'Unknown error';
           console.error(`[502] Client sent ERROR frame for ${req.method} ${req.url} (stream ${streamId}): ${errorMsg}`);
@@ -321,14 +361,18 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
   });
 
   server.on('upgrade', (req, socket, head) => {
-    if (connectionPool.count === 0) {
+    const route = resolveRequestRoute(req.headers.host);
+    if (route.error) {
+      socket.write(`HTTP/1.1 ${route.error} ${getStatusText(route.error)}\r\nConnection: close\r\n\r\n`);
       socket.destroy();
       return;
     }
 
+    const selectedPool = route.pool;
     let headBuffer = head && head.length > 0 ? head : Buffer.alloc(0);
+    const webSockets = route.session ? route.session.activeWebSockets : server._legacyActiveWebSockets || (server._legacyActiveWebSockets = new Set());
 
-    if (activeWebSockets.size >= maxWebSocketStreams) {
+    if (webSockets.size >= maxWebSocketStreams) {
       socket.write('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n');
       socket.destroy();
       return;
@@ -340,10 +384,17 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
       return;
     }
 
-    const streamId = tcpServer.allocateStreamId();
-    activeWebSockets.add(streamId);
+    let streamId;
+    try {
+      streamId = allocateStream(route);
+    } catch {
+      socket.write('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+    webSockets.add(streamId);
 
-    for (const [name, sock] of connectionPool.connections) {
+    for (const [name, sock] of selectedPool.connections) {
       sock.setMaxListeners(maxStreams + maxWebSocketStreams + 10);
     }
 
@@ -351,10 +402,14 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
       protocol: 'websocket',
       method: req.method,
       path: req.url,
-      headers: sanitizeRequestHeaders(req.headers)
+      headers: sanitizeRequestHeaders(req.headers),
+      clientSerial: route.session?.serial,
+      publicHost: route.domain || req.headers.host,
+      publicProto: req.headers['x-forwarded-proto'] || (req.socket.encrypted ? 'https' : 'http'),
+      remoteAddress: req.socket.remoteAddress || '127.0.0.1'
     });
 
-    connectionPool.send(encodeFrame(streamId, FrameType.UPGRADE, upgradePayload));
+    selectedPool.send(encodeFrame(streamId, FrameType.UPGRADE, upgradePayload));
 
     let wsBuffer = Buffer.alloc(0);
     let targetToBrowserBuffer = Buffer.alloc(0);
@@ -370,9 +425,7 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
         if (!cleanupCalled) {
           if (upgradeResponseReceived) {
             const closeFrame = buildWebSocketFrame(0x08, Buffer.from([0x03, 0xe9]));
-            socket.write(closeFrame, (err) => {
-              cleanup();
-            });
+            socket.write(closeFrame, () => cleanup());
           } else {
             cleanup();
           }
@@ -384,95 +437,60 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
       if (cleanupCalled) return;
       cleanupCalled = true;
       if (idleTimer) clearTimeout(idleTimer);
-      activeWebSockets.delete(streamId);
-      connectionPool.unregisterStream(streamId);
-      tcpServer.releaseStreamId(streamId);
+      webSockets.delete(streamId);
+      selectedPool.unregisterStream(streamId);
+      releaseStream(route, streamId);
       socket.destroy();
     }
 
     resetIdleTimer();
 
-    connectionPool.registerStream(streamId, {
+    selectedPool.registerStream(streamId, {
       frameHandler: (frame) => {
         if (frame.type === FrameType.UPGRADE) {
           resetIdleTimer();
           try {
             const response = JSON.parse(frame.payload.toString());
-            
             if (response.status !== 101) {
               const errorStatus = response.status || 502;
               const errorHeaders = response.headers || {};
               const errorBody = errorHeaders['content-length'] ? '' : `WebSocket upgrade failed: ${errorStatus}\r\n`;
-              const headerLines = [
-                `HTTP/1.1 ${errorStatus} ${getStatusText(errorStatus)}`,
-                'Connection: close',
-                `Content-Length: ${Buffer.byteLength(errorBody)}`,
-                '',
-                ''
-              ];
-              socket.write(headerLines.join('\r\n') + errorBody, (err) => {
-                cleanup();
-              });
+              const headerLines = [`HTTP/1.1 ${errorStatus} ${getStatusText(errorStatus)}`, 'Connection: close', `Content-Length: ${Buffer.byteLength(errorBody)}`, '', ''];
+              socket.write(headerLines.join('\r\n') + errorBody, () => cleanup());
               return;
             }
 
             const headers = response.headers || {};
-            const headerLines = [
-              'HTTP/1.1 101 Switching Protocols',
-              `Upgrade: ${headers.upgrade || 'websocket'}`,
-              `Connection: ${headers.connection || 'Upgrade'}`,
-              `Sec-WebSocket-Accept: ${headers['sec-websocket-accept'] || ''}`,
-              '',
-              ''
-            ];
-
+            const headerLines = ['HTTP/1.1 101 Switching Protocols', `Upgrade: ${headers.upgrade || 'websocket'}`, `Connection: ${headers.connection || 'Upgrade'}`, `Sec-WebSocket-Accept: ${headers['sec-websocket-accept'] || ''}`, '', ''];
             upgradeResponseReceived = true;
-            socket.write(headerLines.join('\r\n'), (err) => {
-              if (err) cleanup();
-            });
+            socket.write(headerLines.join('\r\n'), (err) => { if (err) cleanup(); });
           } catch (err) {
             console.error('Invalid UPGRADE response:', err.message);
             cleanup();
           }
         } else if (frame.type === FrameType.DATA && upgradeResponseReceived) {
           resetIdleTimer();
-
           targetToBrowserBuffer = Buffer.concat([targetToBrowserBuffer, frame.payload]);
-
           while (targetToBrowserBuffer.length >= 2 && !closeFramePending) {
             const result = parseWebSocketFrame(targetToBrowserBuffer, true);
             if (!result) break;
-
             const { frameSize, opcode, remaining } = result;
-
             const completeFrame = targetToBrowserBuffer.subarray(0, frameSize);
             targetToBrowserBuffer = remaining;
-
             const isCloseFrame = opcode === 0x08;
-            if (isCloseFrame) {
-              closeFramePending = true;
-            }
-
+            if (isCloseFrame) closeFramePending = true;
             socket.write(completeFrame, (err) => {
-              if (err) {
-                cleanup();
-              } else if (isCloseFrame) {
-                cleanup();
-              }
+              if (err) cleanup();
+              else if (isCloseFrame) cleanup();
             });
-
             if (isCloseFrame) break;
           }
-
           if (targetToBrowserBuffer.length > MAX_WS_BUFFER_SIZE) {
             console.error('WebSocket reassembly buffer overflow - closing connection');
             cleanup();
-            return;
           }
         } else if (frame.type === FrameType.FIN) {
-          if (!closeFramePending) {
-            cleanup();
-          }
+          if (!closeFramePending) cleanup();
         } else if (frame.type === FrameType.ERROR) {
           cleanup();
         }
@@ -489,8 +507,7 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
     function sendLargeFrameChunk() {
       while (pendingOffset < pendingLargeFrame.length) {
         const end = Math.min(pendingOffset + MAX_FRAME_SIZE, pendingLargeFrame.length);
-        const chunk = pendingLargeFrame.subarray(pendingOffset, end);
-        connectionPool.send(encodeFrame(streamId, FrameType.DATA, chunk));
+        selectedPool.send(encodeFrame(streamId, FrameType.DATA, pendingLargeFrame.subarray(pendingOffset, end)));
         pendingOffset = end;
       }
       pendingLargeFrame = null;
@@ -505,20 +522,15 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
         return;
       }
       wsBuffer = Buffer.concat([wsBuffer, chunk]);
-
       while (wsBuffer.length >= 2) {
         if (pendingLargeFrame) break;
-
         const result = parseWebSocketFrame(wsBuffer, true);
         if (!result) break;
-
         const { frameSize, remaining, opcode } = result;
-
         const rawFrame = Buffer.from(wsBuffer.subarray(0, frameSize));
         wsBuffer = remaining;
-
         if (rawFrame.length <= MAX_FRAME_SIZE) {
-          connectionPool.send(encodeFrame(streamId, FrameType.DATA, rawFrame));
+          selectedPool.send(encodeFrame(streamId, FrameType.DATA, rawFrame));
         } else {
           pendingLargeFrame = rawFrame;
           pendingOffset = 0;
@@ -526,7 +538,6 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
           sendLargeFrameChunk();
           if (pendingLargeFrame) break;
         }
-
         if (opcode === 0x08) return;
       }
     }
@@ -544,14 +555,14 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
 
     socket.on('end', () => {
       if (!cleanupCalled) {
-        connectionPool.send(encodeFrame(streamId, FrameType.FIN, Buffer.alloc(0)));
+        selectedPool.send(encodeFrame(streamId, FrameType.FIN, Buffer.alloc(0)));
         cleanup();
       }
     });
 
     socket.on('close', () => {
       if (!cleanupCalled) {
-        connectionPool.send(encodeFrame(streamId, FrameType.FIN, Buffer.alloc(0)));
+        selectedPool.send(encodeFrame(streamId, FrameType.FIN, Buffer.alloc(0)));
         cleanup();
       }
     });

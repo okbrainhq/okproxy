@@ -29,7 +29,8 @@ const testFiles = [
   'test-websocket-bugs.js',
   'test-bugfixes.js',
   'test-multipath.js',
-  'test-multipath-e2e.js'
+  'test-multipath-e2e.js',
+  'test-multi-client-domains.js'
 ];
 
 // Files that need longer timeout (in ms)

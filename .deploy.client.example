@@ -1,0 +1,29 @@
+# .deploy.client - Client deployment configuration
+# Add your real .deploy.client file to .gitignore to prevent accidental commits
+
+# SERVER_HOST: Tunnel server host and TLS tunnel port
+SERVER_HOST=tunnel.example.com:9443
+
+# TARGET_HOST: Local service on the client machine to expose
+TARGET_HOST=localhost:3000
+
+# REPO_URL: Git repository URL to clone/update on the client machine
+REPO_URL=https://github.com/username/okproxy.git
+
+# CLIENT_NAME: Unique local profile name for this client on the remote Mac
+# Used for LaunchAgent label, log directory, and default remote cert directory
+CLIENT_NAME=client-1
+
+# CLIENT_CERT_DIR: Local certificate directory to upload for this client
+# Generate with: npx ca issue-client --domain app.example.com --name client-1 --output ./.certs/client-1
+CLIENT_CERT_DIR=./.certs/client-1
+
+# Optional: remote cert directory on the client machine
+# Defaults to ~/.okproxy/certs/$CLIENT_NAME (or ~/.okproxy/certs for CLIENT_NAME=default)
+# REMOTE_CERT_DIR=~/.okproxy/certs/client-1
+
+# Optional: default deployment host (USER@HOST)
+# DEPLOY_HOST=user@client-machine.local
+
+# Optional: custom SSH port (default: 22)
+# SSH_PORT=2222

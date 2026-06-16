@@ -17,7 +17,9 @@ function parseArgs() {
     targetPort: 3000,
     clientKey: DEFAULT_KEY,
     clientCert: DEFAULT_CERT,
-    caCert: DEFAULT_CA
+    caCert: DEFAULT_CA,
+    domains: [],
+    preserveHost: false
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -65,6 +67,12 @@ function parseArgs() {
       case '--multipath':
         process.env.MULTIPATH_ENABLED = 'true';
         break;
+      case '--domain':
+        options.domains.push(args[++i]);
+        break;
+      case '--preserve-host':
+        options.preserveHost = true;
+        break;
       case '--help':
         console.log(`
 Usage: node index.js [options]
@@ -76,6 +84,8 @@ Options:
   --cert <path>           Client certificate (default: ${DEFAULT_CERT})
   --ca <path>             CA certificate to verify server (default: ${DEFAULT_CA})
   --multipath             Enable multipath (multiple network interfaces)
+  --domain <domain>       Optional authorized domain subset (repeatable)
+  --preserve-host         Forward original public Host header to target
   --help                  Show this help
         `);
         process.exit(0);
@@ -101,7 +111,7 @@ function main() {
   vs.on('ready', () => {
     isReady = true;
     console.log('Connected to TLS tunnel server (multipath ready)');
-    proxy = createProxy(vs, config.targetPort, config.targetHost, vs.maxConcurrentStreams);
+    proxy = createProxy(vs, config.targetPort, config.targetHost, vs.maxConcurrentStreams, { preserveHost: config.preserveHost });
   });
 
   vs.on('socketConnected', (interfaceName) => {

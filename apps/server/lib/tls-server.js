@@ -12,6 +12,7 @@ const INIT_TIMEOUT = 10000;
 const MAX_CONCURRENT_STREAMS = 100;
 
 function createTLSServer(connectionPool, options = {}) {
+  const certBoundDomains = Boolean(options.certBoundDomains);
   const maxStreams = options.maxConcurrentStreams || MAX_CONCURRENT_STREAMS;
   const keepaliveInterval = options.keepaliveInterval || KEEPALIVE_INTERVAL;
   const keepaliveTimeout = options.keepaliveTimeout || KEEPALIVE_TIMEOUT;
@@ -118,17 +119,38 @@ function createTLSServer(connectionPool, options = {}) {
               interfaceName = clientInit.interface;
             }
 
-            // Register this connection in the pool
-            if (!connectionPool.add(serial, interfaceName, socket)) {
-              console.error(`[${new Date().toISOString()}] Rejecting client ${serial} on ${interfaceName}: different client already connected`);
-              socket.destroy();
-              return;
+            let registeredSession = null;
+            let authorizedDomains = [];
+            if (certBoundDomains) {
+              const result = connectionPool.addTunnelConnection({
+                serial,
+                cert,
+                interfaceName,
+                socket,
+                requestedDomains: Array.isArray(clientInit.domains) ? clientInit.domains : []
+              });
+              if (!result.ok) {
+                console.error(`[${new Date().toISOString()}] Rejecting client ${serial} on ${interfaceName}: ${result.reason}`);
+                socket.destroy();
+                return;
+              }
+              registeredSession = result.session;
+              authorizedDomains = result.domains || [];
+              socket._okproxySession = registeredSession;
+            } else {
+              // Register this connection in the legacy single-client pool
+              if (!connectionPool.add(serial, interfaceName, socket)) {
+                console.error(`[${new Date().toISOString()}] Rejecting client ${serial} on ${interfaceName}: different client already connected`);
+                socket.destroy();
+                return;
+              }
             }
 
             // Send INIT ACK
             socket.write(encodeFrame(0, FrameType.INIT, JSON.stringify({
               maxFrameSize: 1048576,
-              maxConcurrentStreams: maxStreams
+              maxConcurrentStreams: maxStreams,
+              domains: authorizedDomains
             })));
 
             initialized = true;
@@ -155,12 +177,14 @@ function createTLSServer(connectionPool, options = {}) {
 
         // Handle RESET_SEQ
         if (frame.streamId === 0 && frame.type === FrameType.RESET_SEQ) {
-          connectionPool.handleResetSeq(frame);
+          const targetPool = certBoundDomains ? socket._okproxySession?.pool : connectionPool;
+          if (targetPool) targetPool.handleResetSeq(frame);
           return;
         }
 
         // All other frames: dedup and route
-        connectionPool.onFrame(frame);
+        const targetPool = certBoundDomains ? socket._okproxySession?.pool : connectionPool;
+        if (targetPool) targetPool.onFrame(frame);
       },
       (err) => {
         console.error('Protocol error:', err.message);
@@ -174,7 +198,8 @@ function createTLSServer(connectionPool, options = {}) {
       stopKeepalive();
       if (initTimer) clearTimeout(initTimer);
       console.log(`[${new Date().toISOString()}] Client disconnected, serial: ${serial}, interface: ${interfaceName}`);
-      connectionPool.remove(socket);
+      if (certBoundDomains) connectionPool.removeTunnelConnection(socket);
+      else connectionPool.remove(socket);
     });
 
     socket.on('error', (err) => {
