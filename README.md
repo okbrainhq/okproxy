@@ -105,6 +105,9 @@ Create `.deploy.server` from `.deploy.server.example`:
 HOSTNAME=tunnel.example.com
 REPO_URL=https://github.com/arunoda/okproxy.git
 
+# Optional: Git branch to deploy (default: main)
+BRANCH=main
+
 # Optional: default deploy target so the command can omit USER@HOST
 DEPLOY_HOST=deploy@tunnel.example.com
 

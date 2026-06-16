@@ -1,4 +1,4 @@
-const { readFileSync, existsSync } = require('node:fs');
+const { readFileSync, writeFileSync, existsSync } = require('node:fs');
 const { join } = require('node:path');
 const { ConnectionPool } = require('./connection-pool');
 const { extractAuthorizedDomains, normalizeDomains, normalizeHost } = require('./domain-utils');
@@ -85,6 +85,52 @@ class MultiClientManager {
     return Boolean(domain && this.isIssuedDomain(domain));
   }
 
+  ensureIssuedDomains(serial, domains) {
+    if (!this.issuedDomainIndex || domains.length === 0) return;
+
+    let index = { version: 1, domains: {} };
+    if (existsSync(this.issuedDomainIndex)) {
+      try {
+        const parsed = JSON.parse(readFileSync(this.issuedDomainIndex, 'utf8'));
+        index = { version: parsed.version || 1, domains: parsed.domains || {} };
+      } catch (err) {
+        console.error(`[${new Date().toISOString()}] Failed to read issued domain index ${this.issuedDomainIndex}:`, err.message);
+        return;
+      }
+    }
+
+    let changed = false;
+    const serialString = String(serial);
+    for (const domain of domains) {
+      if (!index.domains[domain]) {
+        index.domains[domain] = { serials: [], status: 'valid' };
+        changed = true;
+      }
+      const info = index.domains[domain];
+      if (!Array.isArray(info.serials)) {
+        info.serials = [];
+        changed = true;
+      }
+      if (!info.serials.includes(serialString)) {
+        info.serials.push(serialString);
+        changed = true;
+      }
+      if (info.status !== 'valid') {
+        info.status = 'valid';
+        changed = true;
+      }
+    }
+
+    if (!changed) return;
+    try {
+      writeFileSync(this.issuedDomainIndex, JSON.stringify(index, null, 2) + '\n', { mode: 0o644 });
+      this.reloadIssuedDomainIndex();
+      console.log(`[${new Date().toISOString()}] Updated issued domain index for client ${serialString}: ${domains.join(', ')}`);
+    } catch (err) {
+      console.error(`[${new Date().toISOString()}] Failed to update issued domain index ${this.issuedDomainIndex}:`, err.message);
+    }
+  }
+
   addTunnelConnection({ serial, cert, interfaceName, socket, requestedDomains }) {
     const serialString = String(serial);
     if (isRevoked(serialString, this.caDir)) return { ok: false, reason: 'revoked' };
@@ -123,6 +169,8 @@ class MultiClientManager {
     if (!session.addConnection(serialString, interfaceName, socket)) {
       return { ok: false, reason: 'session-rejected-connection' };
     }
+
+    this.ensureIssuedDomains(serialString, domains);
 
     for (const domain of domains) {
       this.activeRoutesByDomain.set(domain, session);

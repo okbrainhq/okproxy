@@ -19,9 +19,11 @@ Create a `.deploy.server` file in the project root to specify deployment paramet
 HOSTNAME=tunnel.example.com
 # REPO_URL: Git repository URL to clone the application
 REPO_URL=https://github.com/username/okproxy.git
+# Optional: Git branch to deploy (default: main)
+BRANCH=main
 ```
 
-The script reads this file to get `HOSTNAME` and `REPO_URL`.
+The script reads this file to get `HOSTNAME`, `REPO_URL`, and optional `BRANCH`.
 
 **Note:** Add `.deploy.server` to `.gitignore` to prevent accidental commits of deployment credentials.
 
@@ -72,10 +74,10 @@ Two scripts work together for remote deployment:
 
 ### Local Orchestration Flow (setup-server.sh)
 
-1. Read `.deploy.server` for `HOSTNAME` and `REPO_URL`
+1. Read `.deploy.server` for `HOSTNAME`, `REPO_URL`, and optional `BRANCH`
 2. Copy `setup-server-remote.sh` to remote server
 3. If `--upload-certs`: scp certificates to remote server
-4. SSH into server and run: `sudo ./setup-server-remote.sh [hostname] [repo_url] [flags]`
+4. SSH into server and run: `sudo ./setup-server-remote.sh [hostname] [repo_url] --branch=[branch] [flags]`
 
 ### Remote Execution Context (setup-server-remote.sh)
 
@@ -112,7 +114,7 @@ This ensures:
 ### 1. Configuration Loading
 
 - Check if `.deploy.server` exists
-- Source the file to load `HOSTNAME` and `REPO_URL`
+- Source the file to load `HOSTNAME`, `REPO_URL`, and optional `BRANCH`
 - Validate required variables are set (unless `--dev` mode)
 
 ### 2. System Preparation
@@ -138,7 +140,7 @@ This ensures:
 ### 4. Application Deployment
 
 - Create `/var/www/okproxy` directory
-- Clone/pull repository from `$REPO_URL` **OR** if directory exists, run `git pull` to update
+- Clone/update repository from `$REPO_URL` using `$BRANCH` (defaults to `main`)
 - Set ownership to `$REAL_USER`
 
 **Note on monorepo structure:** The okproxy project uses a monorepo with `apps/server/` and `packages/frame-protocol/`. The server imports from `../../packages/frame-protocol/index.js`. Since `apps/server/package.json` has zero dependencies, `npm install` is not required - the code runs directly via Node.js built-in modules. The shared package is automatically available after cloning the repository.
@@ -244,7 +246,7 @@ The script must handle being run multiple times safely:
 
 | Operation | Idempotent Approach |
 |-----------|---------------------|
-| Git clone | `if [ -d "$APP_DIR/.git" ]; then git pull; else git clone; fi` |
+| Git clone/update | `if [ -d "$APP_DIR/.git" ]; then git fetch origin "$BRANCH"; git reset --hard "origin/$BRANCH"; else git clone --branch "$BRANCH"; fi` |
 | Directory creation | `mkdir -p` (always succeeds) |
 | Systemd service | Use `systemctl restart` (works whether stopped or running) |
 | Caddy config | Overwrite file, then `systemctl reload caddy` |

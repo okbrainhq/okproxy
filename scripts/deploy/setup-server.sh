@@ -2,7 +2,7 @@
 
 # setup-server.sh
 # Purpose: Orchestrates the setup on a remote server by copying scripts and running them.
-# Usage: ./scripts/deploy/setup-server.sh [USER@HOST] [--upload-certs] [--classic]
+# Usage: ./scripts/deploy/setup-server.sh [USER@HOST] [--upload-certs] [--classic] [--branch BRANCH]
 
 set -e
 
@@ -34,17 +34,33 @@ fi
 HOST=""
 UPLOAD_CERTS=false
 CERT_BOUND_DOMAINS=${CERT_BOUND_DOMAINS:-true}
+BRANCH=${BRANCH:-main}
 
-for arg in "$@"; do
-    case "$arg" in
+while [ $# -gt 0 ]; do
+    case "$1" in
         --upload-certs)
             UPLOAD_CERTS=true
+            shift
             ;;
         --classic)
             CERT_BOUND_DOMAINS=false
+            shift
             ;;
         --cert-bound-domains)
             CERT_BOUND_DOMAINS=true
+            shift
+            ;;
+        --branch=*)
+            BRANCH="${1#--branch=}"
+            shift
+            ;;
+        --branch)
+            if [ $# -lt 2 ]; then
+                echo "Error: --branch requires a branch name"
+                exit 1
+            fi
+            BRANCH="$2"
+            shift 2
             ;;
         --dev)
             echo "Error: --dev flag should be used with setup-server-remote.sh directly, not setup-server.sh"
@@ -52,13 +68,20 @@ for arg in "$@"; do
             ;;
         --*)
             # Unknown flag
+            shift
             ;;
         *)
             # Assume it's the host
-            HOST="$arg"
+            HOST="$1"
+            shift
             ;;
     esac
 done
+
+if [ -z "$BRANCH" ]; then
+    echo "Error: BRANCH cannot be empty. Set BRANCH in .deploy.server or pass --branch."
+    exit 1
+fi
 
 # If no host provided, check if DEPLOY_HOST is set in .deploy.server
 if [ -z "$HOST" ] && [ -n "$DEPLOY_HOST" ]; then
@@ -67,7 +90,7 @@ fi
 
 if [ -z "$HOST" ]; then
     echo "Error: No host specified and DEPLOY_HOST not set in .deploy.server file."
-    echo "Usage: ./scripts/deploy/setup-server.sh [USER@HOST] [--upload-certs] [--classic]"
+    echo "Usage: ./scripts/deploy/setup-server.sh [USER@HOST] [--upload-certs] [--classic] [--branch BRANCH]"
     echo "Or set DEPLOY_HOST in .deploy.server file."
     exit 1
 fi
@@ -75,6 +98,7 @@ fi
 echo "Setting up OKProxy on $HOST..."
 echo "Hostname: $HOSTNAME"
 echo "Repository: $REPO_URL"
+echo "Branch: $BRANCH"
 echo "Cert-bound domains: $CERT_BOUND_DOMAINS"
 
 # Build SSH/SCP port options
@@ -155,7 +179,8 @@ echo "Executing setup script on remote host..."
 # Use printf %q to properly escape arguments to prevent shell injection
 ESCAPED_HOSTNAME=$(printf '%q' "$HOSTNAME")
 ESCAPED_REPO_URL=$(printf '%q' "$REPO_URL")
+ESCAPED_BRANCH=$(printf '%q' "$BRANCH")
 ESCAPED_CERT_BOUND_DOMAINS=$(printf '%q' "$CERT_BOUND_DOMAINS")
-ssh $SSH_OPTS "$HOST" "chmod +x ~/setup-server-remote.sh && sudo ~/setup-server-remote.sh $ESCAPED_HOSTNAME $ESCAPED_REPO_URL --cert-bound-domains=$ESCAPED_CERT_BOUND_DOMAINS"
+ssh $SSH_OPTS "$HOST" "chmod +x ~/setup-server-remote.sh && sudo ~/setup-server-remote.sh $ESCAPED_HOSTNAME $ESCAPED_REPO_URL --branch=$ESCAPED_BRANCH --cert-bound-domains=$ESCAPED_CERT_BOUND_DOMAINS"
 
 echo "Remote setup completed successfully!"
