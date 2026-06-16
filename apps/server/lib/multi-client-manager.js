@@ -100,7 +100,9 @@ class MultiClientManager {
     }
 
     let changed = false;
-    const serialString = String(serial);
+    // TLS exposes certificate serials as hex strings, while CA metadata/CRL use decimal.
+    // Store decimal serials in issued-domains.json so revocation checks remain consistent.
+    const serialString = String(parseInt(String(serial), 16));
     for (const domain of domains) {
       if (!index.domains[domain]) {
         index.domains[domain] = { serials: [], status: 'valid' };

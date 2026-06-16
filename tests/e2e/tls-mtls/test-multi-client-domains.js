@@ -12,6 +12,7 @@ const { MultiClientManager } = require('../../../apps/server/lib/multi-client-ma
 const { VirtualSocket } = require('../../../apps/client/lib/virtual-socket');
 const { createProxy } = require('../../../apps/client/lib/proxy');
 const { revokeCertificate } = require('../../../apps/server/lib/ca');
+const { readFileSync, writeFileSync } = require('node:fs');
 const { getPort, getCertPaths, issueTestClientCertificate, httpRequest } = require('./setup');
 
 function createNamedTarget(name) {
@@ -248,6 +249,30 @@ test('cert-bound mode rejects unknown host and returns 502 for authorized discon
     await env.cleanup();
   }
 });
+
+test('connected client certificate domains are saved to issued domain index for Caddy ask', async () => {
+  const env = await createMultiEnv();
+  try {
+    const issuedDomainIndex = join(env.certs.caDir, 'issued-domains.json');
+    writeFileSync(issuedDomainIndex, JSON.stringify({ version: 1, domains: {} }, null, 2) + '\n');
+
+    const askBefore = await httpRequest({ port: env.ports.httpPort, hostname: 'localhost', path: `/_okproxy/caddy-ask?domain=${env.domains.a}`, headers: { host: '127.0.0.1' } });
+    assert.equal(askBefore.statusCode, 404);
+
+    env.clients.push(await startVirtualClient({ tlsPort: env.ports.tlsPort, cert: env.certA, targetPort: env.ports.targetAPort }));
+
+    const metadata = JSON.parse(readFileSync(join(env.certs.caDir, 'certs.json'), 'utf8'));
+    const cert = metadata.certs.find(c => c.domains.includes(env.domains.a));
+    const index = JSON.parse(readFileSync(issuedDomainIndex, 'utf8'));
+    assert.deepEqual(index.domains[env.domains.a], { serials: [String(cert.serial)], status: 'valid' });
+
+    const askAfter = await httpRequest({ port: env.ports.httpPort, hostname: 'localhost', path: `/_okproxy/caddy-ask?domain=${env.domains.a}`, headers: { host: '127.0.0.1' } });
+    assert.equal(askAfter.statusCode, 200);
+  } finally {
+    await env.cleanup();
+  }
+});
+
 
 test('runtime domain claims cannot add domains and revoked certs cannot connect', async () => {
   const env = await createMultiEnv();
