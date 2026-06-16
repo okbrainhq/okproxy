@@ -59,7 +59,8 @@ function filterWebSocketHeaders(headers) {
 
 const MAX_WS_BUFFER_SIZE = 16 * 1024 * 1024;
 
-function createProxy(connection, targetPort, targetHost = 'localhost', maxStreams = 100) {
+function createProxy(connection, targetPort, targetHost = 'localhost', maxStreams = 100, options = {}) {
+  const preserveHost = Boolean(options.preserveHost);
   const activeStreams = new Map();
   const activeWebSockets = new Map();
 
@@ -166,11 +167,13 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
       }
 
       const proxyHeaders = filterWebSocketHeaders(upgradeInfo.headers);
-      proxyHeaders.host = `${targetHost}:${targetPort}`;
+      proxyHeaders.host = preserveHost && upgradeInfo.publicHost ? upgradeInfo.publicHost : `${targetHost}:${targetPort}`;
 
       if (upgradeInfo.remoteAddress) {
         proxyHeaders['x-forwarded-for'] = upgradeInfo.remoteAddress;
       }
+      if (upgradeInfo.publicHost) proxyHeaders['x-forwarded-host'] = upgradeInfo.publicHost;
+      if (upgradeInfo.publicProto) proxyHeaders['x-forwarded-proto'] = upgradeInfo.publicProto;
 
       const proxyReq = request({
         hostname: targetHost,
@@ -367,7 +370,7 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
       const reqInfo = JSON.parse(payload.toString());
 
       const proxyHeaders = filterRequestHeaders(reqInfo.headers);
-      proxyHeaders.host = `${targetHost}:${targetPort}`;
+      proxyHeaders.host = preserveHost && reqInfo.publicHost ? reqInfo.publicHost : `${targetHost}:${targetPort}`;
 
       delete proxyHeaders.origin;
       delete proxyHeaders.referer;
@@ -375,6 +378,8 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
       if (reqInfo.remoteAddress) {
         proxyHeaders['x-forwarded-for'] = reqInfo.remoteAddress;
       }
+      if (reqInfo.publicHost) proxyHeaders['x-forwarded-host'] = reqInfo.publicHost;
+      if (reqInfo.publicProto) proxyHeaders['x-forwarded-proto'] = reqInfo.publicProto;
 
       const proxyReq = request({
         hostname: targetHost,

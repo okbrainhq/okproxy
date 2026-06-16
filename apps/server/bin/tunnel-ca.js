@@ -27,11 +27,18 @@ function main() {
     case 'issue-client': {
       const outputIdx = args.indexOf('--output');
       const caDirIdx = args.indexOf('--ca-dir');
+      const nameIdx = args.indexOf('--name');
 
       const caDir = caDirIdx !== -1 ? args[caDirIdx + 1] : DEFAULT_CA_DIR;
       const outputDir = outputIdx !== -1 ? args[outputIdx + 1] : DEFAULT_OUTPUT_DIR;
+      const name = nameIdx !== -1 ? args[nameIdx + 1] : undefined;
+      const domains = [];
+      for (let i = 0; i < args.length; i++) {
+        if (args[i] === '--domain') domains.push(args[i + 1]);
+      }
+      const allowDomainOverlap = args.includes('--allow-domain-overlap');
 
-      issueClientCertificate(outputDir, caDir);
+      issueClientCertificate(outputDir, caDir, { name, domains, allowDomainOverlap });
       break;
     }
 
@@ -85,7 +92,10 @@ Usage: tunnel-ca.js <command> [options]
 Commands:
   init [--ca-dir <dir>]                     Initialize CA
   issue-client [--output <dir>]             Issue client certificate
-          [--ca-dir <dir>]                   CA directory (default: ${DEFAULT_CA_DIR})
+          [--name <name>]                     Optional client name
+          [--domain <domain>]                 Authorized public domain (repeatable)
+          [--allow-domain-overlap]            Allow duplicate valid domain for rotation
+          [--ca-dir <dir>]                    CA directory (default: ${DEFAULT_CA_DIR})
   issue-server --hostname <h>               Issue server certificate
           [--output <dir>]                   Output directory (default: ${DEFAULT_OUTPUT_DIR})
           [--ca-dir <dir>]                   CA directory (default: ${DEFAULT_CA_DIR})
@@ -98,7 +108,7 @@ Examples:
   node tunnel-ca.js init
 
   # Issue client certificate
-  node tunnel-ca.js issue-client
+  node tunnel-ca.js issue-client --domain app.example.com
 
   # Issue server certificate with SAN
   node tunnel-ca.js issue-server --hostname localhost

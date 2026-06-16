@@ -3,16 +3,19 @@
 # setup-server-remote.sh
 # Purpose: Installs dependencies and prepares the environment for okproxy on Debian.
 # Usage:
-#   Production: ./setup-server-remote.sh <HOSTNAME> <REPO_URL>
+#   Production: ./setup-server-remote.sh <HOSTNAME> <REPO_URL> [--cert-bound-domains=true|false]
 #   Dev:        ./setup-server-remote.sh --dev
 
 set -eo pipefail
 
 # Parse flags
 DEV_MODE=false
+CERT_BOUND_DOMAINS=true
 for arg in "$@"; do
     case "$arg" in
         --dev) DEV_MODE=true ;;
+        --cert-bound-domains=false) CERT_BOUND_DOMAINS=false ;;
+        --cert-bound-domains=true|--cert-bound-domains) CERT_BOUND_DOMAINS=true ;;
     esac
 done
 
@@ -40,6 +43,7 @@ if [ "$DEV_MODE" = false ]; then
     echo "Target Directory: $APP_DIR"
     echo "Repository: $REPO_URL"
     echo "Hostname: $HOSTNAME"
+    echo "Cert-bound domains: $CERT_BOUND_DOMAINS"
 else
     echo "Starting setup for OKProxy (dev mode)..."
 fi
@@ -255,6 +259,7 @@ if [ "$DEV_MODE" = false ]; then
 
     # 5. Clone or update repository
     CERT_DIR="/opt/okproxy/certs"
+    CA_DIR="/opt/okproxy/ca"
     if [ -d "$APP_DIR/.git" ]; then
         echo "App directory exists. Updating repository..."
         cd "$APP_DIR"
@@ -282,24 +287,36 @@ if [ "$DEV_MODE" = false ]; then
 
     # Set proper ownership for app and cert directories
     sudo chown -R okproxy:okproxy "$APP_DIR"
-    sudo chown -R okproxy:okproxy "$CERT_DIR"
+    sudo mkdir -p "$CERT_DIR" "$CA_DIR"
+    sudo chown -R okproxy:okproxy "$CERT_DIR" "$CA_DIR"
 
     # 6. Check/generate certificates
     CERT_DIR="/opt/okproxy/certs"
+    CA_DIR="/opt/okproxy/ca"
     if [ -f "$CERT_DIR/server-cert.pem" ]; then
         echo "Using uploaded certificates from $CERT_DIR"
-        CERT_OPTS="--key $CERT_DIR/server-key.pem --cert $CERT_DIR/server-cert.pem --ca $CERT_DIR/ca-cert.pem"
+        CERT_OPTS="--key $CERT_DIR/server-key.pem --cert $CERT_DIR/server-cert.pem --ca $CERT_DIR/ca-cert.pem --ca-dir $CA_DIR"
     elif [ ! -f "$APP_DIR/.certs/server-cert.pem" ]; then
         echo "Generating certificates..."
         cd "$APP_DIR"
         "$NODE_PATH" apps/server/bin/tunnel-ca.js init
         "$NODE_PATH" apps/server/bin/tunnel-ca.js issue-server --hostname "$HOSTNAME" --output ./.certs
-        "$NODE_PATH" apps/server/bin/tunnel-ca.js issue-client
+        # Client certificates should be issued separately with --domain for cert-bound deployments.
         echo "Certificates generated."
-        CERT_OPTS=""
+        CERT_OPTS="--ca-dir $APP_DIR/.ca"
     else
         echo "Using generated certificates from .certs/"
-        CERT_OPTS=""
+        CERT_OPTS="--ca-dir $APP_DIR/.ca"
+    fi
+
+    SERVER_MODE_OPTS=""
+    if [ "$CERT_BOUND_DOMAINS" = true ]; then
+        SERVER_MODE_OPTS="--cert-bound-domains --http-host 127.0.0.1"
+        if [ -f "$CA_DIR/issued-domains.json" ]; then
+            SERVER_MODE_OPTS="$SERVER_MODE_OPTS --issued-domain-index $CA_DIR/issued-domains.json"
+        elif [ -f "$APP_DIR/.ca/issued-domains.json" ]; then
+            SERVER_MODE_OPTS="$SERVER_MODE_OPTS --issued-domain-index $APP_DIR/.ca/issued-domains.json"
+        fi
     fi
 
     # 7. Setup systemd service
@@ -314,7 +331,7 @@ Type=simple
 User=okproxy
 Group=okproxy
 WorkingDirectory=/opt/okproxy
-ExecStart=$NODE_PATH apps/server/index.js --http-port 8080 --tls-port 9443 $CERT_OPTS
+ExecStart=$NODE_PATH apps/server/index.js --http-port 8080 --tls-port 9443 $CERT_OPTS $SERVER_MODE_OPTS
 Restart=always
 RestartSec=10
 Environment=NODE_ENV=production
@@ -324,7 +341,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=
+ReadWritePaths=/opt/okproxy/ca /opt/okproxy/certs /opt/okproxy/.ca /opt/okproxy/.certs
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectKernelLogs=true
@@ -348,9 +365,23 @@ EOF
 
     # 8. Setup Caddyfile
     echo "Configuring Caddy for $HOSTNAME..."
-    sudo tee /etc/caddy/Caddyfile > /dev/null <<EOF
-$HOSTNAME {
-    reverse_proxy localhost:8080
+    if [ "$CERT_BOUND_DOMAINS" = true ]; then
+        sudo tee /etc/caddy/Caddyfile > /dev/null <<EOF
+{
+    on_demand_tls {
+        ask http://127.0.0.1:8080/_okproxy/caddy-ask
+    }
+}
+
+:80 {
+    redir https://{host}{uri} permanent
+}
+
+:443 {
+    tls {
+        on_demand
+    }
+    reverse_proxy 127.0.0.1:8080
     header {
         X-Content-Type-Options nosniff
         X-Frame-Options DENY
@@ -359,6 +390,19 @@ $HOSTNAME {
     }
 }
 EOF
+    else
+        sudo tee /etc/caddy/Caddyfile > /dev/null <<EOF
+$HOSTNAME {
+    reverse_proxy 127.0.0.1:8080
+    header {
+        X-Content-Type-Options nosniff
+        X-Frame-Options DENY
+        Referrer-Policy strict-origin-when-cross-origin
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+    }
+}
+EOF
+    fi
     echo "Reloading Caddy..."
     sudo systemctl reload caddy
 

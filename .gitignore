@@ -6,6 +6,7 @@
 
 # Any .deploy files
 .deploy*
+!.deploy.*.example
 
 # Node.js
 node_modules/

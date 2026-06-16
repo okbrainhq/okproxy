@@ -2,7 +2,7 @@
 
 # setup-client.sh
 # Purpose: Orchestrates the setup of a tunnel client on a remote MacBook.
-# Usage: ./scripts/deploy/setup-client.sh [USER@HOST] [--upload-certs]
+# Usage: ./scripts/deploy/setup-client.sh [USER@HOST] [--upload-certs] [--cert-dir <dir>] [--client-name <name>]
 
 set -e
 
@@ -38,11 +38,27 @@ fi
 # Parse command line arguments
 HOST=""
 UPLOAD_CERTS=false
+CLIENT_NAME=${CLIENT_NAME:-default}
+CLIENT_CERT_DIR=${CLIENT_CERT_DIR:-$PROJECT_ROOT/.certs}
+REMOTE_CERT_DIR=${REMOTE_CERT_DIR:-}
 
-for arg in "$@"; do
+while [ $# -gt 0 ]; do
+    arg="$1"
     case "$arg" in
         --upload-certs)
             UPLOAD_CERTS=true
+            ;;
+        --cert-dir)
+            shift
+            CLIENT_CERT_DIR="$1"
+            ;;
+        --client-name)
+            shift
+            CLIENT_NAME="$1"
+            ;;
+        --remote-cert-dir)
+            shift
+            REMOTE_CERT_DIR="$1"
             ;;
         --*)
             # Unknown flag
@@ -52,7 +68,13 @@ for arg in "$@"; do
             HOST="$arg"
             ;;
     esac
+    shift
 done
+
+# Resolve relative local cert directories from the project root
+if [[ "$CLIENT_CERT_DIR" != /* ]]; then
+    CLIENT_CERT_DIR="$PROJECT_ROOT/${CLIENT_CERT_DIR#./}"
+fi
 
 # If no host provided, check if DEPLOY_HOST is set in .deploy.client
 if [ -z "$HOST" ] && [ -n "$DEPLOY_HOST" ]; then
@@ -61,7 +83,7 @@ fi
 
 if [ -z "$HOST" ]; then
     echo "Error: No host specified and DEPLOY_HOST not set in .deploy.client file."
-    echo "Usage: ./scripts/deploy/setup-client.sh [USER@HOST] [--upload-certs]"
+    echo "Usage: ./scripts/deploy/setup-client.sh [USER@HOST] [--upload-certs] [--cert-dir <dir>] [--client-name <name>]"
     echo "Or set DEPLOY_HOST in .deploy.client file."
     exit 1
 fi
@@ -70,6 +92,8 @@ echo "Setting up OKProxy Client on $HOST..."
 echo "Server: $SERVER_HOST"
 echo "Target: $TARGET_HOST"
 echo "Repository: $REPO_URL"
+echo "Client name: $CLIENT_NAME"
+echo "Local cert dir: $CLIENT_CERT_DIR"
 
 # Build SSH/SCP port options
 SSH_OPTS=""
@@ -86,13 +110,19 @@ scp $SCP_OPTS "$SCRIPT_DIR/setup-client-remote.sh" "$HOST:~/setup-client-remote.
 
 # 2. Upload certificates if requested
 # Note: Using ~ for remote home directory (will be expanded on remote side)
-REMOTE_CERT_DIR="~/.okproxy/certs"
+if [ -z "$REMOTE_CERT_DIR" ]; then
+    if [ "$CLIENT_NAME" = "default" ]; then
+        REMOTE_CERT_DIR="~/.okproxy/certs"
+    else
+        REMOTE_CERT_DIR="~/.okproxy/certs/$CLIENT_NAME"
+    fi
+fi
 if [ "$UPLOAD_CERTS" = true ]; then
     echo "Validating and uploading certificates..."
     
     # Check local cert directories exist
-    if [ ! -d "$PROJECT_ROOT/.certs" ]; then
-        echo "Error: .certs directory not found in project root"
+    if [ ! -d "$CLIENT_CERT_DIR" ]; then
+        echo "Error: client cert directory not found: $CLIENT_CERT_DIR"
         echo "Generate certificates first: npx ca init"
         exit 1
     fi
@@ -103,10 +133,10 @@ if [ "$UPLOAD_CERTS" = true ]; then
     fi
 
     # Check required client certificate files exist
-    if [ ! -f "$PROJECT_ROOT/.certs/client-cert.pem" ] || [ ! -f "$PROJECT_ROOT/.certs/client-key.pem" ]; then
-        echo "Error: Client certificates not found in .certs/"
+    if [ ! -f "$CLIENT_CERT_DIR/client-cert.pem" ] || [ ! -f "$CLIENT_CERT_DIR/client-key.pem" ]; then
+        echo "Error: Client certificates not found in $CLIENT_CERT_DIR"
         echo "Required files: client-cert.pem, client-key.pem"
-        echo "Generate with: npx ca issue-client"
+        echo "Generate with: npx ca issue-client --domain <domain> --output <dir>"
         exit 1
     fi
 
@@ -122,17 +152,17 @@ if [ "$UPLOAD_CERTS" = true ]; then
     echo "Uploading certificates to remote MacBook..."
     
     # Create remote cert directory (use ~ for remote expansion)
-    ssh $SSH_OPTS "$HOST" "mkdir -p ~/.okproxy/certs"
+    ssh $SSH_OPTS "$HOST" "mkdir -p $REMOTE_CERT_DIR"
     
     # Upload certificates using scp
-    scp $SCP_OPTS "$PROJECT_ROOT/.certs/client-cert.pem" "$HOST:~/.okproxy/certs/"
-    scp $SCP_OPTS "$PROJECT_ROOT/.certs/client-key.pem" "$HOST:~/.okproxy/certs/"
-    scp $SCP_OPTS "$PROJECT_ROOT/.ca/ca-cert.pem" "$HOST:~/.okproxy/certs/"
+    scp $SCP_OPTS "$CLIENT_CERT_DIR/client-cert.pem" "$HOST:$REMOTE_CERT_DIR/"
+    scp $SCP_OPTS "$CLIENT_CERT_DIR/client-key.pem" "$HOST:$REMOTE_CERT_DIR/"
+    scp $SCP_OPTS "$PROJECT_ROOT/.ca/ca-cert.pem" "$HOST:$REMOTE_CERT_DIR/"
     
     # Fix permissions (private key should be restricted)
-    ssh $SSH_OPTS "$HOST" "chmod 600 ~/.okproxy/certs/client-key.pem && chmod 644 ~/.okproxy/certs/client-cert.pem ~/.okproxy/certs/ca-cert.pem"
+    ssh $SSH_OPTS "$HOST" "chmod 600 $REMOTE_CERT_DIR/client-key.pem && chmod 644 $REMOTE_CERT_DIR/client-cert.pem $REMOTE_CERT_DIR/ca-cert.pem"
     
-    echo "Certificates uploaded successfully to ~/.okproxy/certs/"
+    echo "Certificates uploaded successfully to $REMOTE_CERT_DIR"
 fi
 
 # 3. Execute setup script remotely
@@ -141,16 +171,26 @@ echo "Executing setup script on remote MacBook..."
 ESCAPED_SERVER_HOST=$(printf '%q' "$SERVER_HOST")
 ESCAPED_TARGET_HOST=$(printf '%q' "$TARGET_HOST")
 ESCAPED_REPO_URL=$(printf '%q' "$REPO_URL")
-ssh $SSH_OPTS "$HOST" "chmod +x ~/setup-client-remote.sh && ~/setup-client-remote.sh $ESCAPED_SERVER_HOST $ESCAPED_TARGET_HOST $ESCAPED_REPO_URL"
+ESCAPED_CLIENT_NAME=$(printf '%q' "$CLIENT_NAME")
+ESCAPED_REMOTE_CERT_DIR=$(printf '%q' "$REMOTE_CERT_DIR")
+ssh $SSH_OPTS "$HOST" "chmod +x ~/setup-client-remote.sh && ~/setup-client-remote.sh $ESCAPED_SERVER_HOST $ESCAPED_TARGET_HOST $ESCAPED_REPO_URL $ESCAPED_CLIENT_NAME $ESCAPED_REMOTE_CERT_DIR"
+
+if [ "$CLIENT_NAME" = "default" ]; then
+    LAUNCH_LABEL="com.okproxy.client"
+    CLIENT_LOG_PATH="~/.okproxy/logs/client.log"
+else
+    LAUNCH_LABEL="com.okproxy.client.$CLIENT_NAME"
+    CLIENT_LOG_PATH="~/.okproxy/logs/$CLIENT_NAME/client.log"
+fi
 
 echo ""
 echo "Client setup completed successfully on $HOST!"
 echo "The tunnel client will start automatically on login and restart on crashes."
 echo ""
 if [ -n "$SSH_OPTS" ]; then
-    echo "To check status: ssh $SSH_OPTS $HOST 'launchctl list com.okproxy.client'"
-    echo "To view logs: ssh $SSH_OPTS $HOST 'tail -f ~/.okproxy/logs/client.log'"
+    echo "To check status: ssh $SSH_OPTS $HOST 'launchctl list $LAUNCH_LABEL'"
+    echo "To view logs: ssh $SSH_OPTS $HOST 'tail -f $CLIENT_LOG_PATH'"
 else
-    echo "To check status: ssh $HOST 'launchctl list com.okproxy.client'"
-    echo "To view logs: ssh $HOST 'tail -f ~/.okproxy/logs/client.log'"
+    echo "To check status: ssh $HOST 'launchctl list $LAUNCH_LABEL'"
+    echo "To view logs: ssh $HOST 'tail -f $CLIENT_LOG_PATH'"
 fi

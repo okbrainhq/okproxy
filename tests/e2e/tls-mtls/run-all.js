@@ -27,14 +27,17 @@ const testFiles = [
   'test-security.js',
   'test-revocation.js',
   'test-websocket.js',
+  'test-websocket-bugs.js',
   'test-bugfixes.js',
   'test-multipath.js',
-  'test-multipath-e2e.js'
+  'test-multipath-e2e.js',
+  'test-multi-client-domains.js'
 ];
 
 // Files that need longer timeout (in ms)
 const longTimeoutFiles = new Set([
-  'test-sse-timeout.js' // 65s test + 60s slow headers test + margin = ~130s
+  'test-sse-timeout.js', // 65s test + 60s slow headers test + margin = ~130s
+  'test-bugfixes.js'
 ]);
 
 // Timeout values for different test types (in ms)

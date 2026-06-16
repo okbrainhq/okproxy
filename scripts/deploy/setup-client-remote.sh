@@ -2,8 +2,8 @@
 
 # setup-client-remote.sh
 # Purpose: Installs the tunnel client on macOS and configures it to run as a LaunchAgent.
-# Usage: ./setup-client-remote.sh <SERVER_HOST> <TARGET_HOST> <REPO_URL>
-# Example: ./setup-client-remote.sh t0.arunoda.me:9443 localhost:3000 https://github.com/arunoda/okproxy.git
+# Usage: ./setup-client-remote.sh <SERVER_HOST> <TARGET_HOST> <REPO_URL> [CLIENT_NAME] [CERT_DIR]
+# Example: ./setup-client-remote.sh t0.arunoda.me:9443 localhost:3000 https://github.com/arunoda/okproxy.git blog ~/.okproxy/certs/blog
 
 set -eo pipefail
 
@@ -17,6 +17,8 @@ fi
 SERVER_HOST="$1"
 TARGET_HOST="$2"
 REPO_URL="$3"
+CLIENT_NAME="${4:-default}"
+CERT_DIR="${5:-}"
 
 # Parse server host and port
 SERVER_HOSTNAME="${SERVER_HOST%%:*}"
@@ -32,11 +34,29 @@ if [ "$TARGET_PORT" = "$TARGET_HOST" ]; then
     TARGET_PORT=3000
 fi
 
+SAFE_CLIENT_NAME=$(printf '%s' "$CLIENT_NAME" | tr -c 'A-Za-z0-9_.-' '-')
+if [ -z "$SAFE_CLIENT_NAME" ]; then
+    SAFE_CLIENT_NAME="default"
+fi
+
 APP_DIR="$HOME/okproxy"
 CLIENT_DIR="$APP_DIR/apps/client"
-CERT_DIR="$HOME/.okproxy/certs"
-LOG_DIR="$HOME/.okproxy/logs"
-LAUNCH_LABEL="com.okproxy.client"
+if [ -z "$CERT_DIR" ]; then
+    if [ "$SAFE_CLIENT_NAME" = "default" ]; then
+        CERT_DIR="$HOME/.okproxy/certs"
+    else
+        CERT_DIR="$HOME/.okproxy/certs/$SAFE_CLIENT_NAME"
+    fi
+elif [[ "$CERT_DIR" == ~/* ]]; then
+    CERT_DIR="$HOME/${CERT_DIR#~/}"
+fi
+if [ "$SAFE_CLIENT_NAME" = "default" ]; then
+    LOG_DIR="$HOME/.okproxy/logs"
+    LAUNCH_LABEL="com.okproxy.client"
+else
+    LOG_DIR="$HOME/.okproxy/logs/$SAFE_CLIENT_NAME"
+    LAUNCH_LABEL="com.okproxy.client.$SAFE_CLIENT_NAME"
+fi
 PLIST_PATH="$HOME/Library/LaunchAgents/${LAUNCH_LABEL}.plist"
 
 echo "Starting setup for OKProxy Client on macOS..."
@@ -44,6 +64,8 @@ echo "App Directory: $APP_DIR"
 echo "Server: $SERVER_HOSTNAME:$SERVER_PORT"
 echo "Target: $TARGET_HOSTNAME:$TARGET_PORT"
 echo "Repository: $REPO_URL"
+echo "Client name: $SAFE_CLIENT_NAME"
+echo "Cert directory: $CERT_DIR"
 
 # 1. Check for and install Node.js if needed
 echo "Checking for Node.js..."
@@ -373,6 +395,7 @@ echo ""
 echo "The tunnel client is configured to:"
 echo "  - Connect to: $SERVER_HOSTNAME:$SERVER_PORT"
 echo "  - Forward to: $TARGET_HOSTNAME:$TARGET_PORT"
+echo "  - Certificate dir: $CERT_DIR"
 echo ""
 echo "Management commands:"
 echo "  Check status: launchctl list $LAUNCH_LABEL"

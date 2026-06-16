@@ -4,6 +4,7 @@
 const { execFileSync } = require('node:child_process');
 const { existsSync, mkdirSync, writeFileSync, readFileSync, chmodSync, appendFileSync, copyFileSync, unlinkSync, statSync } = require('node:fs');
 const { join } = require('node:path');
+const { normalizeDomains } = require('./domain-utils');
 const { tmpdir } = require('node:os');
 const { randomBytes } = require('node:crypto');
 
@@ -93,65 +94,131 @@ function getNextSerial(caDir = DEFAULT_CA_DIR) {
  * @param {string} caDir - CA directory
  * @returns {Object} Certificate info { serial, certPath, keyPath, caPath }
  */
-function issueClientCertificate(outputDir, caDir = DEFAULT_CA_DIR) {
+function readJsonFile(path, fallback) {
+  try { return JSON.parse(readFileSync(path, 'utf8')); } catch { return fallback; }
+}
+
+function writeJsonFile(path, value) {
+  writeFileSync(path, JSON.stringify(value, null, 2) + '\n', { mode: 0o600 });
+}
+
+function loadCertMetadata(caDir = DEFAULT_CA_DIR) {
+  return readJsonFile(join(caDir, 'certs.json'), { version: 1, certs: [] });
+}
+
+function saveCertMetadata(caDir, metadata) {
+  writeJsonFile(join(caDir, 'certs.json'), metadata);
+}
+
+function rebuildIssuedDomainIndex(caDir = DEFAULT_CA_DIR) {
+  const metadata = loadCertMetadata(caDir);
+  const domains = {};
+  for (const cert of metadata.certs || []) {
+    if (cert.status !== 'valid') continue;
+    for (const domain of cert.domains || []) {
+      if (!domains[domain]) domains[domain] = { serials: [], status: 'valid' };
+      domains[domain].serials.push(String(cert.serial));
+    }
+  }
+  writeJsonFile(join(caDir, 'issued-domains.json'), { version: 1, domains });
+  return { version: 1, domains };
+}
+
+/**
+ * Issue a client certificate
+ * @param {string} outputDir - Directory to output certificate files
+ * @param {string} caDir - CA directory
+ * @param {Object} options - { domains, name, allowDomainOverlap }
+ * @returns {Object} Certificate info { serial, certPath, keyPath, caPath, domains }
+ */
+function issueClientCertificate(outputDir, caDir = DEFAULT_CA_DIR, options = {}) {
   if (!existsSync(outputDir)) {
     mkdirSync(outputDir, { recursive: true });
   }
 
-  const serial = getNextSerial(caDir);
+  const domains = normalizeDomains(options.domains || []);
+  const metadata = loadCertMetadata(caDir);
 
+  if (!options.allowDomainOverlap && domains.length > 0) {
+    const crl = readFileSync(join(caDir, 'crl.txt'), 'utf8');
+    const revokedSerials = new Set(crl.split('\n').filter(Boolean));
+    for (const cert of metadata.certs || []) {
+      if (cert.status !== 'valid' || revokedSerials.has(String(cert.serial))) continue;
+      for (const domain of domains) {
+        if ((cert.domains || []).includes(domain)) {
+          throw new Error(`Domain already issued to valid certificate ${cert.serial}: ${domain}`);
+        }
+      }
+    }
+  }
+
+  const serial = getNextSerial(caDir);
   const caCertPath = join(caDir, 'ca-cert.pem');
 
   const clientKeyPath = join(outputDir, 'client-key.pem');
   const clientCertPath = join(outputDir, 'client-cert.pem');
   const clientCsrPath = join(outputDir, 'client.csr');
   const caOutPath = join(outputDir, 'ca-cert.pem');
+  const tempConfig = join(outputDir, '.client-openssl.cnf');
 
   // Generate client private key
   execFileSync('openssl', ['genrsa', '-out', clientKeyPath, '2048'], { stdio: 'pipe' });
   chmodSync(clientKeyPath, 0o600);
 
+  const reqConfig = [
+    '[req]',
+    'distinguished_name=dn',
+    '[dn]',
+    '[client_ext]',
+    'extendedKeyUsage=clientAuth'
+  ];
+  if (domains.length > 0) {
+    reqConfig.push(`subjectAltName=${domains.map(d => `DNS:${d}`).join(',')}`);
+  }
+  writeFileSync(tempConfig, reqConfig.join('\n') + '\n', { mode: 0o600 });
+
   // Create certificate signing request (generic CN, identity comes from serial)
   execFileSync(
     'openssl',
-    ['req', '-new', '-key', clientKeyPath, '-out', clientCsrPath, '-subj', '/CN=tunnel-client'],
+    ['req', '-new', '-key', clientKeyPath, '-out', clientCsrPath, '-subj', `/CN=${options.name || 'tunnel-client'}`],
     { stdio: 'pipe' }
   );
 
-  // Sign certificate with CA (valid for 90 days)
-  // Use temp combined CA file to avoid CA key path in /proc/<pid>/cmdline
+  // Sign certificate with CA (valid for 90 days), adding clientAuth and optional SAN domains.
   const tempCAFile = createTempCAFile(caDir);
   try {
     execFileSync(
       'openssl',
-      ['x509', '-req', '-in', clientCsrPath, '-CA', tempCAFile, '-out', clientCertPath, '-days', '90', '-set_serial', String(serial)],
+      ['x509', '-req', '-in', clientCsrPath, '-CA', tempCAFile, '-out', clientCertPath, '-days', '90', '-set_serial', String(serial), '-extfile', tempConfig, '-extensions', 'client_ext'],
       { stdio: 'pipe' }
     );
   } finally {
-    try {
-      unlinkSync(tempCAFile);
-    } catch {
-      // Ignore cleanup errors
-    }
+    try { unlinkSync(tempCAFile); } catch {}
   }
 
-  // Copy CA cert to output directory
   copyFileSync(caCertPath, caOutPath);
 
-  // Clean up CSR
   try {
     unlinkSync(clientCsrPath);
-  } catch {
-    // Ignore cleanup errors
-  }
+    unlinkSync(tempConfig);
+  } catch {}
 
-  // Track issued certificate (serial only, no client ID needed)
-  appendFileSync(
-    join(caDir, 'issued.txt'),
-    `${serial}\t-\t${new Date().toISOString()}\n`
-  );
+  const issuedAt = new Date().toISOString();
+  appendFileSync(join(caDir, 'issued.txt'), `${serial}\t-\t${issuedAt}\n`);
+
+  metadata.certs = metadata.certs || [];
+  metadata.certs.push({
+    serial: String(serial),
+    name: options.name || '-',
+    status: 'valid',
+    issuedAt,
+    domains
+  });
+  saveCertMetadata(caDir, metadata);
+  rebuildIssuedDomainIndex(caDir);
 
   console.log(`Client certificate issued (serial: ${serial})`);
+  if (domains.length > 0) console.log('  Domains:', domains.join(', '));
   console.log('  Key:', clientKeyPath);
   console.log('  Cert:', clientCertPath);
   console.log('  CA:', caOutPath);
@@ -160,7 +227,8 @@ function issueClientCertificate(outputDir, caDir = DEFAULT_CA_DIR) {
     serial,
     certPath: clientCertPath,
     keyPath: clientKeyPath,
-    caPath: caOutPath
+    caPath: caOutPath,
+    domains
   };
 }
 
@@ -323,6 +391,13 @@ function loadCRLIntoCache(caDir) {
  */
 function revokeCertificate(serial, caDir = DEFAULT_CA_DIR) {
   appendFileSync(join(caDir, 'crl.txt'), `${serial}\n`);
+  const metadata = loadCertMetadata(caDir);
+  const serialString = String(serial);
+  for (const cert of metadata.certs || []) {
+    if (String(cert.serial) === serialString) cert.status = 'revoked';
+  }
+  saveCertMetadata(caDir, metadata);
+  rebuildIssuedDomainIndex(caDir);
   // Invalidate cache for this CA directory
   crlCache.delete(caDir);
   console.log(`Certificate revoked (serial: ${serial})`);
@@ -374,17 +449,25 @@ function isRevoked(serial, caDir = DEFAULT_CA_DIR) {
  */
 function listCertificates(caDir = DEFAULT_CA_DIR) {
   try {
+    const metadata = loadCertMetadata(caDir);
+    if (metadata.certs && metadata.certs.length > 0) {
+      const crl = readFileSync(join(caDir, 'crl.txt'), 'utf8');
+      const revokedSerials = new Set(crl.split('\n').filter(Boolean));
+      return metadata.certs.map(cert => ({
+        serial: parseInt(cert.serial, 10),
+        name: cert.name || '-',
+        issuedAt: cert.issuedAt,
+        revoked: cert.status === 'revoked' || revokedSerials.has(String(cert.serial)),
+        domains: (cert.domains || []).join(',')
+      }));
+    }
     const issued = readFileSync(join(caDir, 'issued.txt'), 'utf8');
     const crl = readFileSync(join(caDir, 'crl.txt'), 'utf8');
     const revokedSerials = new Set(crl.split('\n').filter(Boolean));
 
     return issued.split('\n').filter(Boolean).map(line => {
       const [serial, , issuedAt] = line.split('\t');
-      return {
-        serial: parseInt(serial, 10),
-        issuedAt,
-        revoked: revokedSerials.has(serial)
-      };
+      return { serial: parseInt(serial, 10), issuedAt, revoked: revokedSerials.has(serial), domains: '' };
     });
   } catch {
     return [];
@@ -398,5 +481,7 @@ module.exports = {
   revokeCertificate,
   isRevoked,
   listCertificates,
-  isValidHostname
+  isValidHostname,
+  rebuildIssuedDomainIndex,
+  loadCertMetadata
 };

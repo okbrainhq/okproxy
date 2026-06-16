@@ -97,54 +97,150 @@ npx ca revoke --serial <n>           # Revoke a certificate
 
 ## Server Deployment (Debian/Ubuntu)
 
-Create `.deploy.server`:
+The server deploy script copies `setup-server-remote.sh` to your VM, installs Node.js + Caddy, configures `okproxy.service`, opens ports `80`, `443`, and `9443`, and hardens the box with Fail2Ban/UFW.
+
+Create `.deploy.server` from `.deploy.server.example`:
 
 ```bash
 HOSTNAME=tunnel.example.com
 REPO_URL=https://github.com/arunoda/okproxy.git
 
+# Optional: default deploy target so the command can omit USER@HOST
+DEPLOY_HOST=deploy@tunnel.example.com
+
 # Optional: custom SSH port (default: 22)
 # SSH_PORT=2222
+
+# Optional: cert-bound multi-client mode is enabled by default
+# CERT_BOUND_DOMAINS=true
+```
+
+Prepare server certs locally if you want to upload them:
+
+```bash
+npx ca init
+npx ca issue-server --hostname tunnel.example.com --output ./.certs
 ```
 
 Deploy:
 
 ```bash
-./scripts/deploy/setup-server.sh user@server --upload-certs   # first time
-./scripts/deploy/setup-server.sh user@server                  # updates
+# First deploy: uploads server certs + CA metadata, then installs service
+./scripts/deploy/setup-server.sh user@server --upload-certs
+
+# Later updates: git reset/restart on the VM
+./scripts/deploy/setup-server.sh user@server
+
+# Legacy single-client mode, if needed
+./scripts/deploy/setup-server.sh user@server --classic
 ```
 
-Server ports: 80 (HTTP), 443 (HTTPS via Caddy), 9443 (TLS tunnel)
+In cert-bound mode the service runs with:
+
+```bash
+apps/server/index.js --http-port 8080 --tls-port 9443 \
+  --cert-bound-domains --http-host 127.0.0.1
+```
+
+Caddy is configured for on-demand HTTPS and uses the server ask endpoint:
+
+```text
+http://127.0.0.1:8080/_okproxy/caddy-ask
+```
+
+Point each public app domain to the server IP. The tunnel TLS endpoint remains `tunnel.example.com:9443`.
+
+Server ports: `80` HTTP redirect, `443` public HTTPS via Caddy, `9443` TLS tunnel.
 
 ## Client Deployment (macOS)
 
-Create `.deploy.client`:
+The client deploy script copies `setup-client-remote.sh` to the Mac, installs/uses Node.js, clones the repo to `~/okproxy`, uploads the selected client certs, and creates a LaunchAgent with `--multipath` enabled.
+
+Create `.deploy.client` from `.deploy.client.example`:
 
 ```bash
-SERVER_HOST=t0.arunoda.me:9443
+SERVER_HOST=tunnel.example.com:9443
 TARGET_HOST=localhost:3000
 REPO_URL=https://github.com/arunoda/okproxy.git
 
-# Optional: custom SSH port (default: 22)
+# Unique profile name for this client on the Mac
+CLIENT_NAME=blog
+
+# Local cert directory to upload for this client
+CLIENT_CERT_DIR=./.certs/blog
+
+# Optional: default SSH target
+DEPLOY_HOST=user@192.168.0.15
+
+# Optional: custom SSH port
 # SSH_PORT=2222
 
-# Optional: default deploy host so you can omit it from the command
-# DEPLOY_HOST=user@192.168.0.15
+# Optional: override remote cert path
+# REMOTE_CERT_DIR=~/.okproxy/certs/blog
 ```
 
-Deploy:
+Prepare one certificate directory per client/domain:
 
 ```bash
-./scripts/deploy/setup-client.sh user@192.168.0.15 --upload-certs
+npx ca issue-client \
+  --name blog \
+  --domain blog.example.com \
+  --output ./.certs/blog
 ```
 
-The client runs as a LaunchAgent with `--multipath` enabled by default, auto-starts on login, and restarts on crash.
+Deploy the client:
+
+```bash
+# First deploy for this client profile: upload selected cert directory
+./scripts/deploy/setup-client.sh user@192.168.0.15 --upload-certs
+
+# Or select certs explicitly from the command line
+./scripts/deploy/setup-client.sh user@192.168.0.15 \
+  --client-name blog \
+  --cert-dir ./.certs/blog \
+  --upload-certs
+
+# Later updates without re-uploading certs
+./scripts/deploy/setup-client.sh user@192.168.0.15 --client-name blog
+```
+
+`setup-client.sh` uploads these files from `CLIENT_CERT_DIR` to the remote cert directory:
+
+```text
+client-cert.pem
+client-key.pem
+ca-cert.pem
+```
+
+The remote cert directory defaults to:
+
+```text
+~/.okproxy/certs/<CLIENT_NAME>
+```
+
+For `CLIENT_NAME=default`, it keeps the old path:
+
+```text
+~/.okproxy/certs
+```
+
+The LaunchAgent label and logs are profile-specific:
 
 ```bash
 # Manage on the Mac
-launchctl list com.okproxy.client
-launchctl stop com.okproxy.client
-tail -f ~/.okproxy/logs/client.log
+launchctl list com.okproxy.client.blog
+launchctl start com.okproxy.client.blog
+launchctl stop com.okproxy.client.blog
+
+# Logs
+tail -f ~/.okproxy/logs/blog/client.log
+tail -f ~/.okproxy/logs/blog/client-error.log
+```
+
+If you need a custom Node binary on the Mac:
+
+```bash
+OKPROXY_NODE_PATH=/path/to/node ./setup-client-remote.sh ...
 ```
 
 ## Server Options
@@ -160,6 +256,9 @@ tail -f ~/.okproxy/logs/client.log
 --stream-timeout <ms>       Stream inactivity timeout (default: 30000)
 --keepalive-interval <ms>   PING interval (default: 10000)
 --keepalive-timeout <ms>    PONG timeout (default: 25000)
+--cert-bound-domains        Enable certificate-bound Host routing
+--issued-domain-index <p>   Issued domain index path
+--http-host <host>          HTTP bind host (use 127.0.0.1 behind Caddy)
 ```
 
 ## Client Options
@@ -171,6 +270,8 @@ tail -f ~/.okproxy/logs/client.log
 --cert <path>               Client certificate
 --ca <path>                 CA certificate
 --multipath                 Enable multipath over all available interfaces
+--domain <domain>           Optional authorized domain subset (repeatable)
+--preserve-host             Forward original public Host header to target
 ```
 
 ## Protocol
