@@ -298,6 +298,9 @@ if [ "$DEV_MODE" = false ]; then
     CA_DIR="/opt/okproxy/ca"
     if [ -d "$APP_DIR/.git" ]; then
         echo "App directory exists. Updating repository from branch $BRANCH..."
+        # The app directory is owned by the okproxy service user after setup.
+        # Since this script runs via sudo, Git may reject it as "dubious ownership".
+        git config --global --add safe.directory "$APP_DIR" 2>/dev/null || true
         cd "$APP_DIR"
         git fetch origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
         git checkout -B "$BRANCH" "origin/$BRANCH"
