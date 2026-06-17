@@ -11,6 +11,9 @@ struct ConnectionView: View {
             }
 
             Section("Required mTLS Files") {
+                Text("Choose… shows hidden files and dot-directories so keys under folders like .certs can be selected.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 pathRow("Client key (--key)", value: $model.settings.clientKeyPath)
                 pathRow("Client cert (--cert)", value: $model.settings.clientCertPath)
                 pathRow("CA cert (--ca)", value: $model.settings.caCertPath)
@@ -19,6 +22,7 @@ struct ConnectionView: View {
             Section("Options") {
                 Toggle("Enable multipath", isOn: $model.settings.multipath)
                 Toggle("Preserve Host header", isOn: $model.settings.preserveHost)
+                Toggle("Start Client Automatically", isOn: $model.settings.startClientAutomatically)
                 TextEditor(text: $model.settings.domainsText)
                     .frame(minHeight: 70)
                     .overlay(alignment: .topLeading) {
