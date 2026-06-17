@@ -1,6 +1,7 @@
 import SwiftUI
 
 struct ContentView: View {
+    @EnvironmentObject private var model: AppModel
     @State private var selectedTab: Tab = .setup
 
     private enum Tab: Hashable {
@@ -18,14 +19,14 @@ struct ContentView: View {
                 ConnectionView()
                     .tabItem { Label("Connection", systemImage: "network") }
                     .tag(Tab.connection)
-                LogsView()
+                LogsView(logs: model.logs, logFilePath: model.logFilePath, isActive: selectedTab == .logs)
                     .tabItem { Label("Logs", systemImage: "doc.text") }
                     .tag(Tab.logs)
             }
 
             if selectedTab != .logs {
                 Divider()
-                CompactLogsView()
+                CompactLogsView(logs: model.logs)
                     .frame(height: 150)
             }
         }

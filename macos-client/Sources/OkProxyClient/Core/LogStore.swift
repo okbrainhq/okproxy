@@ -1,18 +1,30 @@
 import Foundation
 
+struct LogEntry: Identifiable, Equatable {
+    let id: Int
+    let text: String
+}
+
 @MainActor
 final class LogStore: ObservableObject {
-    @Published var text: String = ""
+    @Published private(set) var entries: [LogEntry] = []
+    @Published private(set) var lastEntryID: Int?
 
     private let fileURL: URL
     private let maxBytes: UInt64
     private let rotatedFileCount: Int
+    private let maxEntries: Int
+    private let initialLoadBytes: UInt64
     private let fileManager = FileManager.default
+    private let timestampFormatter = ISO8601DateFormatter()
+    private var nextID = 0
 
-    init(fileURL: URL, maxBytes: UInt64 = 1_000_000, rotatedFileCount: Int = 4) {
+    init(fileURL: URL, maxBytes: UInt64 = 1_000_000, rotatedFileCount: Int = 4, maxEntries: Int = 2_000, initialLoadBytes: UInt64 = 256_000) {
         self.fileURL = fileURL
         self.maxBytes = maxBytes
         self.rotatedFileCount = rotatedFileCount
+        self.maxEntries = maxEntries
+        self.initialLoadBytes = initialLoadBytes
         loadFromDisk()
     }
 
@@ -21,15 +33,46 @@ final class LogStore: ObservableObject {
         self.init(fileURL: fallback)
     }
 
-    func append(_ line: String) {
-        let stamp = ISO8601DateFormatter().string(from: Date())
-        let entry = "[\(stamp)] \(line)\n"
-        text += entry
-        appendToDisk(entry)
+    var isEmpty: Bool {
+        entries.isEmpty
+    }
+
+    var entryLimit: Int {
+        maxEntries
+    }
+
+    func append(_ output: String) {
+        let trimmedOutput = output.trimmingCharacters(in: .newlines)
+        guard !trimmedOutput.isEmpty else { return }
+
+        let stamp = timestampFormatter.string(from: Date())
+        let rawLines = trimmedOutput.split(omittingEmptySubsequences: false, whereSeparator: \.isNewline)
+        guard !rawLines.isEmpty else { return }
+
+        var diskEntry = ""
+        diskEntry.reserveCapacity(trimmedOutput.count + rawLines.count * (stamp.count + 4))
+
+        var memoryLines: [String] = []
+        let memoryLimit = max(0, maxEntries)
+        memoryLines.reserveCapacity(min(memoryLimit, rawLines.count))
+        let memoryStartIndex = max(0, rawLines.count - memoryLimit)
+
+        for (index, rawLine) in rawLines.enumerated() {
+            let entry = "[\(stamp)] \(String(rawLine))"
+            diskEntry.append(entry)
+            diskEntry.append("\n")
+            if index >= memoryStartIndex {
+                memoryLines.append(entry)
+            }
+        }
+
+        appendInMemory(memoryLines)
+        appendToDisk(diskEntry)
     }
 
     func clear() {
-        text = ""
+        entries.removeAll(keepingCapacity: true)
+        lastEntryID = nil
         try? fileManager.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         try? "".write(to: fileURL, atomically: true, encoding: .utf8)
         for index in 1...rotatedFileCount {
@@ -41,8 +84,51 @@ final class LogStore: ObservableObject {
     }
 
     private func loadFromDisk() {
-        guard let data = try? Data(contentsOf: fileURL), let saved = String(data: data, encoding: .utf8) else { return }
-        text = saved
+        guard let initialLog = readInitialLogData(), var saved = String(data: initialLog.data, encoding: .utf8) else { return }
+        if initialLog.isPartial, let firstNewline = saved.firstIndex(of: "\n") {
+            saved = String(saved[saved.index(after: firstNewline)...])
+        }
+
+        var lines = saved.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        if lines.last == "" { lines.removeLast() }
+        if lines.count > maxEntries {
+            lines = Array(lines.suffix(maxEntries))
+        }
+        appendInMemory(lines)
+    }
+
+    private func readInitialLogData() -> (data: Data, isPartial: Bool)? {
+        guard let handle = try? FileHandle(forReadingFrom: fileURL) else { return nil }
+        defer { try? handle.close() }
+
+        do {
+            let size = try handle.seekToEnd()
+            let offset = size > initialLoadBytes ? size - initialLoadBytes : 0
+            try handle.seek(toOffset: offset)
+            return (try handle.readToEnd() ?? Data(), offset > 0)
+        } catch {
+            return nil
+        }
+    }
+
+    private func appendInMemory(_ lines: [String]) {
+        guard !lines.isEmpty, maxEntries > 0 else { return }
+        let storableLines = lines.count > maxEntries ? Array(lines.suffix(maxEntries)) : lines
+
+        var updatedEntries = entries
+        updatedEntries.reserveCapacity(min(maxEntries, updatedEntries.count + storableLines.count))
+
+        for line in storableLines {
+            nextID += 1
+            updatedEntries.append(LogEntry(id: nextID, text: line))
+        }
+
+        if updatedEntries.count > maxEntries {
+            updatedEntries.removeFirst(updatedEntries.count - maxEntries)
+        }
+
+        entries = updatedEntries
+        lastEntryID = updatedEntries.last?.id
     }
 
     private func appendToDisk(_ entry: String) {
@@ -57,7 +143,8 @@ final class LogStore: ObservableObject {
                 try Data(entry.utf8).write(to: fileURL, options: .atomic)
             }
         } catch {
-            text += "[\(ISO8601DateFormatter().string(from: Date()))] Failed to write log file: \(error.localizedDescription)\n"
+            let stamp = timestampFormatter.string(from: Date())
+            appendInMemory(["[\(stamp)] Failed to write log file: \(error.localizedDescription)"])
         }
     }
 

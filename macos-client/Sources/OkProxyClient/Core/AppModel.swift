@@ -1,5 +1,4 @@
 import AppKit
-import Combine
 import Foundation
 
 @MainActor
@@ -7,7 +6,7 @@ final class AppModel: ObservableObject {
     @Published var settings: AppSettings {
         didSet { settings.save() }
     }
-    @Published var logs: LogStore
+    let logs: LogStore
     @Published var isSettingUp = false
     @Published var isRunningClient = false
     @Published var installedNodeVersion: String = "Not installed"
@@ -16,18 +15,18 @@ final class AppModel: ObservableObject {
 
     private var setupProcess: Process?
     private var clientProcess: Process?
-    private var logSink: AnyCancellable?
+    private var nodeVersionTask: Task<Void, Never>?
 
     init() {
         settings = AppSettings.load()
         logs = LogStore(fileURL: Self.defaultStateDirectory.appendingPathComponent("logs/client.log"))
-        logSink = logs.objectWillChange.sink { [weak self] _ in
-            self?.objectWillChange.send()
-        }
         refreshInstallStatus()
         logs.append("App launched (\(appEnvironment))")
         if settings.startClientAutomatically {
-            Task { @MainActor in self.startClient() }
+            Task { @MainActor in
+                await Task.yield()
+                self.startClient()
+            }
         }
     }
 
@@ -80,9 +79,22 @@ final class AppModel: ObservableObject {
 
     func refreshInstallStatus() {
         let fileManager = FileManager.default
-        isNodeSetup = fileManager.isExecutableFile(atPath: resolvedNodePath)
+        let nodePath = resolvedNodePath
+        isNodeSetup = fileManager.isExecutableFile(atPath: nodePath)
         isRepoSetup = fileManager.fileExists(atPath: URL(fileURLWithPath: resolvedRepoPath).appendingPathComponent(".git").path)
-        installedNodeVersion = isNodeSetup ? nodeVersionString() : "Not installed"
+
+        nodeVersionTask?.cancel()
+        guard isNodeSetup else {
+            installedNodeVersion = "Not installed"
+            return
+        }
+
+        installedNodeVersion = "Checking…"
+        nodeVersionTask = Task(priority: .utility) { [weak self, nodePath] in
+            let version = await Self.nodeVersionStringAsync(atPath: nodePath)
+            guard !Task.isCancelled, let self, self.resolvedNodePath == nodePath else { return }
+            self.installedNodeVersion = version
+        }
     }
 
     func cloneRepo() {
@@ -270,10 +282,18 @@ final class AppModel: ObservableObject {
         return true
     }
 
-    private func nodeVersionString() -> String {
+    nonisolated private static func nodeVersionStringAsync(atPath nodePath: String) async -> String {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .utility).async {
+                continuation.resume(returning: nodeVersionString(atPath: nodePath))
+            }
+        }
+    }
+
+    nonisolated private static func nodeVersionString(atPath nodePath: String) -> String {
         let process = Process()
         let pipe = Pipe()
-        process.executableURL = URL(fileURLWithPath: resolvedNodePath)
+        process.executableURL = URL(fileURLWithPath: nodePath)
         process.arguments = ["--version"]
         process.standardOutput = pipe
         process.standardError = pipe
