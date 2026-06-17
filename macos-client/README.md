@@ -33,7 +33,9 @@ The app manages fixed paths inside that state directory:
 
 - **Logs**
   - A compact live log view is always visible at the bottom of the app.
-  - The Logs tab shows the full log stream and log file path.
+  - The Logs tab shows the log stream and log file path.
+  - Opening the Logs tab jumps to the newest line; scrolling up pauses auto-follow until the user scrolls back to the bottom.
+  - The visible log view is capped to the latest 2,000 entries for responsive tab switching and lower RAM usage.
   - Logs are stored locally and reloaded when the app launches later.
   - Logs rotate at about 1 MB, keeping four rotated files.
 
