@@ -7,11 +7,9 @@ struct SetupView: View {
         Form {
             Section("Environment") {
                 LabeledContent("State directory", value: model.stateDirectory.path)
-                LabeledContent("Repository", value: model.resolvedRepoPath)
-                LabeledContent("Node.js", value: model.resolvedNodePath)
-                Text("Dev builds use ~/.okproxy-dev. Production builds use ~/.okproxy.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                statusRow(title: "Repository", isOK: model.isRepoSetup, detail: model.resolvedRepoPath)
+                statusRow(title: "Node.js", isOK: model.isNodeSetup, detail: "\(model.resolvedNodePath) — \(model.installedNodeVersion)")
+                LabeledContent("Logs", value: model.logFilePath)
             }
 
             Section("Local Node.js") {
@@ -23,6 +21,7 @@ struct SetupView: View {
                         .disabled(model.isSettingUp)
                     Button(model.isSettingUp ? "Working…" : "Update Node.js") { model.updateNode() }
                         .disabled(model.isSettingUp)
+                    Button("Refresh") { model.refreshInstallStatus() }
                 }
             }
 
@@ -41,5 +40,15 @@ struct SetupView: View {
             }
         }
         .formStyle(.grouped)
+        .onAppear { model.refreshInstallStatus() }
+    }
+
+    private func statusRow(title: String, isOK: Bool, detail: String) -> some View {
+        HStack(alignment: .firstTextBaseline) {
+            Image(systemName: isOK ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                .foregroundStyle(isOK ? .green : .orange)
+                .accessibilityLabel(isOK ? "OK" : "Warning")
+            LabeledContent(title, value: detail)
+        }
     }
 }

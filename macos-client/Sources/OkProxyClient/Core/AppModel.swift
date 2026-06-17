@@ -7,9 +7,12 @@ final class AppModel: ObservableObject {
     @Published var settings: AppSettings {
         didSet { settings.save() }
     }
-    @Published var logs = LogStore()
+    @Published var logs: LogStore
     @Published var isSettingUp = false
     @Published var isRunningClient = false
+    @Published var installedNodeVersion: String = "Not installed"
+    @Published var isNodeSetup = false
+    @Published var isRepoSetup = false
 
     private var setupProcess: Process?
     private var clientProcess: Process?
@@ -17,17 +20,38 @@ final class AppModel: ObservableObject {
 
     init() {
         settings = AppSettings.load()
+        logs = LogStore(fileURL: Self.defaultStateDirectory.appendingPathComponent("logs/client.log"))
         logSink = logs.objectWillChange.sink { [weak self] _ in
             self?.objectWillChange.send()
         }
+        refreshInstallStatus()
+        logs.append("App launched (\(appEnvironment))")
+        if settings.startClientAutomatically {
+            Task { @MainActor in self.startClient() }
+        }
     }
+
+    static var defaultStateDirectory: URL {
+        let name = Bundle.main.object(forInfoDictionaryKey: "AppStateDirectoryName") as? String ?? ".okproxy-dev"
+        return FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(name)
+    }
+
+    var appEnvironment: String {
+        Bundle.main.object(forInfoDictionaryKey: "AppEnvironment") as? String ?? "dev"
+    }
+
+    var isDevBuild: Bool { appEnvironment == "dev" }
 
     var stateDirectoryName: String {
         Bundle.main.object(forInfoDictionaryKey: "AppStateDirectoryName") as? String ?? ".okproxy-dev"
     }
 
     var stateDirectory: URL {
-        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(stateDirectoryName)
+        Self.defaultStateDirectory
+    }
+
+    var logFilePath: String {
+        stateDirectory.appendingPathComponent("logs/client.log").path
     }
 
     var resolvedRepoPath: String {
@@ -47,9 +71,18 @@ final class AppModel: ObservableObject {
         panel.canChooseDirectories = false
         panel.canChooseFiles = true
         panel.allowsMultipleSelection = false
+        panel.showsHiddenFiles = true
+        panel.message = "Hidden files and folders are visible so keys inside dot-directories can be selected."
         if panel.runModal() == .OK, let url = panel.url {
             assign(url.path)
         }
+    }
+
+    func refreshInstallStatus() {
+        let fileManager = FileManager.default
+        isNodeSetup = fileManager.isExecutableFile(atPath: resolvedNodePath)
+        isRepoSetup = fileManager.fileExists(atPath: URL(fileURLWithPath: resolvedRepoPath).appendingPathComponent(".git").path)
+        installedNodeVersion = isNodeSetup ? nodeVersionString() : "Not installed"
     }
 
     func cloneRepo() {
@@ -131,6 +164,20 @@ final class AppModel: ObservableObject {
         clientProcess.terminate()
     }
 
+    func showMainWindow() {
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        if let window = NSApplication.shared.windows.first {
+            window.makeKeyAndOrderFront(nil)
+        }
+    }
+
+    func quit() {
+        if isRunningClient {
+            stopClient()
+        }
+        NSApplication.shared.terminate(nil)
+    }
+
     private func installLatestNode(label: String) {
         guard !isSettingUp else { return }
         isSettingUp = true
@@ -185,6 +232,7 @@ final class AppModel: ObservableObject {
         setupProcess = ShellRunner.run("/bin/bash", ["-lc", script], log: logs.append) { [weak self] status in
             self?.logs.append("\(label) exited with status \(status)")
             self?.isSettingUp = false
+            self?.refreshInstallStatus()
         }
     }
 
@@ -199,6 +247,7 @@ final class AppModel: ObservableObject {
     }
 
     private func validateClientPreflight(indexPath: String, keyPath: String, certPath: String, caPath: String) -> Bool {
+        refreshInstallStatus()
         let fileManager = FileManager.default
         guard fileManager.isExecutableFile(atPath: resolvedNodePath) else {
             logs.append("Node executable is missing or not executable: \(resolvedNodePath)")
@@ -220,4 +269,25 @@ final class AppModel: ObservableObject {
         }
         return true
     }
+
+    private func nodeVersionString() -> String {
+        let process = Process()
+        let pipe = Pipe()
+        process.executableURL = URL(fileURLWithPath: resolvedNodePath)
+        process.arguments = ["--version"]
+        process.standardOutput = pipe
+        process.standardError = pipe
+        do {
+            try process.run()
+            process.waitUntilExit()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            return String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty ?? "Installed"
+        } catch {
+            return "Installed (version unavailable)"
+        }
+    }
+}
+
+private extension String {
+    var nilIfEmpty: String? { isEmpty ? nil : self }
 }

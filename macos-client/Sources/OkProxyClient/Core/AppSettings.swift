@@ -13,6 +13,7 @@ struct AppSettings: Codable, Equatable {
     var multipath: Bool = false
     var preserveHost: Bool = false
     var domainsText: String = ""
+    var startClientAutomatically: Bool = false
 
     static let defaultsKey = "OkProxyClient.settings.v1"
 
