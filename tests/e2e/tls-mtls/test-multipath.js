@@ -345,6 +345,70 @@ describe('Bugfix: ready emitted once (Bug 4)', () => {
   });
 });
 
+describe('Bugfix: multipath network-change handling', () => {
+  it('should recreate a socket when an interface keeps the same name but changes IP', () => {
+    const vs = new VirtualSocket({
+      serverHost: 'localhost',
+      serverPort: 9999,
+      clientKey: 'none',
+      clientCert: 'none',
+      caCert: 'none'
+    });
+
+    let createCount = 0;
+    vs._createRealSocket = (name, ip) => {
+      createCount++;
+      const fakeRS = {
+        config: { localAddress: ip },
+        destroyed: false,
+        isConnected: () => true,
+        destroy() { this.destroyed = true; }
+      };
+      vs.realSockets.set(name, fakeRS);
+    };
+
+    vs._syncInterfaces([{ name: 'en0', ip: '192.168.1.10' }]);
+    const oldSocket = vs.realSockets.get('en0');
+
+    vs._syncInterfaces([{ name: 'en0', ip: '10.0.0.20' }]);
+    const newSocket = vs.realSockets.get('en0');
+
+    assert.strictEqual(createCount, 2, 'IP change should create a replacement socket');
+    assert.ok(oldSocket.destroyed, 'old IP-bound socket should be destroyed');
+    assert.notStrictEqual(newSocket, oldSocket, 'socket should be replaced');
+    assert.strictEqual(newSocket.config.localAddress, '10.0.0.20');
+  });
+
+  it('should remove a disappeared interface immediately', () => {
+    const vs = new VirtualSocket({
+      serverHost: 'localhost',
+      serverPort: 9999,
+      clientKey: 'none',
+      clientCert: 'none',
+      caCert: 'none'
+    });
+
+    vs._createRealSocket = (name, ip) => {
+      const fakeRS = {
+        config: { localAddress: ip },
+        destroyed: false,
+        isConnected: () => true,
+        destroy() { this.destroyed = true; }
+      };
+      vs.realSockets.set(name, fakeRS);
+    };
+
+    vs._syncInterfaces([{ name: 'en0', ip: '192.168.1.10' }]);
+    const oldSocket = vs.realSockets.get('en0');
+
+    vs._syncInterfaces([]);
+
+    assert.ok(oldSocket.destroyed, 'disappeared interface socket should be destroyed');
+    assert.strictEqual(vs.realSockets.has('en0'), false, 'disappeared interface should be removed');
+    assert.strictEqual(vs._failureCount.has('en0'), false, 'stale failure count should be cleared');
+  });
+});
+
 describe('Bugfix: NetworkWatchDog in single-connection mode', () => {
   it('should start NetworkWatchDog when multipath is disabled', () => {
     const vs = new VirtualSocket({
