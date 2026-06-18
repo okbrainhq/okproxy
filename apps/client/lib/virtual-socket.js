@@ -60,26 +60,31 @@ class VirtualSocket extends EventEmitter {
   }
 
   _syncInterfaces(interfaces) {
-    const activeNames = new Set(interfaces.map(i => i.name));
+    const activeByName = new Map(interfaces.map(i => [i.name, i.ip]));
 
-    // Remove sockets for interfaces that disappeared
-    for (const [name, rs] of this.realSockets) {
+    // Remove sockets for interfaces that disappeared, or recreate sockets when
+    // the same interface name gets a new IP (common when WiFi changes networks).
+    for (const [name, rs] of [...this.realSockets]) {
       if (name === 'default') continue;
-      if (!activeNames.has(name)) {
-        const fails = (this._failureCount.get(name) || 0) + 1;
-        this._failureCount.set(name, fails);
-        if (fails >= 3) {
-          console.log(`[${new Date().toISOString()}] [virtual-socket] Removing interface: ${name}`);
-          rs.destroy();
-          this.realSockets.delete(name);
-          this._failureCount.delete(name);
-        }
-      } else {
-        this._failureCount.delete(name);
+
+      if (!activeByName.has(name)) {
+        console.log(`[${new Date().toISOString()}] [virtual-socket] Removing disappeared interface: ${name}`);
+        this._removeRealSocket(name, rs);
+        continue;
       }
+
+      const nextIp = activeByName.get(name);
+      const currentIp = this._getSocketLocalAddress(rs);
+      if (currentIp !== nextIp) {
+        console.log(`[${new Date().toISOString()}] [virtual-socket] Interface ${name} IP changed: ${currentIp || 'auto'} -> ${nextIp || 'auto'}, reconnecting`);
+        this._removeRealSocket(name, rs);
+        continue;
+      }
+
+      this._failureCount.delete(name);
     }
 
-    // Add sockets for new interfaces
+    // Add sockets for new interfaces or interfaces removed above for IP change.
     for (const iface of interfaces) {
       if (!this.realSockets.has(iface.name)) {
         this._createRealSocket(iface.name, iface.ip);
@@ -89,6 +94,20 @@ class VirtualSocket extends EventEmitter {
     // Emit ready when we have at least one connection
     if (this.realSockets.size > 0) {
       this._checkReady();
+    }
+  }
+
+  _getSocketLocalAddress(rs) {
+    return rs?.config?.localAddress ?? rs?.localAddress ?? null;
+  }
+
+  _removeRealSocket(interfaceName, rs) {
+    if (this.realSockets.get(interfaceName) === rs) {
+      this.realSockets.delete(interfaceName);
+    }
+    this._failureCount.delete(interfaceName);
+    if (rs && typeof rs.destroy === 'function') {
+      rs.destroy();
     }
   }
 
@@ -107,7 +126,7 @@ class VirtualSocket extends EventEmitter {
     const rs = new RealSocket(rsConfig);
 
     rs.on('status', (status) => {
-      if (status === 'failed') {
+      if (status === 'failed' && this.realSockets.get(interfaceName) === rs) {
         this.realSockets.delete(interfaceName);
         this._checkAllFailed();
       }
