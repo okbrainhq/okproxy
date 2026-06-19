@@ -93,7 +93,7 @@ async function startVirtualClient({ tlsPort, cert, targetPort, domains = [], ext
   return { vs, proxy, stop: () => { proxy?.destroy(); vs.destroy(); } };
 }
 
-async function createMultiEnv() {
+async function createMultiEnv(options = {}) {
   const certs = getCertPaths();
   const suffix = `${Date.now()}-${Math.floor(Math.random() * 100000)}`;
   const domains = {
@@ -131,7 +131,7 @@ async function createMultiEnv() {
   const httpServer = createHTTPServer(manager, tlsServer, {
     certBoundDomains: true,
     maxConcurrentStreams: 100,
-    streamTimeout: 30000
+    streamTimeout: options.streamTimeout || 30000
   });
   const targetA = createNamedTarget('target-a');
   const targetB = createNamedTarget('target-b');
@@ -227,6 +227,50 @@ test('cert-bound mode routes two domains to isolated clients', async () => {
     await env.cleanup();
   }
 });
+
+test('cert-bound mode keeps routing after same client reconnects', async () => {
+  const env = await createMultiEnv({ streamTimeout: 300 });
+  try {
+    const client = await startVirtualClient({
+      tlsPort: env.ports.tlsPort,
+      cert: env.certA,
+      targetPort: env.ports.targetAPort
+    });
+    env.clients.push(client);
+
+    const first = await httpRequest({
+      port: env.ports.httpPort,
+      hostname: 'localhost',
+      path: '/echo',
+      headers: { host: env.domains.a }
+    });
+    assert.equal(first.statusCode, 200);
+
+    await new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error('client reconnect timeout')), 5000);
+      client.vs.once('socketConnected', () => {
+        clearTimeout(timeout);
+        setTimeout(resolve, 100);
+      });
+
+      for (const rs of client.vs.realSockets.values()) {
+        if (rs.socket) rs.socket.destroy();
+      }
+    });
+
+    const second = await httpRequest({
+      port: env.ports.httpPort,
+      hostname: 'localhost',
+      path: '/echo',
+      headers: { host: env.domains.a }
+    });
+    assert.equal(second.statusCode, 200);
+    assert.equal(JSON.parse(second.body).name, 'target-a');
+  } finally {
+    await env.cleanup();
+  }
+});
+
 
 test('cert-bound mode rejects unknown host and returns 502 for authorized disconnected domain', async () => {
   const env = await createMultiEnv();
