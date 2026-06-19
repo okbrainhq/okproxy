@@ -1,3 +1,4 @@
+import Darwin
 import Foundation
 
 final class ShellRunner {
@@ -9,37 +10,16 @@ final class ShellRunner {
 
         let pipe = Pipe()
         let logBuffer = ShellOutputBuffer(log: log)
+        let pipeReader = ShellPipeReader(pipe: pipe, logBuffer: logBuffer)
         process.standardOutput = pipe
         process.standardError = pipe
 
         // Read the pipe on a background queue so the child process never blocks
         // on stdout/stderr writes when the main thread is busy rendering logs.
-        // The previous approach used readabilityHandler (main run loop), which
-        // could stall when LogStore.append + NSTextView re-layout took too long,
-        // filling the 16 KB pipe buffer and freezing the Node.js event loop.
-        let readQueue = DispatchQueue(label: "OkProxyClient.pipe-reader", qos: .utility)
-        let readSource: DispatchSourceRead? = DispatchSource.makeReadSource(
-            fileDescriptor: pipe.fileHandleForReading.fileDescriptor,
-            queue: readQueue
-        )
-
-        if let readSource {
-            readSource.setEventHandler { [pipe] in
-                let data = pipe.fileHandleForReading.readData(ofLength: 65536)
-                guard !data.isEmpty else {
-                    readSource.cancel()
-                    return
-                }
-                logBuffer.append(String(decoding: data, as: UTF8.self))
-            }
-            readSource.setCancelHandler { [pipe] in
-                pipe.fileHandleForReading.closeFile()
-            }
-            readSource.resume()
-        }
+        pipeReader.start()
 
         process.terminationHandler = { proc in
-            readSource?.cancel()
+            pipeReader.stopAndDrain()
             logBuffer.flush()
             Task { @MainActor in onExit?(proc.terminationStatus) }
         }
@@ -47,13 +27,88 @@ final class ShellRunner {
         do {
             try process.run()
         } catch {
-            readSource?.cancel()
+            pipeReader.stopAndDrain()
             Task { @MainActor in
                 log("Failed to run \(executable): \(error.localizedDescription)")
                 onExit?(-1)
             }
         }
         return process
+    }
+}
+
+private final class ShellPipeReader {
+    private let logBuffer: ShellOutputBuffer
+    private let readQueue = DispatchQueue(label: "OkProxyClient.pipe-reader", qos: .utility)
+    private let readSource: DispatchSourceRead
+    private let fileDescriptor: Int32
+    private var isCancelled = false
+
+    init(pipe: Pipe, logBuffer: ShellOutputBuffer) {
+        self.logBuffer = logBuffer
+        self.fileDescriptor = pipe.fileHandleForReading.fileDescriptor
+        self.readSource = DispatchSource.makeReadSource(fileDescriptor: fileDescriptor, queue: readQueue)
+
+        let currentFlags = fcntl(fileDescriptor, F_GETFL)
+        if currentFlags >= 0 {
+            _ = fcntl(fileDescriptor, F_SETFL, currentFlags | O_NONBLOCK)
+        }
+
+        readSource.setEventHandler { [weak self] in
+            self?.readAvailableOnQueue()
+        }
+        readSource.setCancelHandler { [pipe] in
+            pipe.fileHandleForReading.closeFile()
+        }
+    }
+
+    func start() {
+        readSource.resume()
+    }
+
+    func stopAndDrain() {
+        readQueue.sync {
+            readAvailableOnQueue()
+            cancelOnQueue()
+        }
+    }
+
+    private func readAvailableOnQueue() {
+        guard !isCancelled else { return }
+
+        var buffer = [UInt8](repeating: 0, count: 64 * 1024)
+        while true {
+            let bytesRead = buffer.withUnsafeMutableBytes { rawBuffer in
+                Darwin.read(fileDescriptor, rawBuffer.baseAddress, rawBuffer.count)
+            }
+
+            if bytesRead > 0 {
+                logBuffer.append(String(decoding: buffer[0..<bytesRead], as: UTF8.self))
+                continue
+            }
+
+            if bytesRead == 0 {
+                cancelOnQueue()
+                return
+            }
+
+            if errno == EINTR {
+                continue
+            }
+
+            if errno == EAGAIN || errno == EWOULDBLOCK {
+                return
+            }
+
+            cancelOnQueue()
+            return
+        }
+    }
+
+    private func cancelOnQueue() {
+        guard !isCancelled else { return }
+        isCancelled = true
+        readSource.cancel()
     }
 }
 
