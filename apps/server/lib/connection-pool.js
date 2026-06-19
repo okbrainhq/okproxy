@@ -5,11 +5,15 @@ const { encodeFrame, FrameType, CONTROL_FRAME_TYPES, DedupWindow } = require('..
 
 const SEQ_RESET_THRESHOLD = 0xFFFFFF0F; // 2^32 - 1,000,000
 
+// Grace period before cleaning up completed-stream dedup/seq state.
+const STREAM_CLEANUP_GRACE_MS = 60000;
+
 class ConnectionPool {
   constructor() {
     this.connections = new Map(); // `${clientSerial}:${interfaceName}` -> socket
     this.dedupWindows = new Map(); // streamId -> DedupWindow
     this.seqCounters = new Map(); // streamId -> nextSeqNo
+    this.cleanupTimers = new Map(); // streamId -> setTimeout handle (TTL cleanup)
     this.activeStreams = new Map(); // streamId -> { frameHandler, errorHandler }
     this.clientSerial = null; // Active authenticated client identity
   }
@@ -81,20 +85,25 @@ class ConnectionPool {
         const result = window.checkAndAdd(frame.seqNo);
         if (result === 'duplicate') return 'duplicate';
       }
-      // Only clean seqCounters — keep dedupWindow for late duplicates
-      this.seqCounters.delete(streamId);
+      // Keep dedupWindow for late multipath duplicates.
+      // Do NOT delete seqCounters: the outbound seqNo must keep growing
+      // across stream-ID reuses so the client's dedup window sees a
+      // higher seqNo instead of treating the new stream as a duplicate.
+      // Schedule TTL cleanup to bound memory for long-lived tunnels.
+      this._scheduleStreamCleanup(streamId);
       this._routeToHandler(frame);
       return 'new';
     }
 
-    // HEADERS — dedup if window already exists
-    if (frame.type === FrameType.HEADERS) {
+    // HEADERS / UPGRADE — dedup if window already exists
+    if (frame.type === FrameType.HEADERS || frame.type === FrameType.UPGRADE) {
       let window = this.dedupWindows.get(streamId);
       if (!window) {
         window = new DedupWindow(frame.seqNo);
         this.dedupWindows.set(streamId, window);
       }
       if (window.checkAndAdd(frame.seqNo) === 'duplicate') return 'duplicate';
+      this._cancelStreamCleanup(streamId); // Stream (re)started — cancel pending cleanup
       this._routeToHandler(frame);
       return 'new';
     }
@@ -144,6 +153,15 @@ class ConnectionPool {
 
       this.seqCounters.set(streamId, seqNo);
       frameBuf.writeUInt32BE(seqNo, 5);
+
+      // Outbound ERROR means the server is aborting the stream — both
+      // directions are done. Schedule TTL cleanup.
+      // (Outbound FIN is just end-of-request-body; the client's response
+      // may still be active, so no cleanup here — it's scheduled when
+      // the server receives the client's inbound FIN/ERROR in onFrame().)
+      if (type === FrameType.ERROR) {
+        this._scheduleStreamCleanup(streamId);
+      }
     }
 
     for (const [name, sock] of this.connections) {
@@ -176,6 +194,7 @@ class ConnectionPool {
       const data = JSON.parse(frame.payload.toString());
       for (const streamId of data.streams) {
         this.dedupWindows.delete(streamId);
+        this._cancelStreamCleanup(streamId); // Protect seqCounters from stale TTL timer
         // Do NOT reset seqCounters — RESET_SEQ from client means
         // "I reset my outbound", so we only clear our incoming dedup.
       }
@@ -201,8 +220,33 @@ class ConnectionPool {
       }
     }
     this.activeStreams.clear();
+    for (const timer of this.cleanupTimers.values()) clearTimeout(timer);
+    this.cleanupTimers.clear();
     this.dedupWindows.clear();
     this.seqCounters.clear();
+  }
+
+  /**
+   * Schedule TTL cleanup of dedup/seq state for a completed stream.
+   * The grace period catches late multipath duplicates while bounding memory.
+   */
+  _scheduleStreamCleanup(streamId) {
+    this._cancelStreamCleanup(streamId);
+    const timer = setTimeout(() => {
+      this.cleanupTimers.delete(streamId);
+      this.dedupWindows.delete(streamId);
+      this.seqCounters.delete(streamId);
+    }, STREAM_CLEANUP_GRACE_MS);
+    if (typeof timer.unref === 'function') timer.unref();
+    this.cleanupTimers.set(streamId, timer);
+  }
+
+  _cancelStreamCleanup(streamId) {
+    const timer = this.cleanupTimers.get(streamId);
+    if (timer) {
+      clearTimeout(timer);
+      this.cleanupTimers.delete(streamId);
+    }
   }
 }
 
