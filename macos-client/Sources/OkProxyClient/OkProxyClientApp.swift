@@ -14,7 +14,7 @@ struct OkProxyClientApp: App {
     @StateObject private var model = AppModel()
 
     var body: some Scene {
-        WindowGroup(id: "main") {
+        Window("OkProxy Client", id: "main") {
             ContentView()
                 .environmentObject(model)
                 .frame(minWidth: 900, minHeight: 760)
