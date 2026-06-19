@@ -19,7 +19,8 @@ function parseArgs() {
     clientCert: DEFAULT_CERT,
     caCert: DEFAULT_CA,
     domains: [],
-    preserveHost: false
+    preserveHost: false,
+    targetTimeout: 30000
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -55,6 +56,15 @@ function parseArgs() {
         }
         options.targetPort = targetPort;
         break;
+      case '--target-timeout':
+        const targetTimeoutValue = args[++i];
+        const targetTimeout = parseInt(targetTimeoutValue, 10);
+        if (isNaN(targetTimeout) || targetTimeout < 0) {
+          console.error(`Error: Invalid target timeout ${targetTimeoutValue}. Must be 0 or greater.`);
+          process.exit(1);
+        }
+        options.targetTimeout = targetTimeout;
+        break;
       case '--key':
         options.clientKey = args[++i];
         break;
@@ -80,6 +90,7 @@ Usage: node index.js [options]
 Options:
   --server <host:port>    Tunnel server address (default: localhost:9443)
   --target <host:port>    Local target service (default: localhost:3000)
+  --target-timeout <ms>   Target response/upgrade timeout; 0 disables (default: 30000)
   --key <path>            Client private key (default: ${DEFAULT_KEY})
   --cert <path>           Client certificate (default: ${DEFAULT_CERT})
   --ca <path>             CA certificate to verify server (default: ${DEFAULT_CA})
@@ -101,6 +112,7 @@ function main() {
   console.log('Starting TLS tunnel client...');
   console.log(`Server: ${config.serverHost}:${config.serverPort}`);
   console.log(`Target: ${config.targetHost}:${config.targetPort}`);
+  console.log(`Target timeout: ${config.targetTimeout === 0 ? 'disabled' : `${config.targetTimeout}ms`}`);
   console.log(`Multipath: ${process.env.MULTIPATH_ENABLED === 'true' ? 'enabled' : 'disabled (use --multipath to enable)'}`);
 
   let proxy = null;
@@ -111,7 +123,10 @@ function main() {
   vs.on('ready', () => {
     isReady = true;
     console.log('Connected to TLS tunnel server (multipath ready)');
-    proxy = createProxy(vs, config.targetPort, config.targetHost, vs.maxConcurrentStreams, { preserveHost: config.preserveHost });
+    proxy = createProxy(vs, config.targetPort, config.targetHost, vs.maxConcurrentStreams, {
+      preserveHost: config.preserveHost,
+      targetTimeout: config.targetTimeout
+    });
   });
 
   vs.on('socketConnected', (interfaceName) => {

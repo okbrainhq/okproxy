@@ -1127,4 +1127,45 @@ describe('Bug Fixes', () => {
     });
   });
 
+  describe('#31 - Target response timeout', () => {
+    it('should timeout a hanging target locally and keep later requests working', async () => {
+      const env = await createTestEnv({
+        streamTimeout: 5000,
+        targetTimeout: 200,
+        keepaliveInterval: 60000
+      });
+
+      try {
+        await env.startClient();
+        const vs = env.virtualSocket();
+        vs._createRealSocket('timeout-backup', null);
+        await new Promise((r) => setTimeout(r, 300));
+
+        const startTime = Date.now();
+        const response = await httpRequest({
+          hostname: 'localhost',
+          port: env.ports.httpPort,
+          path: '/hang',
+          method: 'GET'
+        });
+        const elapsed = Date.now() - startTime;
+
+        assert.strictEqual(response.statusCode, 504);
+        assert.strictEqual(response.body.toString(), 'Target response timeout');
+        assert.ok(elapsed < 2000, `Target timeout should happen before server stream timeout, elapsed=${elapsed}ms`);
+
+        const followUp = await httpRequest({
+          hostname: 'localhost',
+          port: env.ports.httpPort,
+          path: '/json',
+          method: 'GET'
+        });
+
+        assert.strictEqual(followUp.statusCode, 200);
+      } finally {
+        await env.cleanup();
+      }
+    });
+  });
+
 });

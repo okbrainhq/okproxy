@@ -121,7 +121,9 @@ async function createTestEnv(options = {}) {
       virtualSocket.on('ready', () => {
         clearTimeout(timeout);
         clientReady = true;
-        clientProxy = createProxy(virtualSocket, targetPort, 'localhost', options.maxStreams || 100);
+        clientProxy = createProxy(virtualSocket, targetPort, 'localhost', options.maxStreams || 100, {
+          targetTimeout: options.targetTimeout
+        });
         resolve();
       });
 
