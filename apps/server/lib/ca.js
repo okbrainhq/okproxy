@@ -330,7 +330,7 @@ function issueServerCertificate(hostname, outputDir, caDir = DEFAULT_CA_DIR) {
   try {
     execFileSync(
       'openssl',
-      ['x509', '-req', '-in', serverCsrPath, '-CA', tempCAFile, '-out', serverCertPath, '-days', '365', '-extfile', tempConfig, '-extensions', 'SAN'],
+      ['x509', '-req', '-in', serverCsrPath, '-CA', tempCAFile, '-out', serverCertPath, '-days', '365', '-set_serial', String(getNextSerial(caDir)), '-extfile', tempConfig, '-extensions', 'SAN'],
       { stdio: 'pipe' }
     );
   } finally {
