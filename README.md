@@ -414,6 +414,7 @@ OKPROXY_NODE_PATH=/path/to/node ./setup-client-remote.sh ...
 ```
 --server <host:port>        Tunnel server (default: localhost:9443)
 --target <host:port>        Local target service (default: localhost:3000)
+--target-timeout <ms>       Target response/upgrade timeout; 0 disables (default: 30000)
 --key <path>                Client private key
 --cert <path>               Client certificate
 --ca <path>                 CA certificate
