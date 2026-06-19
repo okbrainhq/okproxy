@@ -126,8 +126,16 @@ class VirtualSocket extends EventEmitter {
     const rs = new RealSocket(rsConfig);
 
     rs.on('status', (status) => {
-      if (status === 'failed' && this.realSockets.get(interfaceName) === rs) {
+      if (this.realSockets.get(interfaceName) !== rs) return;
+
+      if (status === 'disconnected') {
+        this._resetSessionStateIfFullyDisconnected();
+        return;
+      }
+
+      if (status === 'failed') {
         this.realSockets.delete(interfaceName);
+        this._resetSessionStateIfFullyDisconnected();
         this._checkAllFailed();
       }
     });
@@ -156,6 +164,17 @@ class VirtualSocket extends EventEmitter {
       this._readyEmitted = true;
       this.emit('ready');
     }
+  }
+
+  _resetSessionStateIfFullyDisconnected() {
+    const connected = [...this.realSockets.values()].filter(rs => rs.isConnected());
+    if (connected.length > 0) return;
+
+    // Once every physical tunnel socket is gone, no late duplicate frames from
+    // the previous virtual session can arrive. Clear dedup/sequence state so a
+    // reconnect to a fresh server-side session can safely reuse stream IDs.
+    this.seqCounters.clear();
+    this.dedupWindows.clear();
   }
 
   _checkAllFailed() {
