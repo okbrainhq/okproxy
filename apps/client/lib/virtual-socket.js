@@ -7,6 +7,11 @@ const { InterfaceDetector } = require('./interface-detector');
 const { NetworkWatchDog } = require('./network-watchdog');
 const { EventEmitter } = require('node:events');
 
+// Grace period before cleaning up completed-stream dedup/seq state.
+// Must exceed the maximum keepalive timeout (45 s multipath / 10 s single)
+// so late duplicate frames from a slow multipath path are still caught.
+const STREAM_CLEANUP_GRACE_MS = 60000;
+
 // Relaxed keepalive for multipath (redundant connections, less urgency)
 const MP_KEEPALIVE = {
   pingInterval: 15000,
@@ -25,6 +30,7 @@ class VirtualSocket extends EventEmitter {
     this.realSockets = new Map(); // interfaceName -> RealSocket
     this.seqCounters = new Map(); // streamId -> nextSeqNo
     this.dedupWindows = new Map(); // streamId -> DedupWindow
+    this.cleanupTimers = new Map(); // streamId -> setTimeout handle (TTL cleanup)
     this.detector = null;
     this.networkWatchdog = null;
     this.destroyed = false;
@@ -60,26 +66,31 @@ class VirtualSocket extends EventEmitter {
   }
 
   _syncInterfaces(interfaces) {
-    const activeNames = new Set(interfaces.map(i => i.name));
+    const activeByName = new Map(interfaces.map(i => [i.name, i.ip]));
 
-    // Remove sockets for interfaces that disappeared
-    for (const [name, rs] of this.realSockets) {
+    // Remove sockets for interfaces that disappeared, or recreate sockets when
+    // the same interface name gets a new IP (common when WiFi changes networks).
+    for (const [name, rs] of [...this.realSockets]) {
       if (name === 'default') continue;
-      if (!activeNames.has(name)) {
-        const fails = (this._failureCount.get(name) || 0) + 1;
-        this._failureCount.set(name, fails);
-        if (fails >= 3) {
-          console.log(`[${new Date().toISOString()}] [virtual-socket] Removing interface: ${name}`);
-          rs.destroy();
-          this.realSockets.delete(name);
-          this._failureCount.delete(name);
-        }
-      } else {
-        this._failureCount.delete(name);
+
+      if (!activeByName.has(name)) {
+        console.log(`[${new Date().toISOString()}] [virtual-socket] Removing disappeared interface: ${name}`);
+        this._removeRealSocket(name, rs);
+        continue;
       }
+
+      const nextIp = activeByName.get(name);
+      const currentIp = this._getSocketLocalAddress(rs);
+      if (currentIp !== nextIp) {
+        console.log(`[${new Date().toISOString()}] [virtual-socket] Interface ${name} IP changed: ${currentIp || 'auto'} -> ${nextIp || 'auto'}, reconnecting`);
+        this._removeRealSocket(name, rs);
+        continue;
+      }
+
+      this._failureCount.delete(name);
     }
 
-    // Add sockets for new interfaces
+    // Add sockets for new interfaces or interfaces removed above for IP change.
     for (const iface of interfaces) {
       if (!this.realSockets.has(iface.name)) {
         this._createRealSocket(iface.name, iface.ip);
@@ -89,6 +100,20 @@ class VirtualSocket extends EventEmitter {
     // Emit ready when we have at least one connection
     if (this.realSockets.size > 0) {
       this._checkReady();
+    }
+  }
+
+  _getSocketLocalAddress(rs) {
+    return rs?.config?.localAddress ?? rs?.localAddress ?? null;
+  }
+
+  _removeRealSocket(interfaceName, rs) {
+    if (this.realSockets.get(interfaceName) === rs) {
+      this.realSockets.delete(interfaceName);
+    }
+    this._failureCount.delete(interfaceName);
+    if (rs && typeof rs.destroy === 'function') {
+      rs.destroy();
     }
   }
 
@@ -107,8 +132,16 @@ class VirtualSocket extends EventEmitter {
     const rs = new RealSocket(rsConfig);
 
     rs.on('status', (status) => {
+      if (this.realSockets.get(interfaceName) !== rs) return;
+
+      if (status === 'disconnected') {
+        this._resetSessionStateIfFullyDisconnected();
+        return;
+      }
+
       if (status === 'failed') {
         this.realSockets.delete(interfaceName);
+        this._resetSessionStateIfFullyDisconnected();
         this._checkAllFailed();
       }
     });
@@ -137,6 +170,19 @@ class VirtualSocket extends EventEmitter {
       this._readyEmitted = true;
       this.emit('ready');
     }
+  }
+
+  _resetSessionStateIfFullyDisconnected() {
+    const connected = [...this.realSockets.values()].filter(rs => rs.isConnected());
+    if (connected.length > 0) return;
+
+    // Once every physical tunnel socket is gone, no late duplicate frames from
+    // the previous virtual session can arrive. Clear dedup/sequence state so a
+    // reconnect to a fresh server-side session can safely reuse stream IDs.
+    for (const timer of this.cleanupTimers.values()) clearTimeout(timer);
+    this.cleanupTimers.clear();
+    this.seqCounters.clear();
+    this.dedupWindows.clear();
   }
 
   _checkAllFailed() {
@@ -168,6 +214,14 @@ class VirtualSocket extends EventEmitter {
 
       this.seqCounters.set(streamId, seqNo);
       buf.writeUInt32BE(seqNo, 5);
+
+      // When the client sends outbound FIN/ERROR the response is complete
+      // and the stream is fully done in both directions. Schedule TTL
+      // cleanup. (Inbound FIN only ended the request body — the response
+      // may still be streaming, so cleanup is deferred to here.)
+      if (type === FrameType.FIN || type === FrameType.ERROR) {
+        this._scheduleStreamCleanup(streamId);
+      }
     }
 
     for (const rs of this.realSockets.values()) {
@@ -208,6 +262,7 @@ class VirtualSocket extends EventEmitter {
       const data = JSON.parse(frame.payload.toString());
       for (const streamId of data.streams) {
         this.dedupWindows.delete(streamId);
+        this._cancelStreamCleanup(streamId); // Protect seqCounters from stale TTL timer
         // Do NOT reset seqCounters — that's the outbound counter.
         // RESET_SEQ from remote means "remote reset its outbound",
         // so we only clear our incoming dedup window.
@@ -235,9 +290,18 @@ class VirtualSocket extends EventEmitter {
         const result = window.checkAndAdd(frame.seqNo);
         if (result === 'duplicate') return;
       }
-      // Only clean seqCounters — keep dedupWindow to catch late duplicates.
-      // It'll be cleaned up when stream ID is reused or session ends.
-      this.seqCounters.delete(streamId);
+      // Keep dedupWindow to catch late multipath duplicates.
+      // Do NOT delete seqCounters: the outbound seqNo must keep growing
+      // across stream-ID reuses so the server's dedup window sees a
+      // higher seqNo instead of treating the new stream as a duplicate.
+      //
+      // Only schedule TTL cleanup on inbound ERROR (server abort — both
+      // directions are done). For inbound FIN (end-of-request-body), the
+      // response may still be streaming (e.g. SSE); cleanup is scheduled
+      // when the client sends its outbound FIN/ERROR in write().
+      if (frame.type === FrameType.ERROR) {
+        this._scheduleStreamCleanup(streamId);
+      }
       this.emit('frame', frame);
       return;
     }
@@ -247,6 +311,7 @@ class VirtualSocket extends EventEmitter {
       window = new DedupWindow(frame.seqNo);
       window.checkAndAdd(frame.seqNo); // Mark initial seqNo
       this.dedupWindows.set(streamId, window);
+      this._cancelStreamCleanup(streamId); // New stream — cancel any pending cleanup
       this.emit('frame', frame);
       return;
     }
@@ -254,7 +319,36 @@ class VirtualSocket extends EventEmitter {
     const result = window.checkAndAdd(frame.seqNo);
     if (result === 'duplicate') return;
 
+    // Non-duplicate HEADERS/UPGRADE for an existing window means stream-ID reuse.
+    // Cancel any pending TTL cleanup so the active stream's state isn't deleted.
+    if (frame.type === FrameType.HEADERS || frame.type === FrameType.UPGRADE) {
+      this._cancelStreamCleanup(streamId);
+    }
+
     this.emit('frame', frame);
+  }
+
+  /**
+   * Schedule TTL cleanup of dedup/seq state for a completed stream.
+   * The grace period catches late multipath duplicates while bounding memory.
+   */
+  _scheduleStreamCleanup(streamId) {
+    this._cancelStreamCleanup(streamId);
+    const timer = setTimeout(() => {
+      this.cleanupTimers.delete(streamId);
+      this.dedupWindows.delete(streamId);
+      this.seqCounters.delete(streamId);
+    }, STREAM_CLEANUP_GRACE_MS);
+    if (typeof timer.unref === 'function') timer.unref();
+    this.cleanupTimers.set(streamId, timer);
+  }
+
+  _cancelStreamCleanup(streamId) {
+    const timer = this.cleanupTimers.get(streamId);
+    if (timer) {
+      clearTimeout(timer);
+      this.cleanupTimers.delete(streamId);
+    }
   }
 
   get maxConcurrentStreams() {
@@ -286,6 +380,8 @@ class VirtualSocket extends EventEmitter {
       rs.destroy();
     }
     this.realSockets.clear();
+    for (const timer of this.cleanupTimers.values()) clearTimeout(timer);
+    this.cleanupTimers.clear();
     this.dedupWindows.clear();
     this.seqCounters.clear();
     this.removeAllListeners();

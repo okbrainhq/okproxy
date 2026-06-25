@@ -995,6 +995,7 @@ CA=.ca/ca-cert.pem
 MULTIPATH_ENABLED=true
 
 # Existing (unchanged)
+BRANCH=main
 HTTP_PORT=8080
 TLS_PORT=9443
 MAX_STREAMS=100

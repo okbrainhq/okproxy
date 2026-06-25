@@ -2,7 +2,7 @@
 
 # setup-server.sh
 # Purpose: Orchestrates the setup on a remote server by copying scripts and running them.
-# Usage: ./scripts/deploy/setup-server.sh [USER@HOST] [--upload-certs]
+# Usage: ./scripts/deploy/setup-server.sh [USER@HOST] [--upload-certs] [--classic] [--branch BRANCH]
 
 set -e
 
@@ -33,11 +33,34 @@ fi
 # Parse command line arguments
 HOST=""
 UPLOAD_CERTS=false
+CERT_BOUND_DOMAINS=${CERT_BOUND_DOMAINS:-true}
+BRANCH=${BRANCH:-main}
 
-for arg in "$@"; do
-    case "$arg" in
+while [ $# -gt 0 ]; do
+    case "$1" in
         --upload-certs)
             UPLOAD_CERTS=true
+            shift
+            ;;
+        --classic)
+            CERT_BOUND_DOMAINS=false
+            shift
+            ;;
+        --cert-bound-domains)
+            CERT_BOUND_DOMAINS=true
+            shift
+            ;;
+        --branch=*)
+            BRANCH="${1#--branch=}"
+            shift
+            ;;
+        --branch)
+            if [ $# -lt 2 ]; then
+                echo "Error: --branch requires a branch name"
+                exit 1
+            fi
+            BRANCH="$2"
+            shift 2
             ;;
         --dev)
             echo "Error: --dev flag should be used with setup-server-remote.sh directly, not setup-server.sh"
@@ -45,13 +68,20 @@ for arg in "$@"; do
             ;;
         --*)
             # Unknown flag
+            shift
             ;;
         *)
             # Assume it's the host
-            HOST="$arg"
+            HOST="$1"
+            shift
             ;;
     esac
 done
+
+if [ -z "$BRANCH" ]; then
+    echo "Error: BRANCH cannot be empty. Set BRANCH in .deploy.server or pass --branch."
+    exit 1
+fi
 
 # If no host provided, check if DEPLOY_HOST is set in .deploy.server
 if [ -z "$HOST" ] && [ -n "$DEPLOY_HOST" ]; then
@@ -60,7 +90,7 @@ fi
 
 if [ -z "$HOST" ]; then
     echo "Error: No host specified and DEPLOY_HOST not set in .deploy.server file."
-    echo "Usage: ./scripts/deploy/setup-server.sh [USER@HOST] [--upload-certs]"
+    echo "Usage: ./scripts/deploy/setup-server.sh [USER@HOST] [--upload-certs] [--classic] [--branch BRANCH]"
     echo "Or set DEPLOY_HOST in .deploy.server file."
     exit 1
 fi
@@ -68,6 +98,8 @@ fi
 echo "Setting up OKProxy on $HOST..."
 echo "Hostname: $HOSTNAME"
 echo "Repository: $REPO_URL"
+echo "Branch: $BRANCH"
+echo "Cert-bound domains: $CERT_BOUND_DOMAINS"
 
 # Build SSH/SCP port options
 SSH_OPTS=""
@@ -84,6 +116,7 @@ scp $SCP_OPTS "$SCRIPT_DIR/setup-server-remote.sh" "$HOST:~/setup-server-remote.
 
 # 2. Upload certificates if requested (do this FIRST so they exist when service starts)
 CERT_DIR="/opt/okproxy/certs"
+CA_DIR="/opt/okproxy/ca"
 if [ "$UPLOAD_CERTS" = true ]; then
     echo "Validating and uploading certificates..."
     
@@ -119,17 +152,24 @@ if [ "$UPLOAD_CERTS" = true ]; then
     echo "Uploading certificates to remote server..."
     
     # Create remote cert directory with secure permissions FIRST
-    ssh $SSH_OPTS "$HOST" "sudo mkdir -p $CERT_DIR && sudo chown -R \$USER:\$USER /opt/okproxy && sudo chmod 700 $CERT_DIR"
+    ssh $SSH_OPTS "$HOST" "sudo mkdir -p $CERT_DIR $CA_DIR && sudo chown -R \$USER:\$USER /opt/okproxy && sudo chmod 700 $CERT_DIR $CA_DIR"
 
     # Upload certificates using scp
     scp $SCP_OPTS "$PROJECT_ROOT/.certs/server-cert.pem" "$HOST:$CERT_DIR/"
     scp $SCP_OPTS "$PROJECT_ROOT/.certs/server-key.pem" "$HOST:$CERT_DIR/"
     scp $SCP_OPTS "$PROJECT_ROOT/.ca/ca-cert.pem" "$HOST:$CERT_DIR/"
+    scp $SCP_OPTS "$PROJECT_ROOT/.ca/ca-cert.pem" "$HOST:$CA_DIR/"
+    if [ -f "$PROJECT_ROOT/.ca/issued-domains.json" ]; then
+        scp $SCP_OPTS "$PROJECT_ROOT/.ca/issued-domains.json" "$HOST:$CA_DIR/"
+    fi
+    if [ -f "$PROJECT_ROOT/.ca/crl.txt" ]; then
+        scp $SCP_OPTS "$PROJECT_ROOT/.ca/crl.txt" "$HOST:$CA_DIR/"
+    fi
 
     # Fix ownership and permissions (directory already restricted, just fix files)
     echo "Fixing certificate ownership and permissions..."
-    ssh $SSH_OPTS "$HOST" "sudo chown -R \"\$SUDO_USER:\$SUDO_USER\" $CERT_DIR 2>/dev/null || sudo chown -R \"\$USER:\$USER\" $CERT_DIR"
-    ssh $SSH_OPTS "$HOST" "sudo chmod 600 $CERT_DIR/server-key.pem && sudo chmod 644 $CERT_DIR/server-cert.pem $CERT_DIR/ca-cert.pem"
+    ssh $SSH_OPTS "$HOST" "sudo chown -R \"\$SUDO_USER:\$SUDO_USER\" $CERT_DIR $CA_DIR 2>/dev/null || sudo chown -R \"\$USER:\$USER\" $CERT_DIR $CA_DIR"
+    ssh $SSH_OPTS "$HOST" "sudo chmod 600 $CERT_DIR/server-key.pem && sudo chmod 644 $CERT_DIR/server-cert.pem $CERT_DIR/ca-cert.pem && sudo chmod -R go-rwx $CA_DIR"
 
     echo "Certificates uploaded successfully to $CERT_DIR"
 fi
@@ -139,6 +179,8 @@ echo "Executing setup script on remote host..."
 # Use printf %q to properly escape arguments to prevent shell injection
 ESCAPED_HOSTNAME=$(printf '%q' "$HOSTNAME")
 ESCAPED_REPO_URL=$(printf '%q' "$REPO_URL")
-ssh $SSH_OPTS "$HOST" "chmod +x ~/setup-server-remote.sh && sudo ~/setup-server-remote.sh $ESCAPED_HOSTNAME $ESCAPED_REPO_URL"
+ESCAPED_BRANCH=$(printf '%q' "$BRANCH")
+ESCAPED_CERT_BOUND_DOMAINS=$(printf '%q' "$CERT_BOUND_DOMAINS")
+ssh $SSH_OPTS "$HOST" "chmod +x ~/setup-server-remote.sh && sudo ~/setup-server-remote.sh $ESCAPED_HOSTNAME $ESCAPED_REPO_URL --branch=$ESCAPED_BRANCH --cert-bound-domains=$ESCAPED_CERT_BOUND_DOMAINS"
 
 echo "Remote setup completed successfully!"

@@ -6,8 +6,18 @@
 HOSTNAME=tunnel.example.com
 
 # REPO_URL: Git repository URL to clone the application
-REPO_URL=https://github.com/username/tunzero.git
+REPO_URL=https://github.com/username/okproxy.git
+
+# Optional: Git branch to deploy (default: main)
+# BRANCH=main
+
+# Optional: enable certificate-bound multi-client domain routing (default: true)
+# Set false or run setup-server.sh --classic for legacy single-client mode
+# CERT_BOUND_DOMAINS=true
 
 # Optional: Default deployment host (USER@HOST)
 # If set, you can run ./scripts/deploy/setup-server.sh without arguments
 # DEPLOY_HOST=deploy@tunnel.example.com
+
+# Optional: custom SSH port (default: 22)
+# SSH_PORT=2222

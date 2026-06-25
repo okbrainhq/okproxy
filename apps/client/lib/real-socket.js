@@ -101,7 +101,8 @@ class RealSocket extends EventEmitter {
       // Send INIT with interface name
       this.socket.write(encodeFrame(0, FrameType.INIT, JSON.stringify({
         interface: this.config.interfaceName,
-        maxFrameSize: 1048576
+        maxFrameSize: 1048576,
+        domains: this.config.domains || []
       })));
 
       // Set a timeout for INIT response

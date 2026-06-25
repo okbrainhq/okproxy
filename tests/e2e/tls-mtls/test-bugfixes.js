@@ -1127,4 +1127,172 @@ describe('Bug Fixes', () => {
     });
   });
 
+  describe('#31 - Target response timeout', () => {
+    it('should timeout a hanging target locally and keep later requests working', async () => {
+      const env = await createTestEnv({
+        streamTimeout: 5000,
+        targetTimeout: 200,
+        keepaliveInterval: 60000
+      });
+
+      try {
+        await env.startClient();
+        const vs = env.virtualSocket();
+        vs._createRealSocket('timeout-backup', null);
+        await new Promise((r) => setTimeout(r, 300));
+
+        const startTime = Date.now();
+        const response = await httpRequest({
+          hostname: 'localhost',
+          port: env.ports.httpPort,
+          path: '/hang',
+          method: 'GET'
+        });
+        const elapsed = Date.now() - startTime;
+
+        assert.strictEqual(response.statusCode, 504);
+        assert.strictEqual(response.body.toString(), 'Target response timeout');
+        assert.ok(elapsed < 2000, `Target timeout should happen before server stream timeout, elapsed=${elapsed}ms`);
+
+        const followUp = await httpRequest({
+          hostname: 'localhost',
+          port: env.ports.httpPort,
+          path: '/json',
+          method: 'GET'
+        });
+
+        assert.strictEqual(followUp.statusCode, 200);
+      } finally {
+        await env.cleanup();
+      }
+    });
+  });
+
+  describe('#32 - Stream ID reuse does not drop frames via stale dedup window', () => {
+    it('should handle reused stream IDs without hanging', async () => {
+      const env = await createTestEnv();
+
+      try {
+        await env.startClient();
+        await new Promise((r) => setTimeout(r, 200));
+
+        // Force stream ID reuse: always allocate streamId=1.
+        // releaseStreamId is a no-op so the internal activeStreams Set
+        // doesn't interfere. The ConnectionPool.activeStreams Map is
+        // still managed correctly via register/unregister.
+        const tlsServer = env.servers.tlsServer;
+        tlsServer.allocateStreamId = () => 1;
+        tlsServer.releaseStreamId = () => {};
+
+        // First request uses streamId=1
+        const response1 = await httpRequest({
+          hostname: 'localhost',
+          port: env.ports.httpPort,
+          path: '/json',
+          method: 'GET'
+        });
+        assert.strictEqual(response1.statusCode, 200);
+
+        // Give the stream time to fully complete (FIN round-trip)
+        await new Promise((r) => setTimeout(r, 100));
+
+        // Verify dedup window exists for streamId=1 (kept for late duplicates)
+        const vs = env.virtualSocket();
+        assert.ok(vs.dedupWindows.has(1), 'dedupWindow should exist for streamId=1 after completion');
+
+        // Second request reuses streamId=1.
+        // Without the fix: server resets outbound seqNo to 1, client's dedup
+        // window sees seqNo=1 as duplicate → frame dropped → 504 timeout.
+        // With the fix: server continues from seqNo=3, client accepts it.
+        const response2 = await httpRequest({
+          hostname: 'localhost',
+          port: env.ports.httpPort,
+          path: '/json',
+          method: 'GET'
+        });
+        assert.strictEqual(response2.statusCode, 200, 'Second request with reused streamId should succeed');
+
+        // Third request reuses streamId=1 again
+        await new Promise((r) => setTimeout(r, 100));
+        const response3 = await httpRequest({
+          hostname: 'localhost',
+          port: env.ports.httpPort,
+          path: '/json',
+          method: 'GET'
+        });
+        assert.strictEqual(response3.statusCode, 200, 'Third request with reused streamId should succeed');
+      } finally {
+        await env.cleanup();
+      }
+    });
+
+    it('should handle reused stream IDs when target is down (502 path)', async () => {
+      const env = await createTestEnv({ streamTimeout: 2000 });
+
+      try {
+        // Stop the mock target so all requests get ECONNREFUSED → 502
+        await new Promise(r => env.servers.mockTarget.close(r));
+        await env.startClient();
+        await new Promise((r) => setTimeout(r, 100));
+
+        // Force stream ID reuse
+        const tlsServer = env.servers.tlsServer;
+        tlsServer.allocateStreamId = () => 1;
+        tlsServer.releaseStreamId = () => {};
+
+        // First request: target down → 502
+        const response1 = await httpRequest({
+          hostname: 'localhost',
+          port: env.ports.httpPort,
+          path: '/json',
+          method: 'GET'
+        });
+        assert.strictEqual(response1.statusCode, 502);
+
+        await new Promise((r) => setTimeout(r, 100));
+
+        // Second request: reuses streamId=1, target still down → should still get 502
+        const startTime = Date.now();
+        const response2 = await httpRequest({
+          hostname: 'localhost',
+          port: env.ports.httpPort,
+          path: '/json',
+          method: 'GET'
+        });
+        const elapsed = Date.now() - startTime;
+        assert.strictEqual(response2.statusCode, 502, 'Second request should also get 502, not 504 timeout');
+        assert.ok(elapsed < 1500, `Second request should be fast, elapsed=${elapsed}ms`);
+      } finally {
+        await env.cleanup();
+      }
+    });
+  });
+
+  describe('#33 - Many sequential target-down requests do not hang', () => {
+    it('should return 502 quickly for all requests when target is down', async () => {
+      const env = await createTestEnv({ streamTimeout: 5000 });
+
+      try {
+        await new Promise(r => env.servers.mockTarget.close(r));
+        await env.startClient();
+        await new Promise((r) => setTimeout(r, 100));
+
+        for (let i = 0; i < 20; i++) {
+          const startTime = Date.now();
+          const response = await httpRequest({
+            hostname: 'localhost',
+            port: env.ports.httpPort,
+            path: '/json',
+            method: 'GET'
+          });
+          const elapsed = Date.now() - startTime;
+          assert.strictEqual(response.statusCode, 502, `Request ${i} should return 502`);
+          assert.ok(elapsed < 2000, `Request ${i} should finish quickly, elapsed=${elapsed}ms`);
+        }
+      } finally {
+        await env.cleanup();
+      }
+    });
+  });
+
 });

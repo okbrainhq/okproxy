@@ -16,36 +16,120 @@ A secure ngrok alternative using TLS encryption with mutual TLS (mTLS) authentic
 - **Caddy SSL** — automatic HTTPS with Let's Encrypt (server deploy)
 - **Network watchdog** — detects interface changes and reconnects on the new network
 
-## Quick Start — Local
+## Quick Start — Local mTLS
 
-### 1. Generate Keys
+This creates one local CA, one server certificate, and two client certificates bound to two public app domains.
+
+### 1. Create CA + Server + Two Clients
 
 ```bash
+# One-time CA. Keep .ca/ca-key.pem private and do not upload it to servers.
 npx ca init
+
+# Server certificate for local development.
 npx ca issue-server --hostname localhost --output ./.certs
-npx ca issue-client
+
+# Client 1: authorized for p0.example.test
+npx ca issue-client \
+  --name p0 \
+  --domain p0.example.test \
+  --output ./.certs/p0
+
+# Client 2: authorized for p1.example.test
+npx ca issue-client \
+  --name p1 \
+  --domain p1.example.test \
+  --output ./.certs/p1
+
+# Optional: verify issued certs/domains
+npx ca list
+cat .ca/issued-domains.json
 ```
 
-### 2. Start Server
+### 2. Run a Local Target App
+
+Run any HTTP service locally. For a quick test:
 
 ```bash
-npm run server
+python3 -m http.server 3000
 ```
 
-### 3. Start Client
+### 3. Run the Server Locally
+
+Single-client/basic mode:
 
 ```bash
-# Single connection (any interface)
-npm run client -- --target localhost:3000
-
-# Multipath (all available interfaces)
-npm run client -- --target localhost:3000 --multipath
+node apps/server/index.js \
+  --http-port 8080 \
+  --tls-port 9443 \
+  --key ./.certs/server-key.pem \
+  --cert ./.certs/server-cert.pem \
+  --ca ./.ca/ca-cert.pem \
+  --ca-dir ./.ca
 ```
 
-### 4. Access
+Cert-bound multi-client mode, matching production behavior:
 
 ```bash
-curl http://localhost:8080/your-endpoint
+node apps/server/index.js \
+  --http-port 8080 \
+  --tls-port 9443 \
+  --key ./.certs/server-key.pem \
+  --cert ./.certs/server-cert.pem \
+  --ca ./.ca/ca-cert.pem \
+  --ca-dir ./.ca \
+  --cert-bound-domains \
+  --issued-domain-index ./.ca/issued-domains.json
+```
+
+### 4. Run a Client Locally
+
+Client `p0` forwarding to the target on `localhost:3000`:
+
+```bash
+node apps/client/index.js \
+  --server localhost:9443 \
+  --target localhost:3000 \
+  --key ./.certs/p0/client-key.pem \
+  --cert ./.certs/p0/client-cert.pem \
+  --ca ./.ca/ca-cert.pem
+```
+
+Run client `p1` the same way with its cert directory:
+
+```bash
+node apps/client/index.js \
+  --server localhost:9443 \
+  --target localhost:3000 \
+  --key ./.certs/p1/client-key.pem \
+  --cert ./.certs/p1/client-cert.pem \
+  --ca ./.ca/ca-cert.pem
+```
+
+Optional multipath mode:
+
+```bash
+node apps/client/index.js \
+  --server localhost:9443 \
+  --target localhost:3000 \
+  --key ./.certs/p0/client-key.pem \
+  --cert ./.certs/p0/client-cert.pem \
+  --ca ./.ca/ca-cert.pem \
+  --multipath
+```
+
+### 5. Access the Local Tunnel
+
+```bash
+# Basic local access
+curl http://localhost:8080/
+
+# Cert-bound Host routing test
+curl -H 'Host: p0.example.test' http://localhost:8080/
+curl -H 'Host: p1.example.test' http://localhost:8080/
+
+# Caddy ask endpoint should allow domains in .ca/issued-domains.json
+curl -si 'http://localhost:8080/_okproxy/caddy-ask?domain=p0.example.test'
 ```
 
 ## Multipath
@@ -73,12 +157,17 @@ With multipath, you'll see per-interface logs:
 ## Local Key Management
 
 ```bash
-npx ca init                          # Initialize CA (one-time)
-npx ca issue-server --hostname <d>   # Server certificate
-npx ca issue-client                  # Client certificate
-npx ca list                          # List issued certificates
-npx ca revoke --serial <n>           # Revoke a certificate
+npx ca init                                           # Initialize CA (one-time)
+npx ca issue-server --hostname <d> --output ./.certs # Server certificate
+npx ca issue-client --name <n> --domain <domain> \
+  --output ./.certs/<n>                              # Client certificate
+npx ca issue-client --domain <domain> \
+  --allow-domain-overlap                             # Rotation/re-issue only
+npx ca list                                           # List issued certificates
+npx ca revoke --serial <n>                            # Revoke a certificate
 ```
+
+Client domains are stored in `.ca/issued-domains.json`. In cert-bound mode, Caddy uses the server ask endpoint to allow HTTPS only for issued/connected client domains. When a valid client connects, the server also ensures the domains from that client certificate are present in the issued-domain index.
 
 ### Certificate Validity
 
@@ -97,54 +186,209 @@ npx ca revoke --serial <n>           # Revoke a certificate
 
 ## Server Deployment (Debian/Ubuntu)
 
-Create `.deploy.server`:
+The server deploy script copies `setup-server-remote.sh` to your VM, installs Node.js + Caddy, configures `okproxy.service` as `User=okproxy`, opens ports `80`, `443`, and `9443`, and hardens the box with Fail2Ban/UFW.
+
+### 1. Prepare Production CA + Certs Locally
+
+Create the CA and issue one server cert plus one cert per client/domain:
 
 ```bash
-HOSTNAME=tunnel.example.com
+# One-time CA. Keep .ca/ca-key.pem private on your secure machine.
+npx ca init
+
+# TLS tunnel server certificate. Use your tunnel host here.
+npx ca issue-server \
+  --hostname d0.example.com \
+  --output ./.certs
+
+# Client/domain 1
+npx ca issue-client \
+  --name p0 \
+  --domain p0.example.com \
+  --output ./.certs/p0
+
+# Client/domain 2
+npx ca issue-client \
+  --name p1 \
+  --domain p1.example.com \
+  --output ./.certs/p1
+```
+
+The server deploy uploads only the server TLS files and public CA metadata it needs:
+
+```text
+.certs/server-key.pem
+.certs/server-cert.pem
+.ca/ca-cert.pem
+.ca/issued-domains.json
+.ca/crl.txt, if present
+```
+
+It does **not** upload `.ca/ca-key.pem`.
+
+### 2. Configure `.deploy.server`
+
+Create `.deploy.server` from `.deploy.server.example`:
+
+```bash
+# Public tunnel endpoint used by clients for mTLS
+HOSTNAME=d0.example.com
+
+# Repository to deploy on the server
 REPO_URL=https://github.com/arunoda/okproxy.git
+
+# Optional: Git branch to deploy (default: main)
+BRANCH=main
+
+# Optional: default deploy target so the command can omit USER@HOST
+DEPLOY_HOST=deploy@d0.example.com
 
 # Optional: custom SSH port (default: 22)
 # SSH_PORT=2222
+
+# Optional: cert-bound multi-client mode is enabled by default
+# CERT_BOUND_DOMAINS=true
 ```
 
-Deploy:
+Point DNS for the tunnel host and each public app domain to the production server IP:
+
+```text
+d0.example.com  -> server IP, client mTLS endpoint on :9443
+p0.example.com  -> server IP, HTTPS app via Caddy :443
+p1.example.com  -> server IP, HTTPS app via Caddy :443
+```
+
+### 3. Deploy the Production Server
 
 ```bash
-./scripts/deploy/setup-server.sh user@server --upload-certs   # first time
-./scripts/deploy/setup-server.sh user@server                  # updates
+# First deploy: upload server certs + public CA metadata and install service
+./scripts/deploy/setup-server.sh deploy@d0.example.com --upload-certs
+
+# If DEPLOY_HOST is set in .deploy.server, the host can be omitted
+./scripts/deploy/setup-server.sh --upload-certs
+
+# Later updates: fetch configured BRANCH, restart okproxy, reload Caddy
+./scripts/deploy/setup-server.sh
+
+# Override branch for one deploy
+./scripts/deploy/setup-server.sh --branch multi-client
+
+# Legacy single-client mode, if needed
+./scripts/deploy/setup-server.sh --classic
 ```
 
-Server ports: 80 (HTTP), 443 (HTTPS via Caddy), 9443 (TLS tunnel)
+In cert-bound mode the service runs with the issued-domain index:
+
+```bash
+apps/server/index.js --http-port 8080 --tls-port 9443 \
+  --key /opt/okproxy/certs/server-key.pem \
+  --cert /opt/okproxy/certs/server-cert.pem \
+  --ca /opt/okproxy/certs/ca-cert.pem \
+  --ca-dir /opt/okproxy/ca \
+  --cert-bound-domains \
+  --http-host 127.0.0.1 \
+  --issued-domain-index /opt/okproxy/ca/issued-domains.json
+```
+
+Caddy is configured for on-demand HTTPS and asks okproxy before issuing a cert:
+
+```text
+http://127.0.0.1:8080/_okproxy/caddy-ask
+```
+
+When a valid client connects, okproxy reads the domains from the client certificate SAN and ensures they exist in `issued-domains.json`, so Caddy can issue HTTPS for those domains.
+
+Server ports: `80` HTTP redirect, `443` public HTTPS via Caddy, `9443` TLS tunnel.
 
 ## Client Deployment (macOS)
 
-Create `.deploy.client`:
+The client deploy script copies `setup-client-remote.sh` to the Mac, installs/uses Node.js, clones the repo to `~/okproxy`, uploads the selected client certs, and creates a LaunchAgent with `--multipath` enabled.
+
+Create `.deploy.client` from `.deploy.client.example`:
 
 ```bash
-SERVER_HOST=t0.arunoda.me:9443
+SERVER_HOST=tunnel.example.com:9443
 TARGET_HOST=localhost:3000
 REPO_URL=https://github.com/arunoda/okproxy.git
 
-# Optional: custom SSH port (default: 22)
+# Unique profile name for this client on the Mac
+CLIENT_NAME=blog
+
+# Local cert directory to upload for this client
+CLIENT_CERT_DIR=./.certs/blog
+
+# Optional: default SSH target
+DEPLOY_HOST=user@192.168.0.15
+
+# Optional: custom SSH port
 # SSH_PORT=2222
 
-# Optional: default deploy host so you can omit it from the command
-# DEPLOY_HOST=user@192.168.0.15
+# Optional: override remote cert path
+# REMOTE_CERT_DIR=~/.okproxy/certs/blog
 ```
 
-Deploy:
+Prepare one certificate directory per client/domain:
 
 ```bash
-./scripts/deploy/setup-client.sh user@192.168.0.15 --upload-certs
+npx ca issue-client \
+  --name blog \
+  --domain blog.example.com \
+  --output ./.certs/blog
 ```
 
-The client runs as a LaunchAgent with `--multipath` enabled by default, auto-starts on login, and restarts on crash.
+Deploy the client:
+
+```bash
+# First deploy for this client profile: upload selected cert directory
+./scripts/deploy/setup-client.sh user@192.168.0.15 --upload-certs
+
+# Or select certs explicitly from the command line
+./scripts/deploy/setup-client.sh user@192.168.0.15 \
+  --client-name blog \
+  --cert-dir ./.certs/blog \
+  --upload-certs
+
+# Later updates without re-uploading certs
+./scripts/deploy/setup-client.sh user@192.168.0.15 --client-name blog
+```
+
+`setup-client.sh` uploads these files from `CLIENT_CERT_DIR` to the remote cert directory:
+
+```text
+client-cert.pem
+client-key.pem
+ca-cert.pem
+```
+
+The remote cert directory defaults to:
+
+```text
+~/.okproxy/certs/<CLIENT_NAME>
+```
+
+For `CLIENT_NAME=default`, it keeps the old path:
+
+```text
+~/.okproxy/certs
+```
+
+The LaunchAgent label and logs are profile-specific:
 
 ```bash
 # Manage on the Mac
-launchctl list com.okproxy.client
-launchctl stop com.okproxy.client
-tail -f ~/.okproxy/logs/client.log
+launchctl list com.okproxy.client.blog
+launchctl start com.okproxy.client.blog
+launchctl stop com.okproxy.client.blog
+
+# Logs
+tail -f ~/.okproxy/logs/blog/client.log
+tail -f ~/.okproxy/logs/blog/client-error.log
+```
+
+If you need a custom Node binary on the Mac:
+
+```bash
+OKPROXY_NODE_PATH=/path/to/node ./setup-client-remote.sh ...
 ```
 
 ## Server Options
@@ -160,6 +404,9 @@ tail -f ~/.okproxy/logs/client.log
 --stream-timeout <ms>       Stream inactivity timeout (default: 30000)
 --keepalive-interval <ms>   PING interval (default: 10000)
 --keepalive-timeout <ms>    PONG timeout (default: 25000)
+--cert-bound-domains        Enable certificate-bound Host routing
+--issued-domain-index <p>   Issued domain index path
+--http-host <host>          HTTP bind host (use 127.0.0.1 behind Caddy)
 ```
 
 ## Client Options
@@ -167,10 +414,13 @@ tail -f ~/.okproxy/logs/client.log
 ```
 --server <host:port>        Tunnel server (default: localhost:9443)
 --target <host:port>        Local target service (default: localhost:3000)
+--target-timeout <ms>       Target response/upgrade timeout; 0 disables (default: 30000)
 --key <path>                Client private key
 --cert <path>               Client certificate
 --ca <path>                 CA certificate
 --multipath                 Enable multipath over all available interfaces
+--domain <domain>           Optional authorized domain subset (repeatable)
+--preserve-host             Forward original public Host header to target
 ```
 
 ## Protocol

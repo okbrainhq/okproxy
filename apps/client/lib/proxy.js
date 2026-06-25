@@ -58,8 +58,18 @@ function filterWebSocketHeaders(headers) {
 }
 
 const MAX_WS_BUFFER_SIZE = 16 * 1024 * 1024;
+const DEFAULT_TARGET_TIMEOUT = 30000;
 
-function createProxy(connection, targetPort, targetHost = 'localhost', maxStreams = 100) {
+function normalizeTargetTimeout(value) {
+  if (value === undefined || value === null) return DEFAULT_TARGET_TIMEOUT;
+  const timeout = Number(value);
+  if (!Number.isFinite(timeout) || timeout < 0) return DEFAULT_TARGET_TIMEOUT;
+  return timeout;
+}
+
+function createProxy(connection, targetPort, targetHost = 'localhost', maxStreams = 100, options = {}) {
+  const preserveHost = Boolean(options.preserveHost);
+  const targetTimeout = normalizeTargetTimeout(options.targetTimeout);
   const activeStreams = new Map();
   const activeWebSockets = new Map();
 
@@ -79,20 +89,19 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
     } else if (frame.type === FrameType.UPGRADE) {
       startWebSocketProxy(frame.streamId, frame.payload);
     } else if (frame.type === FrameType.DATA) {
-      const proxyReq = activeStreams.get(frame.streamId);
-      if (proxyReq && !proxyReq.destroyed) {
-        proxyReq.write(frame.payload);
+      const streamState = activeStreams.get(frame.streamId);
+      if (streamState && !streamState.req.destroyed) {
+        streamState.req.write(frame.payload);
       }
     } else if (frame.type === FrameType.FIN) {
-      const proxyReq = activeStreams.get(frame.streamId);
-      if (proxyReq && !proxyReq.destroyed) {
-        proxyReq.end();
+      const streamState = activeStreams.get(frame.streamId);
+      if (streamState && !streamState.req.destroyed) {
+        streamState.endRequest();
       }
     } else if (frame.type === FrameType.ERROR) {
-      const proxyReq = activeStreams.get(frame.streamId);
-      if (proxyReq) {
-        proxyReq.destroy();
-        activeStreams.delete(frame.streamId);
+      const streamState = activeStreams.get(frame.streamId);
+      if (streamState) {
+        streamState.destroy();
       }
     }
   }
@@ -166,11 +175,13 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
       }
 
       const proxyHeaders = filterWebSocketHeaders(upgradeInfo.headers);
-      proxyHeaders.host = `${targetHost}:${targetPort}`;
+      proxyHeaders.host = preserveHost && upgradeInfo.publicHost ? upgradeInfo.publicHost : `${targetHost}:${targetPort}`;
 
       if (upgradeInfo.remoteAddress) {
         proxyHeaders['x-forwarded-for'] = upgradeInfo.remoteAddress;
       }
+      if (upgradeInfo.publicHost) proxyHeaders['x-forwarded-host'] = upgradeInfo.publicHost;
+      if (upgradeInfo.publicProto) proxyHeaders['x-forwarded-proto'] = upgradeInfo.publicProto;
 
       const proxyReq = request({
         hostname: targetHost,
@@ -181,12 +192,14 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
       });
 
       let upgradeTimeoutTriggered = false;
-      proxyReq.setTimeout(30000, () => {
-        upgradeTimeoutTriggered = true;
-        proxyReq.destroy();
-        connection.write(encodeFrame(streamId, FrameType.ERROR, Buffer.from('Upgrade timeout')));
-        cleanup(false);
-      });
+      if (targetTimeout > 0) {
+        proxyReq.setTimeout(targetTimeout, () => {
+          upgradeTimeoutTriggered = true;
+          proxyReq.destroy();
+          connection.write(encodeFrame(streamId, FrameType.ERROR, Buffer.from('Upgrade timeout')));
+          cleanup(false);
+        });
+      }
 
       let cleanupCalled = false;
 
@@ -367,13 +380,28 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
       const reqInfo = JSON.parse(payload.toString());
 
       const proxyHeaders = filterRequestHeaders(reqInfo.headers);
-      proxyHeaders.host = `${targetHost}:${targetPort}`;
+      proxyHeaders.host = preserveHost && reqInfo.publicHost ? reqInfo.publicHost : `${targetHost}:${targetPort}`;
 
       delete proxyHeaders.origin;
       delete proxyHeaders.referer;
 
       if (reqInfo.remoteAddress) {
         proxyHeaders['x-forwarded-for'] = reqInfo.remoteAddress;
+      }
+      if (reqInfo.publicHost) proxyHeaders['x-forwarded-host'] = reqInfo.publicHost;
+      if (reqInfo.publicProto) proxyHeaders['x-forwarded-proto'] = reqInfo.publicProto;
+
+      let streamState = null;
+
+      function sendPlainResponse(status, message) {
+        connection.write(encodeFrame(streamId, FrameType.HEADERS, JSON.stringify({
+          status,
+          headers: { 'content-type': 'text/plain' }
+        })));
+        if (message) {
+          connection.write(encodeFrame(streamId, FrameType.DATA, Buffer.from(message)));
+        }
+        connection.write(encodeFrame(streamId, FrameType.FIN, Buffer.alloc(0)));
       }
 
       const proxyReq = request({
@@ -383,6 +411,14 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
         path: reqInfo.path,
         headers: proxyHeaders
       }, (proxyRes) => {
+        if (!streamState || streamState.completed) {
+          proxyRes.resume();
+          return;
+        }
+
+        streamState.responseStarted = true;
+        streamState.clearTargetTimer();
+
         const filteredHeaders = filterRequestHeaders(proxyRes.headers);
 
         const canWrite = connection.write(encodeFrame(streamId, FrameType.HEADERS, JSON.stringify({
@@ -396,6 +432,8 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
           setTimeout(() => proxyRes.resume(), 50);
         }
 
+        let responseEnded = false;
+
         proxyRes.on('data', (chunk) => {
           let offset = 0;
           while (offset < chunk.length) {
@@ -407,34 +445,102 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
         });
 
         proxyRes.on('end', () => {
+          responseEnded = true;
           connection.write(encodeFrame(streamId, FrameType.FIN, Buffer.alloc(0)));
-          activeStreams.delete(streamId);
+          streamState.cleanup();
+        });
+
+        proxyRes.on('close', () => {
+          if (!responseEnded && streamState && !streamState.completed) {
+            console.error(`[CLIENT ERROR] Target response closed early for ${reqInfo.method} ${reqInfo.path}`);
+            connection.write(encodeFrame(streamId, FrameType.ERROR, Buffer.from('Target response closed')));
+            streamState.cleanup();
+          }
         });
 
         proxyRes.on('error', (err) => {
+          if (streamState && streamState.completed) return;
           console.error(`[CLIENT ERROR] Target response error for ${reqInfo.method} ${reqInfo.path}:`, err.message, `(code: ${err.code || 'none'})`);
           const errorDetail = err.code ? `Target error: ${err.code}` : 'Target error';
           connection.write(encodeFrame(streamId, FrameType.ERROR, Buffer.from(errorDetail)));
-          activeStreams.delete(streamId);
+          if (streamState) streamState.cleanup();
         });
       });
 
-      activeStreams.set(streamId, proxyReq);
+      streamState = {
+        req: proxyReq,
+        responseStarted: false,
+        requestEnded: false,
+        completed: false,
+        timedOut: false,
+        targetTimer: null,
+
+        clearTargetTimer() {
+          if (this.targetTimer) {
+            clearTimeout(this.targetTimer);
+            this.targetTimer = null;
+          }
+        },
+
+        startTargetTimer() {
+          if (targetTimeout <= 0 || this.responseStarted || this.completed) return;
+          this.clearTargetTimer();
+          this.targetTimer = setTimeout(() => {
+            this.timeoutTarget();
+          }, targetTimeout);
+          if (typeof this.targetTimer.unref === 'function') this.targetTimer.unref();
+        },
+
+        timeoutTarget() {
+          if (this.completed) return;
+          this.timedOut = true;
+          console.error(`[CLIENT TIMEOUT] Target response timeout after ${targetTimeout}ms for ${reqInfo.method} ${reqInfo.path}`);
+
+          if (this.responseStarted) {
+            connection.write(encodeFrame(streamId, FrameType.ERROR, Buffer.from('Target response timeout')));
+          } else {
+            sendPlainResponse(504, 'Target response timeout');
+          }
+
+          if (!this.req.destroyed) {
+            this.req.destroy(new Error('Target response timeout'));
+          }
+          this.cleanup();
+        },
+
+        endRequest() {
+          if (this.requestEnded || this.completed) return;
+          this.requestEnded = true;
+          this.req.end();
+          this.startTargetTimer();
+        },
+
+        destroy() {
+          if (!this.req.destroyed) this.req.destroy();
+          this.cleanup();
+        },
+
+        cleanup() {
+          if (this.completed) return;
+          this.completed = true;
+          this.clearTargetTimer();
+          activeStreams.delete(streamId);
+        }
+      };
+
+      activeStreams.set(streamId, streamState);
 
       proxyReq.on('error', (err) => {
+        if (streamState && (streamState.completed || streamState.timedOut)) return;
+
         console.error(`[CLIENT ERROR] Target error for ${reqInfo.method} ${reqInfo.path}:`, err.message, `(code: ${err.code || 'none'})`);
         if (err.code === 'ECONNREFUSED') {
-          connection.write(encodeFrame(streamId, FrameType.HEADERS, JSON.stringify({
-            status: 502,
-            headers: { 'content-type': 'text/plain' }
-          })));
-          connection.write(encodeFrame(streamId, FrameType.DATA, Buffer.from('Target service not available')));
-          connection.write(encodeFrame(streamId, FrameType.FIN, Buffer.alloc(0)));
+          sendPlainResponse(502, 'Target service not available');
         } else {
           const errorDetail = err.code ? `Target error: ${err.code}` : 'Target error';
           connection.write(encodeFrame(streamId, FrameType.ERROR, Buffer.from(errorDetail)));
         }
-        activeStreams.delete(streamId);
+        if (streamState) streamState.cleanup();
       });
 
       proxyReq.on('drain', () => {
@@ -527,8 +633,8 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
     }
     activeWebSockets.clear();
 
-    for (const [streamId, proxyReq] of activeStreams) {
-      proxyReq.destroy();
+    for (const [streamId, streamState] of activeStreams) {
+      streamState.destroy();
     }
     activeStreams.clear();
   }

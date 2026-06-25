@@ -84,7 +84,8 @@ function createTLSConnection(config, onFrame, onConnect, onDisconnect) {
       // Send INIT handshake after TLS connection is established
       socket.write(encodeFrame(0, FrameType.INIT, JSON.stringify({
         version: 1,
-        maxFrameSize: 1048576
+        maxFrameSize: 1048576,
+        domains: config.domains || []
       })));
     });
 

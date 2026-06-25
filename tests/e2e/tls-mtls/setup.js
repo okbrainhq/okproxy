@@ -31,6 +31,20 @@ function initTestCerts() {
   issueClientCertificate(clientDir, testCaDir);
 }
 
+function issueTestClientCertificate(name, domains = []) {
+  initTestCerts();
+  const clientDir = join(testCertDir, name);
+  mkdirSync(clientDir, { recursive: true });
+  issueClientCertificate(clientDir, testCaDir, { name, domains });
+  return {
+    clientKey: join(clientDir, 'client-key.pem'),
+    clientCert: join(clientDir, 'client-cert.pem'),
+    clientCa: join(clientDir, 'ca-cert.pem'),
+    caDir: testCaDir,
+    issuedDomainIndex: join(testCaDir, 'issued-domains.json')
+  };
+}
+
 function getCertPaths() {
   initTestCerts();
   return {
@@ -107,7 +121,9 @@ async function createTestEnv(options = {}) {
       virtualSocket.on('ready', () => {
         clearTimeout(timeout);
         clientReady = true;
-        clientProxy = createProxy(virtualSocket, targetPort, 'localhost', options.maxStreams || 100);
+        clientProxy = createProxy(virtualSocket, targetPort, 'localhost', options.maxStreams || 100, {
+          targetTimeout: options.targetTimeout
+        });
         resolve();
       });
 
@@ -230,5 +246,6 @@ module.exports = {
   getCertPaths,
   createTestEnv,
   httpRequest,
-  httpRequestStream
+  httpRequestStream,
+  issueTestClientCertificate
 };

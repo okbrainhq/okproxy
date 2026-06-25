@@ -3,35 +3,66 @@
 # setup-server-remote.sh
 # Purpose: Installs dependencies and prepares the environment for okproxy on Debian.
 # Usage:
-#   Production: ./setup-server-remote.sh <HOSTNAME> <REPO_URL>
+#   Production: ./setup-server-remote.sh <HOSTNAME> <REPO_URL> [--branch=<branch>] [--cert-bound-domains=true|false]
 #   Dev:        ./setup-server-remote.sh --dev
 
 set -eo pipefail
 
 # Parse flags
 DEV_MODE=false
-for arg in "$@"; do
-    case "$arg" in
-        --dev) DEV_MODE=true ;;
+CERT_BOUND_DOMAINS=true
+BRANCH="main"
+POSITIONAL=()
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --dev)
+            DEV_MODE=true
+            shift
+            ;;
+        --cert-bound-domains=false)
+            CERT_BOUND_DOMAINS=false
+            shift
+            ;;
+        --cert-bound-domains=true|--cert-bound-domains)
+            CERT_BOUND_DOMAINS=true
+            shift
+            ;;
+        --branch=*)
+            BRANCH="${1#--branch=}"
+            shift
+            ;;
+        --branch)
+            if [ $# -lt 2 ]; then
+                echo "Error: --branch requires a branch name"
+                exit 1
+            fi
+            BRANCH="$2"
+            shift 2
+            ;;
+        --*)
+            # Unknown flag
+            shift
+            ;;
+        *)
+            POSITIONAL+=("$1")
+            shift
+            ;;
     esac
 done
 
 APP_DIR="/opt/okproxy"
 
 if [ "$DEV_MODE" = false ]; then
-    # Collect positional args (skip flags)
-    POSITIONAL=()
-    for arg in "$@"; do
-        case "$arg" in
-            --*) ;; # skip flags
-            *) POSITIONAL+=("$arg") ;;
-        esac
-    done
     if [ ${#POSITIONAL[@]} -lt 2 ]; then
         echo "Error: Hostname and repository URL are required."
         echo "Usage:"
-        echo "  Production: ./remote-setup.sh <HOSTNAME> <REPO_URL>"
+        echo "  Production: ./remote-setup.sh <HOSTNAME> <REPO_URL> [--branch=<branch>]"
         echo "  Dev:        ./remote-setup.sh --dev"
+        exit 1
+    fi
+    if [ -z "$BRANCH" ]; then
+        echo "Error: Branch name cannot be empty."
         exit 1
     fi
     HOSTNAME="${POSITIONAL[0]}"
@@ -39,7 +70,9 @@ if [ "$DEV_MODE" = false ]; then
     echo "Starting setup for OKProxy (production)..."
     echo "Target Directory: $APP_DIR"
     echo "Repository: $REPO_URL"
+    echo "Branch: $BRANCH"
     echo "Hostname: $HOSTNAME"
+    echo "Cert-bound domains: $CERT_BOUND_DOMAINS"
 else
     echo "Starting setup for OKProxy (dev mode)..."
 fi
@@ -67,6 +100,13 @@ sudo apt update
 # 2. Install basic tools
 echo "Installing basic tools (curl, git, unzip)..."
 sudo apt install -y curl git unzip
+
+if [ "$DEV_MODE" = false ]; then
+    if ! git check-ref-format --branch "$BRANCH" >/dev/null 2>&1; then
+        echo "Error: Invalid branch name: $BRANCH"
+        exit 1
+    fi
+fi
 
 # 3. Install/Update Node.js (Latest LTS)
 echo "Checking Node.js status..."
@@ -255,20 +295,25 @@ if [ "$DEV_MODE" = false ]; then
 
     # 5. Clone or update repository
     CERT_DIR="/opt/okproxy/certs"
+    CA_DIR="/opt/okproxy/ca"
     if [ -d "$APP_DIR/.git" ]; then
-        echo "App directory exists. Updating repository..."
+        echo "App directory exists. Updating repository from branch $BRANCH..."
+        # The app directory is owned by the okproxy service user after setup.
+        # Since this script runs via sudo, Git may reject it as "dubious ownership".
+        git config --global --add safe.directory "$APP_DIR" 2>/dev/null || true
         cd "$APP_DIR"
-        git fetch origin
-        git reset --hard "origin/main"
+        git fetch origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
+        git checkout -B "$BRANCH" "origin/$BRANCH"
+        git reset --hard "origin/$BRANCH"
         echo "Repository updated."
     else
-        echo "App directory does not exist. Cloning repository..."
+        echo "App directory does not exist. Cloning repository branch $BRANCH..."
         if [ -d "$APP_DIR" ]; then
             sudo rm -rf "$APP_DIR"
         fi
         sudo mkdir -p "$(dirname "$APP_DIR")"
         sudo chown -R "$REAL_USER":"$REAL_USER" "$(dirname "$APP_DIR")"
-        git clone "$REPO_URL" "$APP_DIR"
+        git clone --branch "$BRANCH" "$REPO_URL" "$APP_DIR"
         echo "Repository cloned."
     fi
 
@@ -282,24 +327,57 @@ if [ "$DEV_MODE" = false ]; then
 
     # Set proper ownership for app and cert directories
     sudo chown -R okproxy:okproxy "$APP_DIR"
-    sudo chown -R okproxy:okproxy "$CERT_DIR"
+    sudo mkdir -p "$CERT_DIR" "$CA_DIR"
+    sudo chown -R okproxy:okproxy "$CERT_DIR" "$CA_DIR"
+
+    fix_cert_permissions() {
+        # okproxy.service runs as User=okproxy, so private keys must be readable by okproxy.
+        for dir in "$CERT_DIR" "$CA_DIR" "$APP_DIR/.certs" "$APP_DIR/.ca"; do
+            if [ -d "$dir" ]; then
+                sudo chown -R okproxy:okproxy "$dir"
+                sudo chmod 700 "$dir"
+            fi
+        done
+        for key in "$CERT_DIR/server-key.pem" "$APP_DIR/.certs/server-key.pem"; do
+            if [ -f "$key" ]; then
+                sudo chmod 600 "$key"
+            fi
+        done
+        for cert in "$CERT_DIR/server-cert.pem" "$CERT_DIR/ca-cert.pem" "$APP_DIR/.certs/server-cert.pem" "$APP_DIR/.certs/ca-cert.pem" "$APP_DIR/.ca/ca-cert.pem"; do
+            if [ -f "$cert" ]; then
+                sudo chmod 644 "$cert"
+            fi
+        done
+    }
 
     # 6. Check/generate certificates
     CERT_DIR="/opt/okproxy/certs"
+    CA_DIR="/opt/okproxy/ca"
     if [ -f "$CERT_DIR/server-cert.pem" ]; then
         echo "Using uploaded certificates from $CERT_DIR"
-        CERT_OPTS="--key $CERT_DIR/server-key.pem --cert $CERT_DIR/server-cert.pem --ca $CERT_DIR/ca-cert.pem"
+        CERT_OPTS="--key $CERT_DIR/server-key.pem --cert $CERT_DIR/server-cert.pem --ca $CERT_DIR/ca-cert.pem --ca-dir $CA_DIR"
     elif [ ! -f "$APP_DIR/.certs/server-cert.pem" ]; then
         echo "Generating certificates..."
         cd "$APP_DIR"
         "$NODE_PATH" apps/server/bin/tunnel-ca.js init
         "$NODE_PATH" apps/server/bin/tunnel-ca.js issue-server --hostname "$HOSTNAME" --output ./.certs
-        "$NODE_PATH" apps/server/bin/tunnel-ca.js issue-client
+        # Client certificates should be issued separately with --domain for cert-bound deployments.
         echo "Certificates generated."
-        CERT_OPTS=""
+        CERT_OPTS="--ca-dir $APP_DIR/.ca"
     else
         echo "Using generated certificates from .certs/"
-        CERT_OPTS=""
+        CERT_OPTS="--ca-dir $APP_DIR/.ca"
+    fi
+    fix_cert_permissions
+
+    SERVER_MODE_OPTS=""
+    if [ "$CERT_BOUND_DOMAINS" = true ]; then
+        SERVER_MODE_OPTS="--cert-bound-domains --http-host 127.0.0.1"
+        if [ -f "$CA_DIR/issued-domains.json" ]; then
+            SERVER_MODE_OPTS="$SERVER_MODE_OPTS --issued-domain-index $CA_DIR/issued-domains.json"
+        elif [ -f "$APP_DIR/.ca/issued-domains.json" ]; then
+            SERVER_MODE_OPTS="$SERVER_MODE_OPTS --issued-domain-index $APP_DIR/.ca/issued-domains.json"
+        fi
     fi
 
     # 7. Setup systemd service
@@ -314,7 +392,7 @@ Type=simple
 User=okproxy
 Group=okproxy
 WorkingDirectory=/opt/okproxy
-ExecStart=$NODE_PATH apps/server/index.js --http-port 8080 --tls-port 9443 $CERT_OPTS
+ExecStart=$NODE_PATH apps/server/index.js --http-port 8080 --tls-port 9443 $CERT_OPTS $SERVER_MODE_OPTS
 Restart=always
 RestartSec=10
 Environment=NODE_ENV=production
@@ -324,7 +402,7 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=
+ReadWritePaths=/opt/okproxy/ca /opt/okproxy/certs /opt/okproxy/.ca /opt/okproxy/.certs
 ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectKernelLogs=true
@@ -348,9 +426,23 @@ EOF
 
     # 8. Setup Caddyfile
     echo "Configuring Caddy for $HOSTNAME..."
-    sudo tee /etc/caddy/Caddyfile > /dev/null <<EOF
-$HOSTNAME {
-    reverse_proxy localhost:8080
+    if [ "$CERT_BOUND_DOMAINS" = true ]; then
+        sudo tee /etc/caddy/Caddyfile > /dev/null <<EOF
+{
+    on_demand_tls {
+        ask http://127.0.0.1:8080/_okproxy/caddy-ask
+    }
+}
+
+:80 {
+    redir https://{host}{uri} permanent
+}
+
+:443 {
+    tls {
+        on_demand
+    }
+    reverse_proxy 127.0.0.1:8080
     header {
         X-Content-Type-Options nosniff
         X-Frame-Options DENY
@@ -359,6 +451,19 @@ $HOSTNAME {
     }
 }
 EOF
+    else
+        sudo tee /etc/caddy/Caddyfile > /dev/null <<EOF
+$HOSTNAME {
+    reverse_proxy 127.0.0.1:8080
+    header {
+        X-Content-Type-Options nosniff
+        X-Frame-Options DENY
+        Referrer-Policy strict-origin-when-cross-origin
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+    }
+}
+EOF
+    fi
     echo "Reloading Caddy..."
     sudo systemctl reload caddy
 
@@ -428,8 +533,9 @@ EOF
     fi
 
     # 14. Final Permission Fix
-    echo "Ensuring file ownership for $REAL_USER..."
-    sudo chown -R "$REAL_USER":"$REAL_USER" "$APP_DIR"
+    echo "Ensuring okproxy service can read application files and certificates..."
+    sudo chown -R okproxy:okproxy "$APP_DIR"
+    fix_cert_permissions
 
     # 15. Health Check
     echo ""
