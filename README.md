@@ -404,6 +404,8 @@ OKPROXY_NODE_PATH=/path/to/node ./setup-client-remote.sh ...
 --stream-timeout <ms>       Stream inactivity timeout (default: 30000)
 --keepalive-interval <ms>   PING interval (default: 10000)
 --keepalive-timeout <ms>    PONG timeout (default: 25000)
+--http-keepalive-timeout <ms> HTTP keep-alive timeout for Caddy/browser side (default: 3600000)
+--http-headers-timeout <ms> HTTP headers timeout (default: 3605000)
 --cert-bound-domains        Enable certificate-bound Host routing
 --issued-domain-index <p>   Issued domain index path
 --http-host <host>          HTTP bind host (use 127.0.0.1 behind Caddy)
@@ -415,6 +417,7 @@ OKPROXY_NODE_PATH=/path/to/node ./setup-client-remote.sh ...
 --server <host:port>        Tunnel server (default: localhost:9443)
 --target <host:port>        Local target service (default: localhost:3000)
 --target-timeout <ms>       Target response/upgrade timeout; 0 disables (default: 30000)
+--target-keepalive-timeout <ms> Target idle keep-alive timeout; 0 disables idle expiry (default: 3600000)
 --key <path>                Client private key
 --cert <path>               Client certificate
 --ca <path>                 CA certificate

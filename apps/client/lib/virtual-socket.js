@@ -201,7 +201,8 @@ class VirtualSocket extends EventEmitter {
 
     const type = buf.readUInt8(4);
     let seqNo = 0;
-    let writeOk = false;
+    let connected = 0;
+    let backpressured = false;
 
     if (!CONTROL_FRAME_TYPES.has(type)) {
       const streamId = buf.readUInt32BE(0);
@@ -226,15 +227,66 @@ class VirtualSocket extends EventEmitter {
 
     for (const rs of this.realSockets.values()) {
       if (rs.isConnected()) {
-        if (rs.write(buf)) writeOk = true;
+        connected++;
+        if (!rs.write(buf)) backpressured = true;
       }
     }
 
-    if (!writeOk) {
+    if (connected === 0) {
       this.emit('error', new Error('All socket writes failed'));
+      return false;
     }
 
-    return writeOk;
+    return !backpressured;
+  }
+
+  onceDrain(callback) {
+    const waiting = [...this.realSockets.values()]
+      .filter(rs => rs.isConnected() && rs.socket && rs.socket.writableNeedDrain)
+      .map(rs => rs.socket);
+
+    if (waiting.length === 0) {
+      process.nextTick(callback);
+      return;
+    }
+
+    let pending = waiting.length;
+    let callbackCalled = false;
+
+    const finishOne = () => {
+      pending--;
+      if (pending <= 0 && !callbackCalled) {
+        callbackCalled = true;
+        callback();
+      }
+    };
+
+    for (const socket of waiting) {
+      let settled = false;
+      const done = () => {
+        if (settled) return;
+        settled = true;
+        socket.removeListener('drain', done);
+        socket.removeListener('close', done);
+        socket.removeListener('error', done);
+        finishOne();
+      };
+      socket.once('drain', done);
+      socket.once('close', done);
+      socket.once('error', done);
+    }
+  }
+
+  pause() {
+    for (const rs of this.realSockets.values()) {
+      if (rs.isConnected() && typeof rs.pause === 'function') rs.pause();
+    }
+  }
+
+  resume() {
+    for (const rs of this.realSockets.values()) {
+      if (rs.isConnected() && typeof rs.resume === 'function') rs.resume();
+    }
   }
 
   /**

@@ -164,10 +164,65 @@ class ConnectionPool {
       }
     }
 
+    let connected = 0;
+    let backpressured = false;
+
     for (const [name, sock] of this.connections) {
       if (!sock.destroyed) {
-        sock.write(frameBuf);
+        connected++;
+        if (!sock.write(frameBuf)) backpressured = true;
       }
+    }
+
+    return connected > 0 && !backpressured;
+  }
+
+  onceDrain(callback) {
+    const waiting = [...this.connections.values()].filter(sock =>
+      !sock.destroyed && sock.writableNeedDrain
+    );
+
+    if (waiting.length === 0) {
+      process.nextTick(callback);
+      return;
+    }
+
+    let pending = waiting.length;
+    let callbackCalled = false;
+
+    const finishOne = () => {
+      pending--;
+      if (pending <= 0 && !callbackCalled) {
+        callbackCalled = true;
+        callback();
+      }
+    };
+
+    for (const sock of waiting) {
+      let settled = false;
+      const done = () => {
+        if (settled) return;
+        settled = true;
+        sock.removeListener('drain', done);
+        sock.removeListener('close', done);
+        sock.removeListener('error', done);
+        finishOne();
+      };
+      sock.once('drain', done);
+      sock.once('close', done);
+      sock.once('error', done);
+    }
+  }
+
+  pause() {
+    for (const sock of this.connections.values()) {
+      if (!sock.destroyed && typeof sock.pause === 'function') sock.pause();
+    }
+  }
+
+  resume() {
+    for (const sock of this.connections.values()) {
+      if (!sock.destroyed && typeof sock.resume === 'function') sock.resume();
     }
   }
 

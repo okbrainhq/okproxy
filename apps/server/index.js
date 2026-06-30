@@ -24,6 +24,8 @@ function parseArgs() {
     streamTimeout: 30000,
     keepaliveInterval: 10000,
     keepaliveTimeout: 25000,
+    httpKeepAliveTimeout: 60 * 60 * 1000,
+    httpHeadersTimeout: (60 * 60 * 1000) + 5000,
     certBoundDomains: false,
     issuedDomainIndex: './.ca/issued-domains.json',
     httpHost: undefined
@@ -72,6 +74,12 @@ function parseArgs() {
       case '--keepalive-timeout':
         options.keepaliveTimeout = parseInt(args[++i], 10);
         break;
+      case '--http-keepalive-timeout':
+        options.httpKeepAliveTimeout = parseInt(args[++i], 10);
+        break;
+      case '--http-headers-timeout':
+        options.httpHeadersTimeout = parseInt(args[++i], 10);
+        break;
       case '--cert-bound-domains':
         options.certBoundDomains = true;
         break;
@@ -96,6 +104,8 @@ Options:
   --stream-timeout <ms>       Stream inactivity timeout (default: 30000)
   --keepalive-interval <ms>   PING interval (default: 10000)
   --keepalive-timeout <ms>    PONG timeout (default: 25000)
+  --http-keepalive-timeout <ms> HTTP keep-alive timeout for Caddy/browser side (default: 3600000)
+  --http-headers-timeout <ms> HTTP headers timeout (default: 3605000)
   --cert-bound-domains        Enable certificate-bound Host routing
   --issued-domain-index <p>   Issued domain index (default: ./.ca/issued-domains.json)
   --http-host <host>          HTTP listen host (recommended: 127.0.0.1)
