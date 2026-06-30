@@ -280,6 +280,18 @@ class RealSocket extends EventEmitter {
     return this.socket && !this.socket.destroyed && this.initialized;
   }
 
+  pause() {
+    if (this.socket && !this.socket.destroyed && typeof this.socket.pause === 'function') {
+      this.socket.pause();
+    }
+  }
+
+  resume() {
+    if (this.socket && !this.socket.destroyed && typeof this.socket.resume === 'function') {
+      this.socket.resume();
+    }
+  }
+
   destroy() {
     this.destroyed = true;
     this._stopWatchdog();

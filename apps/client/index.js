@@ -20,7 +20,8 @@ function parseArgs() {
     caCert: DEFAULT_CA,
     domains: [],
     preserveHost: false,
-    targetTimeout: 30000
+    targetTimeout: 30000,
+    targetKeepAliveTimeout: 60 * 60 * 1000
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -65,6 +66,15 @@ function parseArgs() {
         }
         options.targetTimeout = targetTimeout;
         break;
+      case '--target-keepalive-timeout':
+        const targetKeepAliveTimeoutValue = args[++i];
+        const targetKeepAliveTimeout = parseInt(targetKeepAliveTimeoutValue, 10);
+        if (isNaN(targetKeepAliveTimeout) || targetKeepAliveTimeout < 0) {
+          console.error(`Error: Invalid target keepalive timeout ${targetKeepAliveTimeoutValue}. Must be 0 or greater.`);
+          process.exit(1);
+        }
+        options.targetKeepAliveTimeout = targetKeepAliveTimeout;
+        break;
       case '--key':
         options.clientKey = args[++i];
         break;
@@ -91,6 +101,7 @@ Options:
   --server <host:port>    Tunnel server address (default: localhost:9443)
   --target <host:port>    Local target service (default: localhost:3000)
   --target-timeout <ms>   Target response/upgrade timeout; 0 disables (default: 30000)
+  --target-keepalive-timeout <ms> Target idle keep-alive timeout; 0 disables idle expiry (default: 3600000)
   --key <path>            Client private key (default: ${DEFAULT_KEY})
   --cert <path>           Client certificate (default: ${DEFAULT_CERT})
   --ca <path>             CA certificate to verify server (default: ${DEFAULT_CA})
@@ -113,6 +124,7 @@ function main() {
   console.log(`Server: ${config.serverHost}:${config.serverPort}`);
   console.log(`Target: ${config.targetHost}:${config.targetPort}`);
   console.log(`Target timeout: ${config.targetTimeout === 0 ? 'disabled' : `${config.targetTimeout}ms`}`);
+  console.log(`Target keep-alive timeout: ${config.targetKeepAliveTimeout === 0 ? 'disabled' : `${config.targetKeepAliveTimeout}ms`}`);
   console.log(`Multipath: ${process.env.MULTIPATH_ENABLED === 'true' ? 'enabled' : 'disabled (use --multipath to enable)'}`);
 
   let proxy = null;
@@ -125,7 +137,8 @@ function main() {
     console.log('Connected to TLS tunnel server (multipath ready)');
     proxy = createProxy(vs, config.targetPort, config.targetHost, vs.maxConcurrentStreams, {
       preserveHost: config.preserveHost,
-      targetTimeout: config.targetTimeout
+      targetTimeout: config.targetTimeout,
+      targetKeepAliveTimeout: config.targetKeepAliveTimeout
     });
   });
 
