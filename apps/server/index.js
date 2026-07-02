@@ -11,8 +11,8 @@ const DEFAULT_CERT = './.certs/server-cert.pem';
 const DEFAULT_CA = './.ca/ca-cert.pem';
 const DEFAULT_CA_DIR = './.ca';
 
-function parseArgs() {
-  const args = process.argv.slice(2);
+function parseArgs(argv) {
+  const args = argv || process.argv.slice(2);
   const options = {
     httpPort: 8080,
     tlsPort: 9443,
@@ -28,6 +28,7 @@ function parseArgs() {
     httpHeadersTimeout: (60 * 60 * 1000) + 5000,
     certBoundDomains: false,
     issuedDomainIndex: './.ca/issued-domains.json',
+    maxBodySize: undefined,
     httpHost: undefined
   };
 
@@ -89,6 +90,19 @@ function parseArgs() {
       case '--http-host':
         options.httpHost = args[++i];
         break;
+      case '--max-body-size':
+        const rawValue = args[++i];
+        if (!/^[0-9]+$/.test(rawValue)) {
+          console.error(`Error: Invalid max body size "${rawValue}". Must be a positive integer.`);
+          process.exit(1);
+        }
+        const maxBodySize = Number(rawValue);
+        if (!Number.isSafeInteger(maxBodySize) || maxBodySize < 1) {
+          console.error(`Error: Invalid max body size. Must be a positive safe integer.`);
+          process.exit(1);
+        }
+        options.maxBodySize = maxBodySize;
+        break;
       case '--help':
         console.log(`
 Usage: node index.js [options]
@@ -109,6 +123,7 @@ Options:
   --cert-bound-domains        Enable certificate-bound Host routing
   --issued-domain-index <p>   Issued domain index (default: ./.ca/issued-domains.json)
   --http-host <host>          HTTP listen host (recommended: 127.0.0.1)
+  --max-body-size <bytes>     Max HTTP request body size in bytes (default: 230686720, i.e. 220MB)
   --help                      Show this help
         `);
         process.exit(0);

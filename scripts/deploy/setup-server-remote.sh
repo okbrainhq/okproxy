@@ -392,7 +392,7 @@ Type=simple
 User=okproxy
 Group=okproxy
 WorkingDirectory=/opt/okproxy
-ExecStart=$NODE_PATH apps/server/index.js --http-port 8080 --tls-port 9443 $CERT_OPTS $SERVER_MODE_OPTS
+ExecStart=$NODE_PATH apps/server/index.js --http-port 8080 --tls-port 9443 --max-body-size 230686720 $CERT_OPTS $SERVER_MODE_OPTS
 Restart=always
 RestartSec=10
 Environment=NODE_ENV=production
@@ -442,6 +442,9 @@ EOF
     tls {
         on_demand
     }
+    request_body {
+        max_size 231MB
+    }
     reverse_proxy 127.0.0.1:8080
     header {
         X-Content-Type-Options nosniff
@@ -454,6 +457,9 @@ EOF
     else
         sudo tee /etc/caddy/Caddyfile > /dev/null <<EOF
 $HOSTNAME {
+    request_body {
+        max_size 231MB
+    }
     reverse_proxy 127.0.0.1:8080
     header {
         X-Content-Type-Options nosniff
