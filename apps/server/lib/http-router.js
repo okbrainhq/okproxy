@@ -5,7 +5,7 @@ const { createServer } = require('node:http');
 const { encodeFrame, FrameType, MAX_FRAME_SIZE } = require('../../../packages/frame-protocol');
 
 const STREAM_TIMEOUT = 30000;
-const DEFAULT_MAX_BODY_SIZE = 10 * 1024 * 1024;
+const DEFAULT_MAX_BODY_SIZE = 220 * 1024 * 1024;
 const MAX_WS_BUFFER_SIZE = 16 * 1024 * 1024;
 const DEFAULT_HTTP_KEEPALIVE_TIMEOUT = 60 * 60 * 1000;
 const HTTP_HEADERS_TIMEOUT_BUFFER = 5000;
