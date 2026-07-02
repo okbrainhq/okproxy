@@ -115,7 +115,7 @@ Options:
   --ca <path>                 CA certificate for client verification (default: ${DEFAULT_CA})
   --ca-dir <path>             CA directory for revocation checks (default: ${DEFAULT_CA_DIR})
   --max-streams <n>           Max concurrent streams per client (default: 100)
-  --stream-timeout <ms>       Stream inactivity timeout (default: 30000)
+  --stream-timeout <ms>       Stream inactivity timeout (default: 300000, i.e. 5 minutes)
   --keepalive-interval <ms>   PING interval (default: 10000)
   --keepalive-timeout <ms>    PONG timeout (default: 25000)
   --http-keepalive-timeout <ms> HTTP keep-alive timeout for Caddy/browser side (default: 3600000)
