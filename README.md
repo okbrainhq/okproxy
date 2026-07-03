@@ -401,7 +401,7 @@ OKPROXY_NODE_PATH=/path/to/node ./setup-client-remote.sh ...
 --ca <path>                 CA certificate
 --ca-dir <path>             CA directory
 --max-streams <n>           Max concurrent streams (default: 100)
---stream-timeout <ms>       Stream inactivity timeout (default: 30000)
+--stream-timeout <ms>       Stream inactivity timeout (default: 300000, i.e. 5 minutes)
 --keepalive-interval <ms>   PING interval (default: 10000)
 --keepalive-timeout <ms>    PONG timeout (default: 25000)
 --http-keepalive-timeout <ms> HTTP keep-alive timeout for Caddy/browser side (default: 3600000)

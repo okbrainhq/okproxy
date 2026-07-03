@@ -338,8 +338,32 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
       });
     }
 
+    let streamTimer = null;
+
+    function scheduleStreamTimeout(isReset) {
+      if (streamTimer) clearTimeout(streamTimer);
+      streamTimer = setTimeout(() => {
+        console.error(`[504] Stream timeout${isReset ? ' (reset)' : ''} for ${req.method} ${req.url} (stream ${streamId}, client ${clientIp})`);
+        timing.mark('stream_timeout');
+        timing.log('stream_timeout');
+        selectedPool.send(encodeFrame(streamId, FrameType.ERROR, Buffer.from('Stream timeout')));
+        cleanup();
+        if (!res.writableEnded) {
+          res.statusCode = 504;
+          res.end('Gateway timeout');
+        }
+      }, streamTimeout);
+    }
+
+    function resetStreamTimeout() {
+      scheduleStreamTimeout(true);
+    }
+
+    scheduleStreamTimeout(false);
+
     req.on('data', (chunk) => {
       if (cleanedUp) return;
+      resetStreamTimeout();
 
       bodySize += chunk.length;
       if (bodySize > maxBodySize) {
@@ -375,7 +399,10 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
     });
 
     req.on('end', () => {
-      if (!cleanedUp) selectedPool.send(encodeFrame(streamId, FrameType.FIN, Buffer.alloc(0)));
+      if (!cleanedUp) {
+        resetStreamTimeout();
+        selectedPool.send(encodeFrame(streamId, FrameType.FIN, Buffer.alloc(0)));
+      }
     });
 
     req.on('error', (err) => {
@@ -383,33 +410,6 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
       timing.log('request_error');
       cleanup();
     });
-
-    let streamTimer = setTimeout(() => {
-      console.error(`[504] Stream timeout for ${req.method} ${req.url} (stream ${streamId}, client ${clientIp})`);
-      timing.mark('stream_timeout');
-      timing.log('stream_timeout');
-      selectedPool.send(encodeFrame(streamId, FrameType.ERROR, Buffer.from('Stream timeout')));
-      cleanup();
-      if (!res.writableEnded) {
-        res.statusCode = 504;
-        res.end('Gateway timeout');
-      }
-    }, streamTimeout);
-
-    function resetStreamTimeout() {
-      clearTimeout(streamTimer);
-      streamTimer = setTimeout(() => {
-        console.error(`[504] Stream timeout (reset) for ${req.method} ${req.url} (stream ${streamId}, client ${clientIp})`);
-        timing.mark('stream_timeout');
-        timing.log('stream_timeout');
-        selectedPool.send(encodeFrame(streamId, FrameType.ERROR, Buffer.from('Stream timeout')));
-        cleanup();
-        if (!res.writableEnded) {
-          res.statusCode = 504;
-          res.end('Gateway timeout');
-        }
-      }, streamTimeout);
-    }
 
     function cleanup() {
       if (cleanedUp) return;
