@@ -4,6 +4,13 @@ const { describe, it } = require('node:test');
 const assert = require('node:assert');
 const { parseArgs } = require('../../apps/server/index.js');
 
+describe('parseArgs defaults', () => {
+  it('should default stream timeout to 5 minutes', () => {
+    const opts = parseArgs([]);
+    assert.strictEqual(opts.streamTimeout, 300000);
+  });
+});
+
 describe('parseArgs --max-body-size', () => {
   it('should default maxBodySize to undefined', () => {
     const opts = parseArgs([]);

@@ -392,7 +392,7 @@ Type=simple
 User=okproxy
 Group=okproxy
 WorkingDirectory=/opt/okproxy
-ExecStart=$NODE_PATH apps/server/index.js --http-port 8080 --tls-port 9443 --max-body-size 230686720 $CERT_OPTS $SERVER_MODE_OPTS
+ExecStart=$NODE_PATH apps/server/index.js --http-port 8080 --tls-port 9443 --max-body-size 230686720 --stream-timeout 300000 $CERT_OPTS $SERVER_MODE_OPTS
 Restart=always
 RestartSec=10
 Environment=NODE_ENV=production

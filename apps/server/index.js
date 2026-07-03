@@ -21,7 +21,7 @@ function parseArgs(argv) {
     caCert: DEFAULT_CA,
     caDir: DEFAULT_CA_DIR,
     maxConcurrentStreams: 100,
-    streamTimeout: 30000,
+    streamTimeout: 300000,
     keepaliveInterval: 10000,
     keepaliveTimeout: 25000,
     httpKeepAliveTimeout: 60 * 60 * 1000,
