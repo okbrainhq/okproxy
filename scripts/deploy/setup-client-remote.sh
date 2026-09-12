@@ -48,8 +48,8 @@ if [ -z "$CERT_DIR" ]; then
     else
         CERT_DIR="$HOME/.okproxy/certs/$SAFE_CLIENT_NAME"
     fi
-elif [[ "$CERT_DIR" == ~/* ]]; then
-    CERT_DIR="$HOME/${CERT_DIR#~/}"
+elif [[ "$CERT_DIR" == '~/'* ]]; then
+    CERT_DIR="$HOME/${CERT_DIR#\~/}"
 fi
 if [ "$SAFE_CLIENT_NAME" = "default" ]; then
     LOG_DIR="$HOME/.okproxy/logs"

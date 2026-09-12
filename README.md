@@ -304,9 +304,20 @@ When a valid client connects, okproxy reads the domains from the client certific
 
 Server ports: `80` HTTP redirect, `443` public HTTPS via Caddy, `9443` TLS tunnel.
 
-## Client Deployment (macOS)
+## Client Deployment
 
-The client deploy script copies `setup-client-remote.sh` to the Mac, installs/uses Node.js, clones the repo to `~/okproxy`, uploads the selected client certs, and creates a LaunchAgent with `--multipath` plus `--parallel-sockets ${PARALLEL_SOCKETS:-4}` enabled.
+`scripts/deploy/setup-client.sh` is platform aware. It detects the target OS (`uname -s`) and runs the matching remote installer:
+
+| Target | Remote script | Service manager |
+|--------|---------------|-----------------|
+| macOS | `setup-client-remote.sh` | LaunchAgent `com.okproxy.client[.<name>]` |
+| Linux (Debian/Ubuntu) | `setup-client-remote-ubuntu.sh` | systemd unit `okproxy-client[-<name>]` |
+
+Both installers use Node.js (20+, installed to `~/.local` when the host has no suitable system Node.js), clone/update the repo to `~/okproxy`, verify the client certs, and start the client with `--multipath` plus `--parallel-sockets ${PARALLEL_SOCKETS:-4}`.
+
+Pass `--local` to run the installer on the current machine instead of over SSH, and `--platform darwin|linux` to skip platform detection.
+
+### macOS
 
 Create `.deploy.client` from `.deploy.client.example`:
 
@@ -394,6 +405,64 @@ If you need a custom Node binary on the Mac:
 ```bash
 OKPROXY_NODE_PATH=/path/to/node ./setup-client-remote.sh ...
 ```
+
+### Ubuntu / Debian (systemd)
+
+`setup-client.sh` detects Linux and uses `setup-client-remote-ubuntu.sh`, so the same `.deploy.client` works for both platforms. Use `--local` when the client host is the machine you are running from (no SSH/SCP needed):
+
+```bash
+# Deploy on this host, reusing certs already present in the cert dir
+./scripts/deploy/setup-client.sh --local \
+  --client-name blog \
+  --cert-dir ~/.okproxy/certs/blog
+
+# Deploy over SSH to an Ubuntu host (first run uploads the certs)
+./scripts/deploy/setup-client.sh ubuntu@10.0.0.5 --upload-certs \
+  --client-name blog \
+  --cert-dir ./.certs/blog
+```
+
+The Linux installer can also be run directly on the host, which is what the deploy script does over SSH:
+
+```bash
+./scripts/deploy/setup-client-remote-ubuntu.sh <SERVER_HOST> <TARGET_HOST> <REPO_URL> [CLIENT_NAME] [CERT_DIR] [PARALLEL_SOCKETS] [options]
+```
+
+Options:
+
+```text
+--app-dir <path>       Repo/app directory on the host (default: $HOME/okproxy)
+--branch <name>        Branch to deploy (default: main)
+--node-path <path>     Use this Node.js binary instead of auto-detecting one
+--service-user <user>  Run the system service as this user (default: current user)
+--system               Force a system-wide unit in /etc/systemd/system (needs root/sudo)
+--user                 Force a per-user unit in ~/.config/systemd/user
+--no-multipath         Single-connection mode instead of multipath
+--no-start             Install the unit without enabling/starting it
+```
+
+What the installer does:
+
+1. Uses a system Node.js 20+ when present, otherwise installs the latest Node.js LTS into `~/.local` (SHA256-verified official tarball for `linux-x64`/`linux-arm64`).
+2. Clones the repo into `$HOME/okproxy` (override with `--app-dir`), or hard-updates it to `origin/<branch>` when it already exists.
+3. Verifies `client-cert.pem`, `client-key.pem` and `ca-cert.pem` in the cert directory (`~/.okproxy/certs/<CLIENT_NAME>`, or `~/.okproxy/certs` for `default`) and tightens key permissions to `600`.
+4. Writes a systemd unit with `Restart=always`, `RestartSec=5`, `NoNewPrivileges`, `ProtectSystem=full`, and appends logs to `~/.okproxy/logs/<CLIENT_NAME>/client.log` and `client-error.log`. It installs a system-wide unit when root or passwordless `sudo` is available, otherwise a `systemctl --user` unit plus `loginctl enable-linger`.
+5. Enables and starts the unit, then waits up to 30 s for `Connected to TLS tunnel server` in the client log.
+
+Manage the service on the host:
+
+```bash
+systemctl status okproxy-client            # or okproxy-client-<name>
+sudo systemctl restart okproxy-client-blog
+sudo systemctl stop okproxy-client-blog
+tail -f ~/.okproxy/logs/blog/client.log        # client output
+tail -f ~/.okproxy/logs/blog/client-error.log  # client errors
+sudo journalctl -u okproxy-client-blog -f      # service lifecycle (start/stop/restarts)
+```
+
+The unit label and log directory mirror the macOS LaunchAgent layout, so both platforms stay consistent. To use a specific Node.js binary, set `OKPROXY_NODE_PATH=/path/to/node` before running the installer or pass `--node-path`.
+
+📖 Full runbook for the Linux service — unit definition, certificate lifecycle (restart-to-apply), health-check recipes, troubleshooting table, verification record and uninstall: [`.design/12-client-ubuntu-systemd-service.md`](.design/12-client-ubuntu-systemd-service.md).
 
 ## Server Options
 
