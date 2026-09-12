@@ -184,12 +184,12 @@ function issueClientCertificate(outputDir, caDir = DEFAULT_CA_DIR, options = {})
     { stdio: 'pipe' }
   );
 
-  // Sign certificate with CA (valid for 90 days), adding clientAuth and optional SAN domains.
+  // Sign certificate with CA (valid for 365 days / 1 year), adding clientAuth and optional SAN domains.
   const tempCAFile = createTempCAFile(caDir);
   try {
     execFileSync(
       'openssl',
-      ['x509', '-req', '-in', clientCsrPath, '-CA', tempCAFile, '-out', clientCertPath, '-days', '90', '-set_serial', String(serial), '-extfile', tempConfig, '-extensions', 'client_ext'],
+      ['x509', '-req', '-in', clientCsrPath, '-CA', tempCAFile, '-out', clientCertPath, '-days', '365', '-set_serial', String(serial), '-extfile', tempConfig, '-extensions', 'client_ext'],
       { stdio: 'pipe' }
     );
   } finally {
