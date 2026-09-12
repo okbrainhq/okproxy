@@ -179,7 +179,7 @@ Client domains are stored in `.ca/issued-domains.json`. In cert-bound mode, Cadd
 |-------------|----------|-------|
 | CA | 10 years | Sign client/server certs |
 | Server | 1 year | TLS server authentication |
-| Client | 90 days | TLS client authentication |
+| Client | 1 year | TLS client authentication |
 
 ### Directory Layout
 

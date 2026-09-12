@@ -147,13 +147,15 @@ esac
 
 # Fetch latest LTS version from official Node.js releases JSON
 # Filter for entries where "lts" is a string (not false) and extract version
-LTS_DATA=$(curl -fsSL https://nodejs.org/dist/index.json 2>/dev/null | head -c 10000 || echo "")
+LTS_DATA=$(curl -fsSL https://nodejs.org/dist/index.json 2>/dev/null || echo "")
 
 if [ -n "$LTS_DATA" ]; then
     # Find first entry with "lts":"codename" (not "lts":false)
     # Extract the version from the first LTS entry
-    TARGET_VERSION=$(echo "$LTS_DATA" | grep -oE '\{"version":"v[0-9]+\.[^}]*"lts":"[^"]+"[^}]*\}' | head -1 | grep -oE '"version":"v[0-9]+' | grep -oE 'v[0-9]+')
-    TARGET_MAJOR=$(echo "$TARGET_VERSION" | grep -oE '[0-9]+')
+    # Split entries on '}' and take the first chunk that contains a string "lts" (entries contain nested objects).
+    # '|| true' prevents 'set -e' from aborting the whole script if the JSON shape changes or no LTS entry is found.
+    TARGET_VERSION=$(echo "$LTS_DATA" | tr '}' '\n' | grep '"lts":"' | head -1 | sed -E 's/.*"version":"(v[0-9]+)\..*/\1/' || true)
+    TARGET_MAJOR=$(echo "$TARGET_VERSION" | grep -oE '[0-9]+' || true)
 
     if [ -n "$TARGET_MAJOR" ]; then
         TARGET_NODE_VERSION="v${TARGET_MAJOR}"
