@@ -32,3 +32,11 @@ CLIENT_CERT_DIR=./.certs/client-1
 
 # Optional: custom SSH port (default: 22)
 # SSH_PORT=2222
+
+# Notes
+# -----
+# The deploy script detects the target OS (uname -s) and picks the installer:
+#   macOS               -> LaunchAgent (com.okproxy.client[.<name>])
+#   Linux (Debian/Ubuntu) -> systemd unit (okproxy-client[.<name>])
+# Use --local to install on the machine you are running from:
+#   ./scripts/deploy/setup-client.sh --local --client-name client-1
