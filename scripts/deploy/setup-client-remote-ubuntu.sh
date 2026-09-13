@@ -18,6 +18,52 @@
 
 set -eo pipefail
 
+# ------------------------------------------------------------ pure helpers
+# Unit-file serialization helpers. Kept pure so tests can source this file with
+# OKPROXY_DEPLOY_SOURCE_ONLY=1 and assert on escaping without installing.
+systemd_escape_arg() {
+    # Serialize one ExecStart argument (systemd quoting): wrap the token in
+    # double quotes, escape backslash/quote, double % (specifiers) and $ (which
+    # otherwise triggers systemd variable expansion).
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//%/%%}"
+    s="${s//'$'/'$$'}"
+    printf '"%s"' "$s"
+}
+
+systemd_escape_value() {
+    # Escape a free-form single-line unit value (Description=, User=, ...).
+    local s="$1"
+    s="${s//$'\n'/ }"
+    s="${s//$'\r'/ }"
+    s="${s//%/%%}"
+    printf '%s' "$s"
+}
+
+systemd_escape_path() {
+    # Escape a path used in a unit directive. Quote it when it contains
+    # whitespace or a double quote; always double %.
+    local s="$1"
+    s="${s//$'\n'/}"
+    s="${s//%/%%}"
+    case "$s" in
+        *[[:space:]\"]*)
+            s="${s//\\/\\\\}"
+            s="${s//\"/\\\"}"
+            printf '"%s"' "$s"
+            ;;
+        *)
+            printf '%s' "$s"
+            ;;
+    esac
+}
+
+if [ "${OKPROXY_DEPLOY_SOURCE_ONLY:-0}" = "1" ]; then
+    return 0
+fi
+
 usage() {
     sed -n '3,17p' "$0" | sed 's/^# \{0,1\}//'
 }
@@ -292,8 +338,11 @@ echo "Using Node.js at: $NODE_BIN ($("$NODE_BIN" -v))"
 mkdir -p "$CERT_DIR" "$LOG_DIR"
 
 # ----------------------------------------------------------------- repository
+# Record the revision being replaced so a failed restart can restore it.
+PREV_CODE_REV=""
 if [ -d "$APP_DIR/.git" ]; then
-    echo "Updating repository in $APP_DIR..."
+    PREV_CODE_REV="$(git -C "$APP_DIR" rev-parse HEAD 2>/dev/null || true)"
+    echo "Updating repository in $APP_DIR (current revision: ${PREV_CODE_REV:-unknown})..."
     git -C "$APP_DIR" fetch --quiet origin
     git -C "$APP_DIR" reset --hard --quiet "origin/$BRANCH"
     echo "Repository updated to origin/$BRANCH."
@@ -330,44 +379,64 @@ chmod 644 "$CLIENT_CERT" "$CA_CERT"
 echo "Certificates verified at $CERT_DIR"
 
 # ------------------------------------------------------------ systemd unit
+# Build the ExecStart token by token with systemd quoting so that paths,
+# hostnames or cert directories containing spaces/metacharacters cannot break
+# the unit or inject directives.
+CLIENT_EXEC_START="$(systemd_escape_arg "$NODE_BIN") $(systemd_escape_arg "$CLIENT_DIR/index.js")"
 if [ "$MULTIPATH" = true ]; then
-    MULTIPATH_ARG="--multipath"
-else
-    MULTIPATH_ARG=""
+    CLIENT_EXEC_START="$CLIENT_EXEC_START --multipath"
+fi
+CLIENT_EXEC_START="$CLIENT_EXEC_START --server $(systemd_escape_arg "$SERVER_HOSTNAME:$SERVER_PORT") --target $(systemd_escape_arg "$TARGET_HOSTNAME:$TARGET_PORT") --parallel-sockets $(systemd_escape_arg "$PARALLEL_SOCKETS") --cert $(systemd_escape_arg "$CLIENT_CERT") --key $(systemd_escape_arg "$CLIENT_KEY") --ca $(systemd_escape_arg "$CA_CERT")"
+
+UNIT_WANTED_BY="default.target"
+if [ "$SERVICE_SCOPE" = "system" ]; then
+    UNIT_WANTED_BY="multi-user.target"
 fi
 
-UNIT_TMP=$(mktemp)
-cat > "$UNIT_TMP" <<EOF
+render_client_unit() {
+    cat <<EOF
 [Unit]
-Description=okproxy tunnel client (${SAFE_CLIENT_NAME}) -> ${SERVER_HOSTNAME}:${SERVER_PORT}
+Description=$(systemd_escape_value "okproxy tunnel client (${SAFE_CLIENT_NAME}) -> ${SERVER_HOSTNAME}:${SERVER_PORT}")
 Documentation=https://github.com/okbrainhq/okproxy
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-User=${SERVICE_USER}
-WorkingDirectory=${CLIENT_DIR}
-ExecStart=${NODE_BIN} ${CLIENT_DIR}/index.js ${MULTIPATH_ARG} --server ${SERVER_HOSTNAME}:${SERVER_PORT} --target ${TARGET_HOSTNAME}:${TARGET_PORT} --parallel-sockets ${PARALLEL_SOCKETS} --cert ${CLIENT_CERT} --key ${CLIENT_KEY} --ca ${CA_CERT}
+User=$(systemd_escape_value "$SERVICE_USER")
+WorkingDirectory=$(systemd_escape_path "$CLIENT_DIR")
+ExecStart=$CLIENT_EXEC_START
 Restart=always
 RestartSec=5
 TimeoutStopSec=20
 KillSignal=SIGTERM
-StandardOutput=append:${LOG_DIR}/client.log
-StandardError=append:${LOG_DIR}/client-error.log
+StandardOutput=append:$(systemd_escape_path "$LOG_DIR/client.log")
+StandardError=append:$(systemd_escape_path "$LOG_DIR/client-error.log")
 Environment=NODE_ENV=production
-Environment=OKPROXY_PARALLEL_SOCKETS=${PARALLEL_SOCKETS}
-Environment=MULTIPATH_ENABLED=${MULTIPATH}
+Environment=OKPROXY_PARALLEL_SOCKETS=$(systemd_escape_value "$PARALLEL_SOCKETS")
+Environment=MULTIPATH_ENABLED=$(systemd_escape_value "$MULTIPATH")
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectKernelTunables=true
+ReadWritePaths=$(systemd_escape_path "$CERT_DIR") $(systemd_escape_path "$LOG_DIR") $(systemd_escape_path "$CLIENT_DIR")
 
 [Install]
-WantedBy=$([ "$SERVICE_SCOPE" = "system" ] && echo "multi-user.target" || echo "default.target")
+WantedBy=$UNIT_WANTED_BY
 EOF
+}
+
+UNIT_TMP=$(mktemp)
+render_client_unit > "$UNIT_TMP"
 
 echo "Installing systemd unit at $UNIT_PATH..."
+# Back up an existing unit so a failed redeploy can be rolled back.
+UNIT_BACKUP=""
+if [ -f "$UNIT_PATH" ]; then
+    UNIT_BACKUP="${UNIT_PATH}.okproxy-backup"
+    $SUDO cp -p "$UNIT_PATH" "$UNIT_BACKUP"
+    echo "Previous unit backed up to $UNIT_BACKUP"
+fi
 if [ "$SERVICE_SCOPE" = "system" ]; then
     $SUDO install -m 644 "$UNIT_TMP" "$UNIT_PATH"
     $SUDO systemctl daemon-reload
@@ -379,36 +448,113 @@ fi
 rm -f "$UNIT_TMP"
 
 # --------------------------------------------------------------- start/enable
-ACTIVE=false
-if [ "$START_SERVICE" = true ]; then
-    echo "Enabling and starting ${SERVICE_NAME}..."
-    if [ "$SERVICE_SCOPE" = "system" ]; then
-        $SUDO systemctl enable --now "$SERVICE_NAME"
-    else
-        systemctl --user enable --now "$SERVICE_NAME"
-        if command -v loginctl >/dev/null 2>&1; then
-            $SUDO loginctl enable-linger "$SERVICE_USER" 2>/dev/null \
-                || loginctl enable-linger "$SERVICE_USER" 2>/dev/null \
-                || true
+LOG_FILE="$LOG_DIR/client.log"
+
+if [ "$SERVICE_SCOPE" = "system" ]; then
+    SYSTEMCTL="$SUDO systemctl"
+else
+    SYSTEMCTL="systemctl --user"
+fi
+
+# Readiness poll budget (seconds). Overridable so deployment tests can run the
+# failure/rollback path quickly.
+READINESS_ATTEMPTS="${OKPROXY_READINESS_ATTEMPTS:-30}"
+
+# Restore the previous release (code revision + unit file) after a failed
+# deploy. Used for both an immediate restart failure and a readiness timeout.
+rollback_release() {
+    local reason="$1"
+    echo "Error: $reason"
+    echo "  unit: $SERVICE_NAME (scope: $SERVICE_SCOPE)"
+    echo "  active process: $($SYSTEMCTL is-active "$SERVICE_NAME" 2>/dev/null || true)"
+    echo "  invocation now: ${NEW_INVOCATION:-<none>} (before restart: ${PREV_INVOCATION:-<none>})"
+
+    if [ -n "${PREV_CODE_REV:-}" ] && [ -d "$APP_DIR/.git" ]; then
+        if [ "$(git -C "$APP_DIR" rev-parse HEAD 2>/dev/null || true)" != "$PREV_CODE_REV" ]; then
+            echo "Restoring previous code revision $PREV_CODE_REV..."
+            git -C "$APP_DIR" reset --hard --quiet "$PREV_CODE_REV" \
+                || echo "  warning: could not restore code revision $PREV_CODE_REV"
         fi
     fi
-    sleep 3
+
+    if [ -n "${UNIT_BACKUP:-}" ] && [ -f "$UNIT_BACKUP" ]; then
+        echo "Restoring previous unit from $UNIT_BACKUP..."
+        $SUDO install -m 644 "$UNIT_BACKUP" "$UNIT_PATH" || true
+        $SYSTEMCTL daemon-reload 2>/dev/null || true
+        $SYSTEMCTL restart "$SERVICE_NAME" || true
+    else
+        echo "No previous unit to restore; stopping and disabling the failed unit."
+        $SYSTEMCTL stop "$SERVICE_NAME" || true
+        $SYSTEMCTL disable "$SERVICE_NAME" >/dev/null 2>&1 || true
+    fi
+
+    echo "Last log lines:"
+    [ -f "$LOG_FILE" ] && tail -n 20 "$LOG_FILE" || true
+    [ -s "$LOG_DIR/client-error.log" ] && tail -n 20 "$LOG_DIR/client-error.log" || true
+    exit 1
+}
+
+if [ "$START_SERVICE" = true ]; then
+    echo "Enabling and starting ${SERVICE_NAME}..."
+    $SYSTEMCTL enable "$SERVICE_NAME" >/dev/null 2>&1 || true
+    if [ "$SERVICE_SCOPE" = "user" ] && command -v loginctl >/dev/null 2>&1; then
+        $SUDO loginctl enable-linger "$SERVICE_USER" 2>/dev/null \
+            || loginctl enable-linger "$SERVICE_USER" 2>/dev/null \
+            || true
+    fi
+
+    # Record the pre-restart state. A redeploy must produce a *new* invocation
+    # and *new* log output; a historical "Connected to TLS tunnel server" line
+    # from a previous run must never satisfy the readiness check.
+    PREV_INVOCATION="$($SYSTEMCTL show -p InvocationID --value "$SERVICE_NAME" 2>/dev/null || true)"
+    LOG_OFFSET=0
+    if [ -f "$LOG_FILE" ]; then
+        LOG_OFFSET=$(stat -c %s "$LOG_FILE" 2>/dev/null || echo 0)
+    fi
+
+    # Explicit restart, never `enable --now` (which leaves an already-running
+    # unit untouched). The restart result is checked explicitly so a failure
+    # cannot bypass rollback via `set -e`.
+    RESTART_OK=true
+    if ! $SYSTEMCTL restart "$SERVICE_NAME"; then
+        RESTART_OK=false
+    fi
+
+    if [ "$RESTART_OK" != true ]; then
+        rollback_release "${SERVICE_NAME} failed to restart"
+    fi
 
     # Log files are created by systemd (root); hand them to the service user
     if [ "$SERVICE_SCOPE" = "system" ] && [ -n "$SUDO" ]; then
         $SUDO chown -R "$SERVICE_USER" "$LOG_DIR" 2>/dev/null || true
     fi
 
-    if [ "$SERVICE_SCOPE" = "system" ]; then
-        systemctl is-active --quiet "$SERVICE_NAME" && ACTIVE=true
-    else
-        systemctl --user is-active --quiet "$SERVICE_NAME" && ACTIVE=true
-    fi
+    echo "Waiting for the restarted service to become healthy (up to ${READINESS_ATTEMPTS}s)..."
+    READY=false
+    NEW_INVOCATION=""
+    for _ in $(seq 1 "$READINESS_ATTEMPTS"); do
+        ACTIVE=false
+        $SYSTEMCTL is-active --quiet "$SERVICE_NAME" && ACTIVE=true
+        NEW_INVOCATION="$($SYSTEMCTL show -p InvocationID --value "$SERVICE_NAME" 2>/dev/null || true)"
+        NEW_LOG=""
+        if [ -f "$LOG_FILE" ]; then
+            NEW_LOG="$(tail -c +$((LOG_OFFSET + 1)) "$LOG_FILE" 2>/dev/null || true)"
+        fi
+        if [ "$ACTIVE" = true ] && [ -n "$NEW_INVOCATION" ] && [ "$NEW_INVOCATION" != "$PREV_INVOCATION" ]; then
+            case "$NEW_LOG" in
+                *"Connected to TLS tunnel server"*) READY=true ;;
+            esac
+        fi
+        if [ "$READY" = true ]; then
+            break
+        fi
+        sleep 1
+    done
 
-    if [ "$ACTIVE" = true ]; then
-        echo "Service is active."
+    if [ "$READY" = true ]; then
+        echo "Service is active with a new invocation ($NEW_INVOCATION) and logged a fresh tunnel connection."
     else
-        echo "Warning: service is not active yet. Recent log output:"
+        rollback_release "${SERVICE_NAME} did not become healthy within ${READINESS_ATTEMPTS}s of the restart"
     fi
 else
     echo "Skipping start (--no-start). Enable later with:"
@@ -417,20 +563,6 @@ else
     else
         echo "  systemctl --user enable --now $SERVICE_NAME"
     fi
-fi
-
-# ------------------------------------------------------------- health check
-LOG_FILE="$LOG_DIR/client.log"
-CONNECTED=false
-if [ "$START_SERVICE" = true ]; then
-    echo "Waiting for the tunnel to connect (up to 30s)..."
-    for _ in $(seq 1 30); do
-        if [ -f "$LOG_FILE" ] && grep -q "Connected to TLS tunnel server" "$LOG_FILE"; then
-            CONNECTED=true
-            break
-        fi
-        sleep 1
-    done
 fi
 
 echo ""
@@ -445,11 +577,6 @@ if [ -s "$LOG_DIR/client-error.log" ]; then
 fi
 
 echo ""
-if [ "$START_SERVICE" = true ] && [ "$CONNECTED" != true ]; then
-    echo "Setup finished, but no successful tunnel connection was logged yet."
-    echo "The client retries automatically; check logs if it stays disconnected."
-fi
-
 echo "Setup completed."
 echo ""
 echo "Management commands:"

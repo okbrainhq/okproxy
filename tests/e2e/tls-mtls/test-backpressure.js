@@ -3,6 +3,7 @@
 const { describe, it } = require('node:test');
 const assert = require('node:assert');
 const { createTestEnv } = require('./setup');
+const { memorySnapshot, startPeakSampler, mb } = require('./memory-utils');
 
 describe('Backpressure', () => {
   it('should not have unbounded memory growth under slow target', async () => {
@@ -15,7 +16,10 @@ describe('Backpressure', () => {
       
       const { request } = require('node:http');
       
-      const startMem = process.memoryUsage().heapUsed;
+      // Measure peak RSS and native buffer usage, not just a heap delta: frames
+      // are relayed through Buffers, so arrayBuffers/external grow first.
+      const before = memorySnapshot();
+      const sampler = startPeakSampler(20);
       
       await new Promise((resolve, reject) => {
         const req = request({
@@ -32,11 +36,17 @@ describe('Backpressure', () => {
         req.end();
       });
       
-      const endMem = process.memoryUsage().heapUsed;
-      const memIncrease = endMem - startMem;
-      
-      // Should not grow by more than 10MB during test
-      assert.ok(memIncrease < 10 * 1024 * 1024, 'Memory should not grow unbounded');
+      const peak = sampler.stop();
+      const rssGrowth = peak.peakRss - before.rss;
+      const nativeGrowth = peak.peakArrayBuffers - before.arrayBuffers;
+      const heapGrowth = peak.peakHeapUsed - before.heapUsed;
+
+      // Should not grow by more than 32MB RSS / 16MB native buffers during test.
+      assert.ok(rssGrowth < 32 * 1024 * 1024,
+        `RSS should not grow unbounded (grew ${mb(rssGrowth)}, sampled ${peak.samples}x)`);
+      assert.ok(nativeGrowth < 16 * 1024 * 1024,
+        `native buffers should not grow unbounded (grew ${mb(nativeGrowth)})`);
+      assert.ok(heapGrowth < 10 * 1024 * 1024, 'Memory should not grow unbounded');
     } finally {
       await env.cleanup();
     }

@@ -113,6 +113,12 @@ if ! [[ "$PARALLEL_SOCKETS" =~ ^[0-9]+$ ]] || [ "$PARALLEL_SOCKETS" -lt 1 ] || [
     exit 1
 fi
 
+# Sanitize the client name before using it in remote paths.
+SAFE_CLIENT_NAME=$(printf '%s' "$CLIENT_NAME" | tr -c 'A-Za-z0-9_.-' '-')
+if [ -z "$SAFE_CLIENT_NAME" ]; then
+    SAFE_CLIENT_NAME="default"
+fi
+
 # Build SSH/SCP port options
 SSH_OPTS=""
 SCP_OPTS=""
@@ -183,12 +189,42 @@ fi
 
 # 2. Resolve the remote cert directory
 if [ -z "$REMOTE_CERT_DIR" ]; then
-    if [ "$CLIENT_NAME" = "default" ]; then
+    if [ "$SAFE_CLIENT_NAME" = "default" ]; then
         REMOTE_CERT_DIR="~/.okproxy/certs"
     else
-        REMOTE_CERT_DIR="~/.okproxy/certs/$CLIENT_NAME"
+        REMOTE_CERT_DIR="~/.okproxy/certs/$SAFE_CLIENT_NAME"
     fi
 fi
+
+# Resolve a leading ~ to a concrete path. This matters over SSH: a quoted
+# remote argument cannot rely on the remote shell expanding a tilde, and
+# passing a literal ~ would silently create a relative "./~" directory.
+case "$REMOTE_CERT_DIR" in
+    '~')
+        if [ "$LOCAL" = true ]; then
+            REMOTE_CERT_DIR="$HOME"
+        else
+            REMOTE_HOME=$(ssh $SSH_OPTS "$HOST" 'printf %s "$HOME"')
+            if [ -z "$REMOTE_HOME" ]; then
+                echo "Error: could not resolve the home directory on $HOST."
+                exit 1
+            fi
+            REMOTE_CERT_DIR="$REMOTE_HOME"
+        fi
+        ;;
+    '~/'*)
+        if [ "$LOCAL" = true ]; then
+            REMOTE_CERT_DIR="$HOME/${REMOTE_CERT_DIR#\~/}"
+        else
+            REMOTE_HOME=$(ssh $SSH_OPTS "$HOST" 'printf %s "$HOME"')
+            if [ -z "$REMOTE_HOME" ]; then
+                echo "Error: could not resolve the home directory on $HOST."
+                exit 1
+            fi
+            REMOTE_CERT_DIR="$REMOTE_HOME/${REMOTE_CERT_DIR#\~/}"
+        fi
+        ;;
+esac
 
 # 3. Upload certificates if requested
 if [ "$UPLOAD_CERTS" = true ]; then
@@ -228,11 +264,12 @@ if [ "$UPLOAD_CERTS" = true ]; then
         chmod 644 "$LOCAL_CERT_DIR/client-cert.pem" "$LOCAL_CERT_DIR/ca-cert.pem"
     else
         echo "Uploading certificates to remote machine..."
-        ssh $SSH_OPTS "$HOST" "mkdir -p $REMOTE_CERT_DIR"
+        REMOTE_CERT_DIR_Q=$(printf '%q' "$REMOTE_CERT_DIR")
+        ssh $SSH_OPTS "$HOST" "mkdir -p $REMOTE_CERT_DIR_Q"
         scp $SCP_OPTS "$CLIENT_CERT_DIR/client-cert.pem" "$HOST:$REMOTE_CERT_DIR/"
         scp $SCP_OPTS "$CLIENT_CERT_DIR/client-key.pem" "$HOST:$REMOTE_CERT_DIR/"
         scp $SCP_OPTS "$CLIENT_CERT_DIR/ca-cert.pem" "$HOST:$REMOTE_CERT_DIR/"
-        ssh $SSH_OPTS "$HOST" "chmod 600 $REMOTE_CERT_DIR/client-key.pem && chmod 644 $REMOTE_CERT_DIR/client-cert.pem $REMOTE_CERT_DIR/ca-cert.pem"
+        ssh $SSH_OPTS "$HOST" "chmod 600 $REMOTE_CERT_DIR_Q/client-key.pem && chmod 644 $REMOTE_CERT_DIR_Q/client-cert.pem $REMOTE_CERT_DIR_Q/ca-cert.pem"
         echo "Certificates uploaded successfully to $REMOTE_CERT_DIR"
     fi
 fi
@@ -243,25 +280,25 @@ echo "Executing setup script on ${HOST:-this machine}..."
 ESCAPED_SERVER_HOST=$(printf '%q' "$SERVER_HOST")
 ESCAPED_TARGET_HOST=$(printf '%q' "$TARGET_HOST")
 ESCAPED_REPO_URL=$(printf '%q' "$REPO_URL")
-ESCAPED_CLIENT_NAME=$(printf '%q' "$CLIENT_NAME")
+ESCAPED_CLIENT_NAME=$(printf '%q' "$SAFE_CLIENT_NAME")
 ESCAPED_REMOTE_CERT_DIR=$(printf '%q' "$REMOTE_CERT_DIR")
 ESCAPED_PARALLEL_SOCKETS=$(printf '%q' "$PARALLEL_SOCKETS")
 
 if [ "$LOCAL" = true ]; then
     chmod +x "$SCRIPT_DIR/$REMOTE_SCRIPT"
-    "$SCRIPT_DIR/$REMOTE_SCRIPT" "$SERVER_HOST" "$TARGET_HOST" "$REPO_URL" "$CLIENT_NAME" "$REMOTE_CERT_DIR" "$PARALLEL_SOCKETS"
+    "$SCRIPT_DIR/$REMOTE_SCRIPT" "$SERVER_HOST" "$TARGET_HOST" "$REPO_URL" "$SAFE_CLIENT_NAME" "$REMOTE_CERT_DIR" "$PARALLEL_SOCKETS"
 else
     ssh $SSH_OPTS "$HOST" "chmod +x ~/$(basename "$REMOTE_SCRIPT") && ~/$(basename "$REMOTE_SCRIPT") $ESCAPED_SERVER_HOST $ESCAPED_TARGET_HOST $ESCAPED_REPO_URL $ESCAPED_CLIENT_NAME $ESCAPED_REMOTE_CERT_DIR $ESCAPED_PARALLEL_SOCKETS"
 fi
 
 # 5. Print the platform-specific management commands
 if [ "$PLATFORM" = "darwin" ]; then
-    if [ "$CLIENT_NAME" = "default" ]; then
+    if [ "$SAFE_CLIENT_NAME" = "default" ]; then
         LAUNCH_LABEL="com.okproxy.client"
         CLIENT_LOG_PATH="~/.okproxy/logs/client.log"
     else
-        LAUNCH_LABEL="com.okproxy.client.$CLIENT_NAME"
-        CLIENT_LOG_PATH="~/.okproxy/logs/$CLIENT_NAME/client.log"
+        LAUNCH_LABEL="com.okproxy.client.$SAFE_CLIENT_NAME"
+        CLIENT_LOG_PATH="~/.okproxy/logs/$SAFE_CLIENT_NAME/client.log"
     fi
 
     echo ""
@@ -279,12 +316,12 @@ if [ "$PLATFORM" = "darwin" ]; then
         echo "To view logs: ssh $HOST 'tail -f $CLIENT_LOG_PATH'"
     fi
 else
-    if [ "$CLIENT_NAME" = "default" ]; then
+    if [ "$SAFE_CLIENT_NAME" = "default" ]; then
         SERVICE_NAME="okproxy-client"
         CLIENT_LOG_PATH="~/.okproxy/logs/client.log"
     else
-        SERVICE_NAME="okproxy-client-$CLIENT_NAME"
-        CLIENT_LOG_PATH="~/.okproxy/logs/$CLIENT_NAME/client.log"
+        SERVICE_NAME="okproxy-client-$SAFE_CLIENT_NAME"
+        CLIENT_LOG_PATH="~/.okproxy/logs/$SAFE_CLIENT_NAME/client.log"
     fi
 
     echo ""

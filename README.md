@@ -190,7 +190,7 @@ Client domains are stored in `.ca/issued-domains.json`. In cert-bound mode, Cadd
 
 ## Server Deployment (Debian/Ubuntu)
 
-The server deploy script copies `setup-server-remote.sh` to your VM, installs Node.js + Caddy, configures `okproxy.service` as `User=okproxy`, opens ports `80`, `443`, and `9443`, and hardens the box with Fail2Ban/UFW.
+The server deploy script copies `setup-server-remote.sh` to your VM, installs Node.js + Caddy, configures `okproxy.service` as `User=okproxy`, opens ports `80`, `443`, `9443` and the configured SSH management port, and hardens the box with Fail2Ban/UFW.
 
 ### 1. Prepare Production CA + Certs Locally
 
@@ -229,6 +229,32 @@ The server deploy uploads only the server TLS files and public CA metadata it ne
 ```
 
 It does **not** upload `.ca/ca-key.pem`.
+
+On the server the trust material is stored **outside the git checkout**, in
+`/var/lib/okproxy/certs` (server key/cert) and `/var/lib/okproxy/ca` (CA cert,
+`issued-domains.json`, `crl.txt`), so a clone/update can never delete it. If a
+host still has the legacy in-checkout layout (`/opt/okproxy/certs`,
+`/opt/okproxy/ca`, `/opt/okproxy/.certs`, `/opt/okproxy/.ca`), the next deploy
+copies the **coherent set that the running service used** (the historically
+active `certs`+`ca` first) into `/var/lib/okproxy` after cryptographic
+validation; partial or mismatched layouts abort instead of guessing, and partial
+material already in `/var/lib/okproxy` is never overwritten. An existing CA is
+never regenerated — if the server pair is missing or incomplete it is re-issued
+from the existing CA (which requires `ca-key.pem` on the host). A new CA is only
+created when both trust directories are genuinely empty (hidden files included);
+any partial state (CA key only, records only, missing `ca-cert.pem`, orphan leaf
+key, …) aborts and preserves the files.
+
+The UFW rules open the SSH management port configured in `.deploy.server`
+(`SSH_PORT`) or verified from the live listener + `sshd` configuration. UFW is
+only enabled when the port could be verified, no `deny`/`reject` rule exists at
+all, and every management port has an exact `allow` rule. Mutations are ordered
+safely: existing rules are read and validated first, allowances are added and
+verified before any restrictive default is applied, and the firewall is enabled
+last — so an already-active default-allow firewall is never locked out by a
+partially-applied deploy. If the port cannot be determined, or any deny/reject
+rule is present, the deploy stops before changing anything (with instructions)
+instead of assuming port 22.
 
 ### 2. Configure `.deploy.server`
 
@@ -285,13 +311,13 @@ In cert-bound mode the service runs with the issued-domain index:
 
 ```bash
 apps/server/index.js --http-port 8080 --tls-port 9443 \
-  --key /opt/okproxy/certs/server-key.pem \
-  --cert /opt/okproxy/certs/server-cert.pem \
-  --ca /opt/okproxy/certs/ca-cert.pem \
-  --ca-dir /opt/okproxy/ca \
+  --key /var/lib/okproxy/certs/server-key.pem \
+  --cert /var/lib/okproxy/certs/server-cert.pem \
+  --ca /var/lib/okproxy/ca/ca-cert.pem \
+  --ca-dir /var/lib/okproxy/ca \
   --cert-bound-domains \
   --http-host 127.0.0.1 \
-  --issued-domain-index /opt/okproxy/ca/issued-domains.json
+  --issued-domain-index /var/lib/okproxy/ca/issued-domains.json
 ```
 
 Caddy is configured for on-demand HTTPS and asks okproxy before issuing a cert:
@@ -574,15 +600,35 @@ packages/
     dedup-window.js         # Sliding window deduplication
 scripts/deploy/             # Server & client deployment scripts
 tests/e2e/tls-mtls/         # E2E test suite
+tests/unit/                 # CLI argument parsing unit tests
+tests/deploy/               # Mocked/disposable deployment validation
+docs/deployment-fixes.md    # Deployment audit fixes and limitations
 ```
 
 ## Tests
 
 ```bash
-npm run test                 # Core test suite
+npm test                     # Core suite (includes CLI unit + gzip suites)
 npm run test:all             # Full suite including SSE timeout tests
+npm run test:unit            # CLI arg-parsing unit tests only
+npm run test:gzip            # Standalone content-encoding suite only
+npm run test:deploy          # Mocked deployment validation (no host changes)
 node --test tests/e2e/tls-mtls/test-multipath.js   # just multipath
 ```
+
+Notes and prerequisites:
+
+- Node.js >= 20 and `openssl` on `PATH` (e2e setup generates a throwaway CA).
+- The standalone gzip suite binds the fixed ports `19443` and `18080`. A busy
+  port, bind error, non-zero exit or missing success marker is a **failure** (no
+  silent coverage loss); set `OKPROXY_ALLOW_GZIP_SKIP=1` only if you intend to
+  skip that suite.
+- `npm run test:all` takes several minutes because `test-sse-timeout.js` holds
+  connections open for ~2 minutes by design.
+- `npm run test:deploy` runs the deploy scripts inside throwaway sandboxes with
+  mock `ssh`/`scp`/`sudo`/`systemctl`/`launchctl`/`ss`/`sshd`/`ufw`. It never
+  installs a service, changes a firewall, contacts a remote host or opens any
+  SSH/SCP/rsync connection. It requires `git` and `openssl` on `PATH`.
 
 ## License
 

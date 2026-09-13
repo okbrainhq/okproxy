@@ -83,6 +83,18 @@ if [ -z "$BRANCH" ]; then
     exit 1
 fi
 
+if [ -n "$SSH_PORT" ]; then
+    if ! [[ "$SSH_PORT" =~ ^[0-9]+$ ]] || [ "$SSH_PORT" -lt 1 ] || [ "$SSH_PORT" -gt 65535 ]; then
+        echo "Error: SSH_PORT must be a port number between 1 and 65535 (got: $SSH_PORT)"
+        exit 1
+    fi
+fi
+
+if [ "$CERT_BOUND_DOMAINS" != true ] && [ "$CERT_BOUND_DOMAINS" != false ]; then
+    echo "Error: CERT_BOUND_DOMAINS must be true or false (got: $CERT_BOUND_DOMAINS)"
+    exit 1
+fi
+
 # If no host provided, check if DEPLOY_HOST is set in .deploy.server
 if [ -z "$HOST" ] && [ -n "$DEPLOY_HOST" ]; then
     HOST="$DEPLOY_HOST"
@@ -115,8 +127,11 @@ echo "Copying setup-server-remote.sh..."
 scp $SCP_OPTS "$SCRIPT_DIR/setup-server-remote.sh" "$HOST:~/setup-server-remote.sh"
 
 # 2. Upload certificates if requested (do this FIRST so they exist when service starts)
-CERT_DIR="/opt/okproxy/certs"
-CA_DIR="/opt/okproxy/ca"
+# Trust material is stored outside the replaceable git checkout so a first-time
+# clone/update can never delete uploaded keys or the CA.
+DATA_DIR="/var/lib/okproxy"
+CERT_DIR="$DATA_DIR/certs"
+CA_DIR="$DATA_DIR/ca"
 if [ "$UPLOAD_CERTS" = true ]; then
     echo "Validating and uploading certificates..."
     
@@ -151,8 +166,10 @@ if [ "$UPLOAD_CERTS" = true ]; then
     echo "Local certificates validated."
     echo "Uploading certificates to remote server..."
     
-    # Create remote cert directory with secure permissions FIRST
-    ssh $SSH_OPTS "$HOST" "sudo mkdir -p $CERT_DIR $CA_DIR && sudo chown -R \$USER:\$USER /opt/okproxy && sudo chmod 700 $CERT_DIR $CA_DIR"
+    # Create remote cert directory with secure permissions FIRST.
+    # Only the okproxy data directory is touched; the parent tree is never
+    # chowned recursively.
+    ssh $SSH_OPTS "$HOST" "sudo mkdir -p '$CERT_DIR' '$CA_DIR' && sudo chown -R \"\$(id -un)\" '$DATA_DIR' && sudo chmod 700 '$CERT_DIR' '$CA_DIR'"
 
     # Upload certificates using scp
     scp $SCP_OPTS "$PROJECT_ROOT/.certs/server-cert.pem" "$HOST:$CERT_DIR/"
@@ -168,19 +185,29 @@ if [ "$UPLOAD_CERTS" = true ]; then
 
     # Fix ownership and permissions (directory already restricted, just fix files)
     echo "Fixing certificate ownership and permissions..."
-    ssh $SSH_OPTS "$HOST" "sudo chown -R \"\$SUDO_USER:\$SUDO_USER\" $CERT_DIR $CA_DIR 2>/dev/null || sudo chown -R \"\$USER:\$USER\" $CERT_DIR $CA_DIR"
-    ssh $SSH_OPTS "$HOST" "sudo chmod 600 $CERT_DIR/server-key.pem && sudo chmod 644 $CERT_DIR/server-cert.pem $CERT_DIR/ca-cert.pem && sudo chmod -R go-rwx $CA_DIR"
+    ssh $SSH_OPTS "$HOST" "sudo chown -R \"\$(id -un)\" '$CERT_DIR' '$CA_DIR'"
+    ssh $SSH_OPTS "$HOST" "sudo chmod 600 '$CERT_DIR/server-key.pem' && sudo chmod 644 '$CERT_DIR/server-cert.pem' '$CERT_DIR/ca-cert.pem' && sudo chmod -R go-rwx '$CA_DIR'"
 
     echo "Certificates uploaded successfully to $CERT_DIR"
 fi
 
 # 3. Execute setup script remotely (this handles git clone/update and service start)
 echo "Executing setup script on remote host..."
-# Use printf %q to properly escape arguments to prevent shell injection
+# Escape every argument with printf %q before interpolating it into the remote
+# command string, so a hostile HOSTNAME/REPO_URL/BRANCH/SSH_PORT cannot inject
+# shell syntax on the server. Each argument is passed as its own token.
 ESCAPED_HOSTNAME=$(printf '%q' "$HOSTNAME")
 ESCAPED_REPO_URL=$(printf '%q' "$REPO_URL")
 ESCAPED_BRANCH=$(printf '%q' "$BRANCH")
-ESCAPED_CERT_BOUND_DOMAINS=$(printf '%q' "$CERT_BOUND_DOMAINS")
-ssh $SSH_OPTS "$HOST" "chmod +x ~/setup-server-remote.sh && sudo ~/setup-server-remote.sh $ESCAPED_HOSTNAME $ESCAPED_REPO_URL --branch=$ESCAPED_BRANCH --cert-bound-domains=$ESCAPED_CERT_BOUND_DOMAINS"
+# Pass the boolean as a single `--flag=value` token: a detached
+# `--cert-bound-domains false` is parsed as `true` by the remote script (and
+# shifts its positionals), silently turning a classic deployment into a
+# cert-bound one.
+CERT_BOUND_ARG=$(printf '%q' "--cert-bound-domains=$CERT_BOUND_DOMAINS")
+SSH_PORT_ARG=""
+if [ -n "$SSH_PORT" ]; then
+    SSH_PORT_ARG="--ssh-port $(printf '%q' "$SSH_PORT")"
+fi
+ssh $SSH_OPTS "$HOST" "chmod +x ~/setup-server-remote.sh && sudo ~/setup-server-remote.sh $ESCAPED_HOSTNAME $ESCAPED_REPO_URL --branch $ESCAPED_BRANCH $CERT_BOUND_ARG $SSH_PORT_ARG"
 
 echo "Remote setup completed successfully!"

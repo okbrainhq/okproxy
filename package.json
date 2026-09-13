@@ -7,7 +7,11 @@
     "server": "node apps/server/index.js",
     "client": "node apps/client/index.js",
     "test": "node tests/e2e/tls-mtls/run.js",
-    "test:all": "node tests/e2e/tls-mtls/run-all.js"
+    "test:all": "node tests/e2e/tls-mtls/run-all.js",
+    "test:unit": "node --test tests/unit/test-parse-args.js",
+    "test:gzip": "node tests/e2e/tls-mtls/test-gzip.js",
+    "test:deploy": "node tests/deploy/run.js",
+    "test:deploy:unit": "node --test tests/deploy/"
   },
   "bin": {
     "ca": "apps/server/bin/tunnel-ca.js"
