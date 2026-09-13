@@ -54,6 +54,45 @@ cd macos-client
 ```
 
 The build script generates bundled `.icns` app icons for dev/prod and self-signs the app.
+`run.sh` uses plain `open` (not `open -n`) so an already-running copy is
+activated instead of duplicated; the app additionally holds an exclusive
+`flock` on `<state-dir>/app.lock`, so a second copy exits and activates the
+first rather than sharing config/logs.
+
+## Robustness notes
+
+- `ProcessSupervisor` owns a persistent direct-child `OkProxyProcessHelper`.
+  The helper retains its workload leader unreaped through final descendant group
+  signaling. Swift signaling/reaping share a synchronous lock; timeout/error keeps
+  ownership and start gates held rather than reporting success. The build script
+  bundles/signs the helper next to the app executable. See documented containment
+  limits: escaped groups and externally killed helpers are not fully recoverable.
+- Log output is decoded incrementally (UTF-8 scalars split across reads), the
+  output buffer, in-memory history and per-write payloads are bounded with
+  explicit overflow markers, at most one delivery is in flight, and all log file
+  I/O runs off the main thread. Pipe chunks use synchronous bounded append, not
+  an unbounded queue of captured-string closures.
+- Node.js installs verify the official `SHASUMS256.txt` checksum (fails closed),
+  validate the staged binary before swapping, keep the previous install until the
+  activated copy validates, and recover an interrupted transaction on the next
+  startup before probes/autostart, using persistent transaction phases.
+- Setup and start/stop transactions share one exclusion gate, so repo/Node work
+  cannot race a running client and nothing new starts while the app is quitting.
+- Server/target accept `host:port` and bracketed IPv6 (`[::1]:9443`); update
+  checks compare full semantic versions (major/minor/patch).
+
+See `../docs/macos-fixes.md` for details, limitations and Mac validation steps.
+
+## Tests
+
+```bash
+python3 ./tests/critical-invariants.py # Linux: production C helper + offline installer fixtures
+./tests/macos-robustness-checks.sh   # source checks, plist XML, bash -n, embedded scripts
+./tests/macos-behavior-checks.sh     # executes the install script + build lock against fixtures
+python3 ./tests/reviewer3-swift-checks.py # extracted Swift regressions; skips without swiftc
+./scripts/test.sh                    # Swift build + focused regressions (requires macOS/Swift)
+```
+
 
 ## Client command generated
 
