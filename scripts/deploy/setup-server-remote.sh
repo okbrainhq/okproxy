@@ -9,14 +9,24 @@
 # Trust material (server key/cert + CA) is stored in /var/lib/okproxy, outside
 # the /opt/okproxy git checkout, and is migrated automatically from the legacy
 # in-checkout layout on first run.
+#
+# The *active* trust set is referenced through one symlink
+# ($TRUST_ROOT/current -> releases/<id>). Uploads are staged and validated
+# outside the active directories and activated by swapping that single symlink
+# with one atomic rename, so an interrupted upload can never leave a new
+# certificate next to an old key. See docs/deployment-fixes.md.
 
-set -eo pipefail
+set -Eeo pipefail
 
 # Parse flags
 DEV_MODE=false
 CERT_BOUND_DOMAINS=true
 BRANCH="main"
 SSH_PORT="${SSH_PORT:-}"
+TRUST_RELEASE_ACTION=""
+TRUST_RELEASE_ID=""
+DEPLOY_TRUST_RELEASE=""
+PREV_TRUST_POINTER=""
 POSITIONAL=()
 
 while [ $# -gt 0 ]; do
@@ -81,6 +91,40 @@ while [ $# -gt 0 ]; do
             BRANCH="$2"
             shift 2
             ;;
+        --deploy-trust-release=*)
+            DEPLOY_TRUST_RELEASE="${1#*=}"
+            case "$DEPLOY_TRUST_RELEASE" in
+                ''|.|..|*[!A-Za-z0-9._-]*) echo "Error: invalid deployment release id"; exit 1 ;;
+            esac
+            shift
+            ;;
+        --trust-release-validate=*)
+            TRUST_RELEASE_ACTION="validate"
+            TRUST_RELEASE_ID="${1#--trust-release-validate=}"
+            shift
+            ;;
+        --trust-release-activate=*)
+            TRUST_RELEASE_ACTION="activate"
+            TRUST_RELEASE_ID="${1#--trust-release-activate=}"
+            shift
+            ;;
+        --trust-release-discard=*)
+            TRUST_RELEASE_ACTION="discard"
+            TRUST_RELEASE_ID="${1#--trust-release-discard=}"
+            shift
+            ;;
+        --previous-trust-release=*)
+            # Trust release that was active *before* this deployment. Passed by
+            # the uploader so a failed startup can restore it (rollback).
+            PREV_TRUST_POINTER="${1#--previous-trust-release=}"
+            case "$PREV_TRUST_POINTER" in
+                *..*)
+                    echo "Error: --previous-trust-release must not contain '..' (got: $PREV_TRUST_POINTER)"
+                    exit 1
+                    ;;
+            esac
+            shift
+            ;;
         --*)
             # Unknown flag
             shift
@@ -108,9 +152,28 @@ APP_DIR="/opt/okproxy"
 # may clone or hard-reset. Certificates and the CA index are irreplaceable
 # trust material, so they live under DATA_DIR and are never touched by
 # checkout operations. Legacy in-checkout locations are migrated once.
-DATA_DIR="/var/lib/okproxy"
-CERT_DIR="$DATA_DIR/certs"
-CA_DIR="$DATA_DIR/ca"
+#
+# The active trust set is a *release directory* referenced through a single
+# symlink ($TRUST_ROOT/current -> releases/<id>). Every activated release is
+# kept forever under $TRUST_ROOT/releases, so the previous complete set can
+# always be restored by repointing that one symlink. Uploads are staged in
+# $TRUST_ROOT/staging outside the active directories and validated before they
+# can ever become active (see the trust release helpers below).
+DATA_DIR="${OKPROXY_DATA_DIR:-/var/lib/okproxy}"
+TRUST_ROOT="${OKPROXY_TRUST_ROOT:-$DATA_DIR}"
+
+trust_layout_init() {
+    # Derive every trust path from TRUST_ROOT. Kept as a function so the whole
+    # layout can be pointed at a sandbox with a single variable in tests.
+    TRUST_ACTIVE_LINK="$TRUST_ROOT/current"
+    TRUST_RELEASES_DIR="$TRUST_ROOT/releases"
+    TRUST_STAGING_DIR="$TRUST_ROOT/staging"
+    TRUST_PREVIOUS_POINTER_FILE="$TRUST_ROOT/previous-release"
+    CERT_DIR="$TRUST_ACTIVE_LINK/certs"
+    CA_DIR="$TRUST_ACTIVE_LINK/ca"
+}
+
+trust_layout_init
 
 # ------------------------------------------------------------ pure helpers
 # These helpers are unit-tested by tests/deploy. Sourcing this file with
@@ -504,6 +567,435 @@ ensure_server_trust_set() {
     echo "Trust material ready in $DATA_DIR."
 }
 
+# ------------------------------------------------- trust release layout helpers
+# The active trust material is one release directory referenced through one
+# symlink ($TRUST_ROOT/current). Why:
+#   * uploads are staged and validated outside the active directories;
+#   * activation is a single rename of that symlink, so the active set flips
+#     from one complete release to another complete release with no window in
+#     which a new certificate can sit next to an old key;
+#   * every activated release stays under $TRUST_ROOT/releases, so a failure can
+#     always be rolled back by repointing the symlink.
+trust_release_ready() {
+    # $1 = directory holding certs/ and ca/ plus a READY marker.
+    local dir="$1"
+    [ -f "$dir/READY" ] || return 1
+    [ -f "$dir/certs/server-cert.pem" ] || return 1
+    [ -f "$dir/certs/server-key.pem" ] || return 1
+    [ -f "$dir/ca/ca-cert.pem" ] || return 1
+    return 0
+}
+
+trust_release_coherent() {
+    # $1 = release directory: complete *and* cryptographically coherent.
+    local dir="$1"
+    trust_release_ready "$dir" || return 1
+    server_pair_is_coherent "$dir/certs" "$dir/ca" || return 1
+    return 0
+}
+
+validate_staged_trust_release() {
+    # $1 = release id.
+    # Validates a staged upload *before* anything can touch the active layout,
+    # then promotes it into the persistent release directory. A truncated or
+    # incoherent set never gets a READY marker, so activate_trust_release() can
+    # never pick it up.
+    local id="$1"
+    if [ -z "$id" ]; then
+        echo "Error: --trust-release-validate requires a release id"
+        return 1
+    fi
+    local staging="$TRUST_STAGING_DIR/$id"
+    local release="$TRUST_RELEASES_DIR/$id"
+    local f
+    if [ ! -d "$staging" ]; then
+        echo "Error: no staged trust release at $staging"
+        return 1
+    fi
+    for f in certs/server-cert.pem certs/server-key.pem ca/ca-cert.pem; do
+        if [ ! -f "$staging/$f" ]; then
+            echo "Error: staged trust release $id is incomplete (missing $f)."
+            echo "The active trust material was not modified."
+            return 1
+        fi
+    done
+    # Restrict staging now. Service ownership/readability is established by
+    # prepare_deployment_trust inside the setup transaction before activation.
+    $AS_ROOT chmod 700 "$staging/certs" "$staging/ca" || return 1
+    $AS_ROOT chmod 600 "$staging/certs/server-key.pem" || return 1
+    $AS_ROOT chmod 644 "$staging/certs/server-cert.pem" "$staging/ca/ca-cert.pem" || return 1
+    if ! key_matches_cert "$staging/certs/server-key.pem" "$staging/certs/server-cert.pem"; then
+        echo "Error: staged server key does not match the staged server certificate."
+        echo "Refusing to activate an incoherent trust set (active material untouched)."
+        return 1
+    fi
+    if ! cert_signed_by_ca "$staging/certs/server-cert.pem" "$staging/ca/ca-cert.pem"; then
+        echo "Error: staged server certificate is not signed by the staged CA."
+        echo "Refusing to activate an incoherent trust set (active material untouched)."
+        return 1
+    fi
+    $AS_ROOT mkdir -p "$TRUST_RELEASES_DIR" || return 1
+    if [ -e "$release" ]; then
+        echo "Error: trust release $id already exists at $release"
+        return 1
+    fi
+    # READY is written last: it is what makes the release eligible for activation.
+    $AS_ROOT touch "$staging/READY" || return 1
+    if ! $AS_ROOT mv "$staging" "$release"; then
+        echo "Error: could not promote staged release $id to $release"
+        return 1
+    fi
+    echo "Trust release $id staged and validated: $release"
+    return 0
+}
+
+discard_staged_trust_release() {
+    # $1 = release id. Removes ONLY the staging directory of a failed upload;
+    # validated releases are never deleted (they are the rollback history).
+    local id="$1"
+    if [ -z "$id" ]; then
+        return 1
+    fi
+    local staging="$TRUST_STAGING_DIR/$id"
+    case "$staging" in
+        "$TRUST_STAGING_DIR"/*) ;;
+        *)
+            echo "Error: refusing to discard $staging"
+            return 1
+            ;;
+    esac
+    if [ -d "$staging" ]; then
+        echo "Discarding failed staged release $staging (active material untouched)."
+        $AS_ROOT rm -rf "$staging"
+    fi
+    return 0
+}
+
+trust_restore_pointer() {
+    # $1 = symlink target to restore (relative to $TRUST_ROOT, or absolute).
+    local target="$1" resolved tmp
+    if [ -z "$target" ]; then
+        return 1
+    fi
+    case "$target" in
+        /*) resolved="$target" ;;
+        *) resolved="$TRUST_ROOT/$target" ;;
+    esac
+    if [ ! -d "$resolved" ]; then
+        echo "Error: cannot restore trust pointer: $resolved does not exist"
+        return 1
+    fi
+    # mv -T of a freshly created symlink over the active one is a single rename.
+    tmp="$TRUST_ACTIVE_LINK.restore.$$"
+    $AS_ROOT ln -sfn "$target" "$tmp" || return 1
+    if ! $AS_ROOT mv -T "$tmp" "$TRUST_ACTIVE_LINK"; then
+        $AS_ROOT rm -f "$tmp"
+        return 1
+    fi
+    echo "Restored trust pointer: $TRUST_ACTIVE_LINK -> $target"
+    return 0
+}
+
+bootstrap_trust_release_layout() {
+    # Establish $TRUST_ACTIVE_LINK -> releases/<id> with one atomic rename.
+    # A pre-existing real $TRUST_ROOT/certs|ca layout (older deployments) is
+    # copied into the first release. Originals remain usable by old absolute-path units.
+    local dir copied=false
+    if [ -L "$TRUST_ACTIVE_LINK" ] && [ -d "$TRUST_ACTIVE_LINK/certs" ] && [ -d "$TRUST_ACTIVE_LINK/ca" ]; then
+        return 0
+    fi
+    if [ -e "$TRUST_ACTIVE_LINK" ] && [ ! -L "$TRUST_ACTIVE_LINK" ]; then
+        if [ -n "$(ls -A "$TRUST_ACTIVE_LINK" 2>/dev/null || true)" ]; then
+            echo "Error: $TRUST_ACTIVE_LINK is a real directory, not the trust release symlink."
+            echo "Move it aside (sudo mv \"$TRUST_ACTIVE_LINK\" \"$TRUST_ACTIVE_LINK.bak\") and re-run;"
+            echo "it is not deleted because it may hold trust material."
+            return 1
+        fi
+        $AS_ROOT rmdir "$TRUST_ACTIVE_LINK" || return 1
+    fi
+    local id="bootstrap-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+    local release="$TRUST_RELEASES_DIR/$id"
+    $AS_ROOT mkdir -p "$release/certs" "$release/ca" || return 1
+    for dir in certs ca; do
+        if [ -d "$TRUST_ROOT/$dir" ] && [ ! -L "$TRUST_ROOT/$dir" ]; then
+            echo "Adopting legacy trust directory $TRUST_ROOT/$dir into release $id..."
+            copied=true
+            $AS_ROOT cp -a "$TRUST_ROOT/$dir/." "$release/$dir/" || return 1
+        fi
+    done
+    if [ "$copied" = true ]; then
+        server_pair_is_coherent "$release/certs" "$release/ca" || return 1
+        for dir in certs ca; do
+            diff -qr "$TRUST_ROOT/$dir" "$release/$dir" >/dev/null || return 1
+        done
+        $AS_ROOT touch "$release/READY" || return 1
+    fi
+    $AS_ROOT ln -sfn "releases/$id" "$TRUST_ACTIVE_LINK.new.$$" || return 1
+    if ! $AS_ROOT mv -T "$TRUST_ACTIVE_LINK.new.$$" "$TRUST_ACTIVE_LINK"; then
+        $AS_ROOT rm -f "$TRUST_ACTIVE_LINK.new.$$"
+        echo "Error: could not create the trust release symlink at $TRUST_ACTIVE_LINK"
+        return 1
+    fi
+    if [ ! -d "$CERT_DIR" ] || [ ! -d "$CA_DIR" ]; then
+        echo "Error: $TRUST_ACTIVE_LINK does not resolve to a cert/CA directory pair."
+        return 1
+    fi
+    # Never move/delete legacy originals: rollback units still reference them.
+    echo "Trust release layout initialised: $TRUST_ACTIVE_LINK -> releases/$id"
+    return 0
+}
+
+activate_trust_release() {
+    # $1 = release id. Swaps the active trust pointer with a single atomic rename
+    # and restores the previous release if the new one does not validate.
+    local id="$1" previous release
+    if [ -z "$id" ]; then
+        echo "Error: --trust-release-activate requires a release id"
+        return 1
+    fi
+    release="$TRUST_RELEASES_DIR/$id"
+    bootstrap_trust_release_layout || return 1
+    if [ ! -d "$release" ]; then
+        echo "Error: unknown trust release $id ($release)"
+        return 1
+    fi
+    if ! trust_release_coherent "$release"; then
+        echo "Error: trust release $id is not a complete, coherent, validated set."
+        echo "Active trust material was not modified."
+        return 1
+    fi
+
+    previous="$PREV_TRUST_POINTER"
+    if [ -z "$previous" ] && [ -L "$TRUST_ACTIVE_LINK" ]; then
+        previous="$(readlink "$TRUST_ACTIVE_LINK" 2>/dev/null || true)"
+    fi
+    if [ -n "$previous" ]; then
+        printf '%s\n' "$previous" | $AS_ROOT tee "$TRUST_PREVIOUS_POINTER_FILE" >/dev/null || return 1
+    fi
+
+    local tmp="$TRUST_ACTIVE_LINK.new.$$"
+    $AS_ROOT ln -sfn "releases/$id" "$tmp" || return 1
+    if ! $AS_ROOT mv -T "$tmp" "$TRUST_ACTIVE_LINK"; then
+        $AS_ROOT rm -f "$tmp"
+        echo "Error: could not activate trust release $id; active material unchanged."
+        return 1
+    fi
+    echo "Activated trust release $id: $TRUST_ACTIVE_LINK -> releases/$id"
+
+    if ! server_pair_is_coherent "$CERT_DIR" "$CA_DIR"; then
+        echo "Error: the activated release does not form a coherent active set."
+        if [ -n "$previous" ] && trust_restore_pointer "$previous"; then
+            echo "Restored the previous trust release."
+        else
+            echo "Could not restore the previous release; inspect $TRUST_RELEASES_DIR manually."
+        fi
+        return 1
+    fi
+    return 0
+}
+
+# ------------------------------------------------- server release rollback
+# The unit is deployed through these functions so the previous complete state
+# (code revision, unit file, trust pointer) is captured before the restart
+# and restored if the server does not come up. Readiness is verified against
+# the *current* invocation and process-owned listeners — never against historical
+# log lines from a previous run.
+SERVER_SERVICE_NAME="okproxy"
+SERVER_UNIT_PATH="${OKPROXY_SERVER_UNIT_PATH:-/etc/systemd/system/okproxy.service}"
+SERVER_READINESS_ATTEMPTS="${OKPROXY_READINESS_ATTEMPTS:-30}"
+
+PREV_CODE_REV=""
+PREV_UNIT_BACKUP=""
+PREV_INVOCATION=""
+NEW_INVOCATION=""
+
+capture_previous_checkout_revision() {
+    # Configure this exact checkout before asking Git for HEAD; never guess a
+    # replacement revision after fetch/reset. Existing but unreadable fails closed.
+    PREV_CODE_REV=""
+    if [ -e "$APP_DIR/.git" ]; then
+        git config --global --add safe.directory "$APP_DIR" || return 1
+        PREV_CODE_REV="$(git -C "$APP_DIR" rev-parse --verify HEAD)" || return 1
+        [ -n "$PREV_CODE_REV" ] || return 1
+        echo "Current code revision: $PREV_CODE_REV"
+    fi
+    if [ -f "$SERVER_UNIT_PATH" ] && [ -z "$PREV_CODE_REV" ]; then
+        echo "Error: existing service has no known checkout revision; refusing update."
+        return 1
+    fi
+    CODE_STATE_CAPTURED=true
+}
+
+capture_server_release_state() {
+    [ "${CODE_STATE_CAPTURED:-false}" = true ] || return 1
+    PREV_UNIT_BACKUP=""
+    PREV_INVOCATION="$(sudo systemctl show -p InvocationID --value "$SERVER_SERVICE_NAME" 2>/dev/null || true)"
+    if [ -z "${PREV_TRUST_POINTER:-}" ] && [ -L "$TRUST_ACTIVE_LINK" ]; then
+        PREV_TRUST_POINTER="$(readlink "$TRUST_ACTIVE_LINK")" || return 1
+    fi
+    if [ -f "$SERVER_UNIT_PATH" ]; then
+        local backup
+        backup="$(mktemp "${SERVER_UNIT_PATH}.okproxy-backup.XXXXXX")" || return 1
+        sudo cp -p "$SERVER_UNIT_PATH" "$backup" || return 1
+        cmp -s "$SERVER_UNIT_PATH" "$backup" || return 1
+        PREV_UNIT_BACKUP="$backup"
+    fi
+}
+
+begin_server_transaction() {
+    [ "${SERVER_TRANSACTION:-false}" = true ] && return 0
+    [ "${CODE_STATE_CAPTURED:-false}" = true ] || capture_previous_checkout_revision || return 1
+    capture_server_release_state || return 1
+    SERVER_TRANSACTION=true
+    # EXIT catches explicit exit and errexit (including permission errors).
+    # Signals are translated to failure; rollback disables traps before restoring.
+    trap 'rollback_server_release "deployment interrupted or failed (exit $?)"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+    trap 'exit 129' HUP
+}
+
+complete_server_transaction() {
+    trap - EXIT INT TERM HUP
+    SERVER_TRANSACTION=false
+}
+
+initialize_server_trust_layout() {
+    bootstrap_trust_release_layout || return 1
+    if [ -z "$PREV_TRUST_POINTER" ]; then
+        PREV_TRUST_POINTER="$(readlink "$TRUST_ACTIVE_LINK")" || return 1
+    fi
+}
+
+prepare_deployment_trust() {
+    local release="$TRUST_RELEASES_DIR/$DEPLOY_TRUST_RELEASE"
+    trust_release_coherent "$release" || return 1
+    # Grant traversal/read access BEFORE publishing. Do not recursively chown
+    # the trust root: previous releases and legacy originals are rollback state.
+    sudo chown -R okproxy:okproxy "$release" || return 1
+    sudo chmod 755 "$TRUST_ROOT" "$TRUST_RELEASES_DIR" || return 1
+    sudo chmod 700 "$release" "$release/certs" "$release/ca" || return 1
+    sudo chmod 600 "$release/certs/server-key.pem" || return 1
+    sudo -u okproxy test -r "$release/certs/server-key.pem" || return 1
+    sudo -u okproxy test -r "$release/certs/server-cert.pem" || return 1
+    sudo -u okproxy test -r "$release/ca/ca-cert.pem" || return 1
+    activate_trust_release "$DEPLOY_TRUST_RELEASE" || return 1
+}
+
+server_listeners_ready() {
+    # No /health exists: routing returns 404/502 without clients. Require both
+    # local listeners owned by this service's current MainPID, not another app.
+    local pid listeners port
+    pid="$(sudo systemctl show -p MainPID --value "$SERVER_SERVICE_NAME")" || return 1
+    case "$pid" in ''|0|*[!0-9]*) return 1 ;; esac
+    listeners="$(sudo ss -ltnpH)" || return 1
+    for port in 8080 9443; do
+        printf '%s\n' "$listeners" | awk -v port="$port" -v pid="$pid" '
+            $4 ~ (":" port "$") && index($0, "pid=" pid ",") { found=1 }
+            END { exit !found }' || return 1
+    done
+}
+
+rollback_server_release() {
+    # Restore the previous code revision, trust pointer and unit file. Used
+    # for both an immediate restart failure and a readiness timeout.
+    trap - EXIT INT TERM HUP
+    set +e
+    SERVER_TRANSACTION=false
+    local reason="$1" current_pointer
+    echo "Error: $reason"
+    echo "  unit: $SERVER_SERVICE_NAME ($SERVER_UNIT_PATH)"
+    echo "  active process: $(sudo systemctl is-active "$SERVER_SERVICE_NAME" 2>/dev/null || true)"
+    echo "  invocation now: ${NEW_INVOCATION:-<none>} (before restart: ${PREV_INVOCATION:-<none>})"
+
+    if [ -n "${PREV_CODE_REV:-}" ] && [ -e "$APP_DIR/.git" ]; then
+        if [ "$(git -C "$APP_DIR" rev-parse HEAD 2>/dev/null || true)" != "$PREV_CODE_REV" ]; then
+            echo "Restoring previous code revision $PREV_CODE_REV..."
+            git -C "$APP_DIR" reset --hard --quiet "$PREV_CODE_REV" \
+                || echo "  warning: could not restore code revision $PREV_CODE_REV"
+        fi
+    fi
+
+    if [ -n "${PREV_TRUST_POINTER:-}" ]; then
+        current_pointer="$(readlink "$TRUST_ACTIVE_LINK" 2>/dev/null || true)"
+        if [ "$current_pointer" != "$PREV_TRUST_POINTER" ]; then
+            echo "Restoring trust pointer to $PREV_TRUST_POINTER..."
+            trust_restore_pointer "$PREV_TRUST_POINTER" \
+                || echo "  warning: could not restore the trust pointer $PREV_TRUST_POINTER"
+        fi
+    fi
+
+    if [ -n "${PREV_UNIT_BACKUP:-}" ] && [ -f "$PREV_UNIT_BACKUP" ]; then
+        echo "Restoring previous unit from $PREV_UNIT_BACKUP..."
+        if sudo install -m 644 "$PREV_UNIT_BACKUP" "$SERVER_UNIT_PATH" \
+            && sudo systemctl daemon-reload; then
+            sudo systemctl restart "$SERVER_SERVICE_NAME" \
+                || echo "  warning: restored unit could not restart; manual recovery required"
+        else
+            echo "  warning: unit restoration failed; manual recovery required (backup: $PREV_UNIT_BACKUP)"
+        fi
+    else
+        echo "No previous unit to restore; stopping and disabling the failed unit."
+        sudo systemctl stop "$SERVER_SERVICE_NAME" || true
+        sudo systemctl disable "$SERVER_SERVICE_NAME" >/dev/null 2>&1 || true
+        sudo rm -f "$SERVER_UNIT_PATH" || echo "  warning: could not remove failed new unit"
+        sudo systemctl daemon-reload || echo "  warning: rollback daemon-reload failed"
+    fi
+
+    echo "Last log lines:"
+    sudo journalctl -u "$SERVER_SERVICE_NAME" -n 20 --no-pager 2>/dev/null || true
+    exit 1
+}
+
+deploy_server_unit() {
+    begin_server_transaction || return 1
+    if [ -n "${PREV_CODE_REV:-}" ]; then
+        echo "Deploying unit (previous revision: $PREV_CODE_REV)"
+    fi
+
+    local unit_tmp
+    unit_tmp="$(mktemp)" || rollback_server_release "unit staging failed"
+    render_okproxy_unit > "$unit_tmp" || rollback_server_release "unit rendering failed"
+    sudo install -m 644 "$unit_tmp" "$SERVER_UNIT_PATH" || rollback_server_release "unit installation failed"
+    rm -f "$unit_tmp"
+
+    sudo systemctl daemon-reload || rollback_server_release "daemon-reload failed"
+    sudo systemctl enable "$SERVER_SERVICE_NAME" >/dev/null 2>&1 || rollback_server_release "unit enable failed"
+
+    # Explicit restart with an explicit result check: `enable --now` would
+    # leave an already-running unit untouched and `set -e` must not be able
+    # to skip the rollback.
+    local restart_ok=true
+    if ! sudo systemctl restart "$SERVER_SERVICE_NAME"; then
+        restart_ok=false
+    fi
+    if [ "$restart_ok" != true ]; then
+        rollback_server_release "$SERVER_SERVICE_NAME failed to restart"
+    fi
+
+    echo "Waiting for the restarted service to become healthy (up to ${SERVER_READINESS_ATTEMPTS}s)..."
+    local ready=false active
+    for _ in $(seq 1 "$SERVER_READINESS_ATTEMPTS"); do
+        active=false
+        sudo systemctl is-active --quiet "$SERVER_SERVICE_NAME" && active=true
+        NEW_INVOCATION="$(sudo systemctl show -p InvocationID --value "$SERVER_SERVICE_NAME" 2>/dev/null || true)"
+        if [ "$active" = true ] && [ -n "$NEW_INVOCATION" ] && [ "$NEW_INVOCATION" != "$PREV_INVOCATION" ] \
+            && server_listeners_ready \
+            && [ "$(sudo systemctl show -p InvocationID --value "$SERVER_SERVICE_NAME")" = "$NEW_INVOCATION" ]; then
+            ready=true
+        fi
+        if [ "$ready" = true ]; then
+            break
+        fi
+        sleep 1
+    done
+
+    if [ "$ready" = true ]; then
+        echo "Systemd service configured and healthy (invocation $NEW_INVOCATION)."
+    else
+        rollback_server_release "$SERVER_SERVICE_NAME did not become healthy within ${SERVER_READINESS_ATTEMPTS}s of the restart"
+    fi
+}
 # ------------------------------------------------------------ firewall helpers
 detect_management_ports() {
     # Print the SSH management port(s) that must stay reachable. Prefers an
@@ -655,6 +1147,28 @@ apply_firewall_rules() {
 
 if [ "${OKPROXY_DEPLOY_SOURCE_ONLY:-0}" = "1" ]; then
     return 0
+fi
+
+# ------------------------------------------------ trust release CLI actions
+# Used by the uploader (setup-server.sh) to stage/validate and atomically
+# activate an uploaded trust release without running the full setup.
+if [ -n "$TRUST_RELEASE_ACTION" ]; then
+    case "$TRUST_RELEASE_ID" in
+        ''|*[!A-Za-z0-9._-]*)
+            echo "Error: invalid trust release id: $TRUST_RELEASE_ID"
+            exit 1
+            ;;
+    esac
+    case "$TRUST_RELEASE_ACTION" in
+        validate) validate_staged_trust_release "$TRUST_RELEASE_ID" ;;
+        activate) activate_trust_release "$TRUST_RELEASE_ID" ;;
+        discard) discard_staged_trust_release "$TRUST_RELEASE_ID" ;;
+        *)
+            echo "Error: unknown trust release action: $TRUST_RELEASE_ACTION"
+            exit 1
+            ;;
+    esac
+    exit 0
 fi
 
 if [ "$DEV_MODE" = false ]; then
@@ -899,12 +1413,19 @@ if [ "$DEV_MODE" = false ]; then
         echo "Caddy is already installed: $(caddy version)"
     fi
 
-    # 5. Migrate legacy trust material, then clone or update the checkout
-    if [ -d "$APP_DIR/.git" ]; then
+    # 5. Migrate legacy trust material, establish the trust release layout, then
+    #    clone or update the checkout. The layout must exist before anything
+    #    creates directories under $DATA_DIR, otherwise a real directory would
+    #    shadow the release symlink.
+    begin_server_transaction
+    initialize_server_trust_layout
+    # Capture the revision being replaced before the checkout is modified so the
+    # step-7 unit deployment can roll back to it.
+    # Revision already captured by begin_server_transaction, before bootstrap.
+    if [ -e "$APP_DIR/.git" ]; then
         echo "App directory exists. Updating repository from branch $BRANCH..."
         # The app directory is owned by the okproxy service user after setup.
         # Since this script runs via sudo, Git may reject it as "dubious ownership".
-        git config --global --add safe.directory "$APP_DIR" 2>/dev/null || true
         cd "$APP_DIR"
         git fetch origin "+refs/heads/$BRANCH:refs/remotes/origin/$BRANCH"
         git checkout -B "$BRANCH" "origin/$BRANCH"
@@ -973,7 +1494,11 @@ if [ "$DEV_MODE" = false ]; then
     # invalidate every client certificate issued by the old one. If the server
     # pair is missing/incomplete it is re-issued from the existing CA, and any
     # incoherent or partial state fails closed.
-    ensure_server_trust_set
+    if [ -n "$DEPLOY_TRUST_RELEASE" ]; then
+        prepare_deployment_trust
+    else
+        ensure_server_trust_set
+    fi
 
     # The server always reads explicit paths; never rely on WorkingDirectory
     # defaults that point inside the checkout.
@@ -994,12 +1519,13 @@ if [ "$DEV_MODE" = false ]; then
     echo "Setting up systemd service..."
     # ReadWritePaths entries must exist; create the required ones explicitly.
     sudo mkdir -p "$CERT_DIR" "$CA_DIR"
-    render_okproxy_unit | sudo tee /etc/systemd/system/okproxy.service > /dev/null
 
-    sudo systemctl daemon-reload
-    sudo systemctl enable okproxy
-    sudo systemctl restart okproxy
-    echo "Systemd service configured and started."
+    # The unit is deployed through a guarded function: the previous code
+    # revision, unit file and trust pointer are captured first, the restart is
+    # checked explicitly and readiness is verified against the *current*
+    # invocation. Any immediate startup failure or readiness timeout restores
+    # the previous complete state instead of leaving a server that never came up.
+    deploy_server_unit
 
     # 8. Setup Caddyfile
     echo "Configuring Caddy for $HOSTNAME..."
@@ -1050,22 +1576,32 @@ EOF
     echo "Reloading Caddy..."
     sudo systemctl reload caddy
 
-    # 9. SSH Hardening
-    echo "Hardening SSH security..."
-    if [ -f /etc/ssh/sshd_config ]; then
-        sudo cp /etc/ssh/sshd_config /etc/ssh/sshd_config.bak
-        sudo sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication no/' /etc/ssh/sshd_config
-        sudo sed -i 's/^#\?ChallengeResponseAuthentication .*/ChallengeResponseAuthentication no/' /etc/ssh/sshd_config
-        sudo sed -i 's/^#\?PermitRootLogin .*/PermitRootLogin no/' /etc/ssh/sshd_config
-        echo "Validating SSH config..."
-        if sudo sshd -t; then
-            echo "Restarting SSH service..."
-            sudo systemctl restart ssh
-        else
-            echo "ERROR: SSH config is invalid. Restoring backup..."
-            sudo cp /etc/ssh/sshd_config.bak /etc/ssh/sshd_config
-        fi
-    fi
+    # 9. SSH authentication hardening: deliberately NOT automated
+    #
+    # This step used to disable PasswordAuthentication / ChallengeResponse and
+    # PermitRootLogin and then restart ssh unconditionally. On a host whose
+    # administrators only hold a password (or only log in as root) that turned a
+    # successful deployment into a permanent lockout, and it restarted the ssh
+    # daemon on the very session running the deploy. It is therefore opt-in and
+    # performed by the operator, from a second, already-verified session:
+    #
+    #   1. Verify key-based access from a *new* session first:
+    #        ssh -o PreferredAuthentications=publickey <user>@<host> true
+    #   2. Keep that session open and edit the config manually:
+    #        sudo cp -p /etc/ssh/sshd_config /etc/ssh/sshd_config.bak
+    #        ... PasswordAuthentication no / PermitRootLogin no ...
+    #        sudo sshd -t
+    #        sudo systemctl reload ssh      # reload, never a blind restart
+    #   3. Roll back with: sudo cp -p /etc/ssh/sshd_config.bak /etc/ssh/sshd_config
+    #
+    # The deployment performs no sshd_config change, no ssh restart and no live
+    # access verification of its own.
+    echo "Skipping automatic SSH hardening (manual opt-in only)."
+    echo "  Writing PasswordAuthentication/PermitRootLogin=no followed by an ssh"
+    echo "  restart can lock out every administrator on a password-only or"
+    echo "  root-only host, so this deployment never changes sshd_config or"
+    echo "  restarts ssh. See docs/deployment-fixes.md (SSH hardening, manual"
+    echo "  opt-in) and verify key access from a second session before enabling it."
 
     # 10. Install Fail2Ban
     echo "Installing Fail2Ban..."
@@ -1161,27 +1697,9 @@ EOF
         exit 1
     fi
     
-    # Check HTTP endpoint (with 5s timeout to prevent hanging)
-    HTTP_OK=false
-    for i in 1 2 3; do
-        if curl -sf --connect-timeout 5 --max-time 10 http://localhost:8080/ > /dev/null 2>&1 || curl -sf --connect-timeout 5 --max-time 10 http://localhost:8080/health > /dev/null 2>&1; then
-            echo "✓ HTTP endpoint is responding"
-            HTTP_OK=true
-            break
-        fi
-        sleep 2
-    done
-    
-    if [ "$HTTP_OK" = false ]; then
-        echo "✗ HTTP endpoint is NOT responding"
-    fi
-    
-    # Check TLS port
-    if ss -tlnp | grep -q ':9443'; then
-        echo "✓ TLS port 9443 is listening"
-    else
-        echo "✗ TLS port 9443 is NOT listening"
-    fi
+    # Routing status is not readiness: no connected client is required.
+    server_listeners_ready || rollback_server_release "local listeners disappeared"
+    complete_server_transaction
 
 fi
 

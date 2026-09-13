@@ -129,11 +129,22 @@ scp $SCP_OPTS "$SCRIPT_DIR/setup-server-remote.sh" "$HOST:~/setup-server-remote.
 # 2. Upload certificates if requested (do this FIRST so they exist when service starts)
 # Trust material is stored outside the replaceable git checkout so a first-time
 # clone/update can never delete uploaded keys or the CA.
+#
+# The active trust set is referenced through one symlink
+# ($DATA_DIR/current -> releases/<id>). Uploads are staged in $DATA_DIR/staging,
+# which is never the active directory: the complete set is validated on the
+# server (key matches cert, cert chains to the CA) and promoted to a persistent
+# release, and only then activated by swapping that single symlink with one
+# atomic rename. An interrupted upload therefore cannot leave a new certificate
+# next to an old key, and the previously active release stays intact and
+# recoverable (see docs/deployment-fixes.md).
 DATA_DIR="/var/lib/okproxy"
-CERT_DIR="$DATA_DIR/certs"
-CA_DIR="$DATA_DIR/ca"
+TRUST_ACTIVE_LINK="$DATA_DIR/current"
+RELEASES_DIR="$DATA_DIR/releases"
+STAGING_DIR="$DATA_DIR/staging"
+DEPLOY_TRUST_ARG=""
 if [ "$UPLOAD_CERTS" = true ]; then
-    echo "Validating and uploading certificates..."
+    echo "Validating and staging certificates..."
     
     # Check local cert directories exist
     if [ ! -d "$PROJECT_ROOT/.certs" ]; then
@@ -164,31 +175,40 @@ if [ "$UPLOAD_CERTS" = true ]; then
     fi
     
     echo "Local certificates validated."
-    echo "Uploading certificates to remote server..."
-    
-    # Create remote cert directory with secure permissions FIRST.
-    # Only the okproxy data directory is touched; the parent tree is never
-    # chowned recursively.
-    ssh $SSH_OPTS "$HOST" "sudo mkdir -p '$CERT_DIR' '$CA_DIR' && sudo chown -R \"\$(id -un)\" '$DATA_DIR' && sudo chmod 700 '$CERT_DIR' '$CA_DIR'"
 
-    # Upload certificates using scp
-    scp $SCP_OPTS "$PROJECT_ROOT/.certs/server-cert.pem" "$HOST:$CERT_DIR/"
-    scp $SCP_OPTS "$PROJECT_ROOT/.certs/server-key.pem" "$HOST:$CERT_DIR/"
-    scp $SCP_OPTS "$PROJECT_ROOT/.ca/ca-cert.pem" "$HOST:$CERT_DIR/"
-    scp $SCP_OPTS "$PROJECT_ROOT/.ca/ca-cert.pem" "$HOST:$CA_DIR/"
+    # Upload never activates. The setup transaction captures old trust (including
+    # bootstrapped legacy paths) before code or active material is changed.
+    RELEASE_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+    STAGED_RELEASE="$STAGING_DIR/$RELEASE_ID"
+    echo "Staging trust release $RELEASE_ID in $STAGED_RELEASE (active material untouched)..."
+    ssh $SSH_OPTS "$HOST" "sudo mkdir -p '$STAGED_RELEASE/certs' '$STAGED_RELEASE/ca' && sudo chown -R \"\$(id -un)\" '$STAGED_RELEASE'"
+
+    # Upload every file into the staging directory. The active certs/ca
+    # directories are never written to directly.
+    scp $SCP_OPTS "$PROJECT_ROOT/.certs/server-cert.pem" "$HOST:$STAGED_RELEASE/certs/"
+    scp $SCP_OPTS "$PROJECT_ROOT/.certs/server-key.pem" "$HOST:$STAGED_RELEASE/certs/"
+    scp $SCP_OPTS "$PROJECT_ROOT/.ca/ca-cert.pem" "$HOST:$STAGED_RELEASE/certs/"
+    scp $SCP_OPTS "$PROJECT_ROOT/.ca/ca-cert.pem" "$HOST:$STAGED_RELEASE/ca/"
     if [ -f "$PROJECT_ROOT/.ca/issued-domains.json" ]; then
-        scp $SCP_OPTS "$PROJECT_ROOT/.ca/issued-domains.json" "$HOST:$CA_DIR/"
+        scp $SCP_OPTS "$PROJECT_ROOT/.ca/issued-domains.json" "$HOST:$STAGED_RELEASE/ca/"
     fi
     if [ -f "$PROJECT_ROOT/.ca/crl.txt" ]; then
-        scp $SCP_OPTS "$PROJECT_ROOT/.ca/crl.txt" "$HOST:$CA_DIR/"
+        scp $SCP_OPTS "$PROJECT_ROOT/.ca/crl.txt" "$HOST:$STAGED_RELEASE/ca/"
     fi
 
-    # Fix ownership and permissions (directory already restricted, just fix files)
-    echo "Fixing certificate ownership and permissions..."
-    ssh $SSH_OPTS "$HOST" "sudo chown -R \"\$(id -un)\" '$CERT_DIR' '$CA_DIR'"
-    ssh $SSH_OPTS "$HOST" "sudo chmod 600 '$CERT_DIR/server-key.pem' && sudo chmod 644 '$CERT_DIR/server-cert.pem' '$CERT_DIR/ca-cert.pem' && sudo chmod -R go-rwx '$CA_DIR'"
+    # Validate the complete staged set on the server. Nothing is activated
+    # unless key, certificate and CA are present and coherent.
+    echo "Validating the staged trust release on the server (active material untouched)..."
+    if ! ssh $SSH_OPTS "$HOST" "sudo ~/setup-server-remote.sh --trust-release-validate='$RELEASE_ID'"; then
+        echo "Error: the uploaded trust material did not pass server-side validation."
+        echo "The active trust material was not modified."
+        ssh $SSH_OPTS "$HOST" "sudo ~/setup-server-remote.sh --trust-release-discard='$RELEASE_ID'" || true
+        exit 1
+    fi
 
-    echo "Certificates uploaded successfully to $CERT_DIR"
+    DEPLOY_TRUST_ARG="--deploy-trust-release=$(printf '%q' "$RELEASE_ID")"
+    echo "Certificates staged and validated (release $RELEASE_ID); activation deferred to setup."
+
 fi
 
 # 3. Execute setup script remotely (this handles git clone/update and service start)
@@ -208,6 +228,7 @@ SSH_PORT_ARG=""
 if [ -n "$SSH_PORT" ]; then
     SSH_PORT_ARG="--ssh-port $(printf '%q' "$SSH_PORT")"
 fi
-ssh $SSH_OPTS "$HOST" "chmod +x ~/setup-server-remote.sh && sudo ~/setup-server-remote.sh $ESCAPED_HOSTNAME $ESCAPED_REPO_URL --branch $ESCAPED_BRANCH $CERT_BOUND_ARG $SSH_PORT_ARG"
+# Activation is part of the remote code/unit/trust transaction, never a separate SSH call.
+ssh $SSH_OPTS "$HOST" "chmod +x ~/setup-server-remote.sh && sudo ~/setup-server-remote.sh $ESCAPED_HOSTNAME $ESCAPED_REPO_URL --branch $ESCAPED_BRANCH $CERT_BOUND_ARG $SSH_PORT_ARG $DEPLOY_TRUST_ARG"
 
 echo "Remote setup completed successfully!"

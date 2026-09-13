@@ -77,7 +77,8 @@ else
     LOG_DIR="$HOME/.okproxy/logs/$SAFE_CLIENT_NAME"
     LAUNCH_LABEL="com.okproxy.client.$SAFE_CLIENT_NAME"
 fi
-PLIST_PATH="$HOME/Library/LaunchAgents/${LAUNCH_LABEL}.plist"
+PLIST_DIR="$HOME/Library/LaunchAgents"
+PLIST_PATH="$PLIST_DIR/${LAUNCH_LABEL}.plist"
 
 if ! [[ "$PARALLEL_SOCKETS" =~ ^[0-9]+$ ]] || [ "$PARALLEL_SOCKETS" -lt 1 ] || [ "$PARALLEL_SOCKETS" -gt 32 ]; then
     echo "Error: PARALLEL_SOCKETS must be an integer from 1 to 32."
@@ -249,8 +250,12 @@ echo "Using Node.js at: $NODE_PATH ($($NODE_PATH -v))"
 
 # 2. Create necessary directories
 echo "Creating directories..."
+# ~/Library/LaunchAgents does not exist on a fresh macOS home directory. Without
+# it the plist write below fails (`cat > ...` -> "No such file or directory")
+# *after* the previous agent was unloaded and its plist removed.
 mkdir -p "$CERT_DIR"
 mkdir -p "$LOG_DIR"
+mkdir -p "$PLIST_DIR"
 
 # 3. Clone or update repository
 echo "Setting up repository..."

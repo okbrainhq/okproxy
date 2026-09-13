@@ -27,6 +27,10 @@ function createSandbox(prefix = 'okproxy-deploy-') {
   for (const dir of [sandbox.bin, sandbox.home, sandbox.log]) {
     mkdirSync(dir, { recursive: true });
   }
+  // Default deny: a forgotten mock must never reach real service/network tools.
+  for (const tool of ['sudo', 'systemctl', 'journalctl', 'ssh', 'scp', 'rsync', 'sftp']) {
+    writeMock(sandbox.bin, tool, `echo "BLOCKED unmocked ${tool}" >&2; exit 111`);
+  }
   return sandbox;
 }
 
@@ -94,20 +98,26 @@ exec "$@"
 }
 
 /**
- * Mock systemctl for the client installer tests. Emulates just enough state to
- * drive restart/readiness checks.
+ * Mock systemctl for the client/server installer tests. Emulates just enough
+ * state to drive restart/readiness checks.
  *
  * MOCK_SYSTEMCTL_MODE=ok          -> restart appends a fresh tunnel-connected log line
  * MOCK_SYSTEMCTL_MODE=fail        -> restart changes the invocation but logs nothing
  * MOCK_SYSTEMCTL_MODE=restart-fail -> restart itself fails (exit 1)
+ *
+ * When `healthFile` is passed, a successful restart also creates it and a failed
+ * restart removes it, so a mocked readiness probe (e.g. curl) can be driven by
+ * restart state instead of the host.
  */
-function writeSystemctlMock(sandbox, { stateDir, logFile }) {
+function writeSystemctlMock(sandbox, { stateDir, logFile, healthFile }) {
   const state = stateDir || join(sandbox.log, 'systemctl-state');
   mkdirSync(state, { recursive: true });
+  const health = healthFile || '';
   const file = writeMock(sandbox.bin, 'systemctl', `
 mode="\${MOCK_SYSTEMCTL_MODE:-ok}"
 state_dir="${state}"
 log_file="${logFile}"
+health_file="${health}"
 
 args=("$@")
 if [ "\${args[0]}" = "--user" ]; then
@@ -120,6 +130,9 @@ name="\${args[\${#args[@]}-1]:-}"
 
 case "$cmd" in
   daemon-reload)
+    if [ "$mode" = "daemon-fail" ] && [ ! -f "$state_dir/reload-failed" ]; then
+      touch "$state_dir/reload-failed"; exit 1
+    fi
     exit 0
     ;;
   enable)
@@ -127,6 +140,7 @@ case "$cmd" in
     exit 0
     ;;
   show)
+    if [[ "$*" == *MainPID* ]]; then echo 4242; exit 0; fi
     if [ -f "$state_dir/invocation" ]; then
       cat "$state_dir/invocation"
     fi
@@ -138,18 +152,27 @@ case "$cmd" in
     ;;
   restart)
     if [ "$mode" = "restart-fail" ]; then
+      [ -n "$health_file" ] && rm -f "$health_file"
       exit 1
     fi
     printf 'inv-%s' "$(date +%s%N)" > "$state_dir/invocation"
     touch "$state_dir/active"
     if [ "$mode" = "ok" ]; then
+      [ -n "$health_file" ] && touch "$health_file"
       mkdir -p "$(dirname "$log_file")"
       printf 'Connected to TLS tunnel server\\n' >> "$log_file"
+    else
+      [ -n "$health_file" ] && rm -f "$health_file"
     fi
     exit 0
     ;;
   stop)
     rm -f "$state_dir/active"
+    [ -n "$health_file" ] && rm -f "$health_file"
+    exit 0
+    ;;
+  disable)
+    rm -f "$state_dir/enabled"
     exit 0
     ;;
   *)
@@ -158,6 +181,11 @@ case "$cmd" in
 esac
 `);
   return { file, state };
+}
+
+/** Mock journalctl: always succeeds, so rollback diagnostics never touch the host. */
+function writeJournalctlMock(sandbox) {
+  return writeMock(sandbox.bin, 'journalctl', 'exit 0');
 }
 
 function writeLoginctlMock(sandbox) {
@@ -344,6 +372,7 @@ module.exports = {
   writeSudoMock,
   writeSystemctlMock,
   writeLoginctlMock,
+  writeJournalctlMock,
   readRemoteLog,
   runInSandbox,
   executeCapturedRemoteCommand,

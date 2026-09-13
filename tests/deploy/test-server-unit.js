@@ -29,10 +29,11 @@ describe('server systemd unit', () => {
     assert.strictEqual(res.status, 0, res.stderr);
 
     // Trust material is read from the persistent data dir, never from /opt/okproxy.
-    assert.match(res.stdout, /ReadWritePaths=\/var\/lib\/okproxy\/certs \/var\/lib\/okproxy\/ca -\/opt\/okproxy\/\.certs -\/opt\/okproxy\/\.ca/);
-    assert.match(res.stdout, /--key \/var\/lib\/okproxy\/certs\/server-key\.pem/);
-    assert.match(res.stdout, /--cert \/var\/lib\/okproxy\/certs\/server-cert\.pem/);
-    assert.match(res.stdout, /--ca \/var\/lib\/okproxy\/ca\/ca-cert\.pem/);
+    // The active set is one release referenced through the `current` symlink.
+    assert.match(res.stdout, /ReadWritePaths=\/var\/lib\/okproxy\/current\/certs \/var\/lib\/okproxy\/current\/ca -\/opt\/okproxy\/\.certs -\/opt\/okproxy\/\.ca/);
+    assert.match(res.stdout, /--key \/var\/lib\/okproxy\/current\/certs\/server-key\.pem/);
+    assert.match(res.stdout, /--cert \/var\/lib\/okproxy\/current\/certs\/server-cert\.pem/);
+    assert.match(res.stdout, /--ca \/var\/lib\/okproxy\/current\/ca\/ca-cert\.pem/);
     assert.doesNotMatch(res.stdout, /ReadWritePaths=[^\n]*\/opt\/okproxy\/certs/);
   });
 
@@ -81,9 +82,10 @@ describe('server deploy script destructive-path safety', () => {
   it('refuses to delete unknown non-git contents and keeps trust material in /var/lib/okproxy', () => {
     assert.match(source, /legacy_app_dir_is_safe_to_replace/);
     assert.match(source, /Refusing to delete it/);
-    assert.match(source, /DATA_DIR="\/var\/lib\/okproxy"/);
-    assert.match(source, /CERT_DIR="\$DATA_DIR\/certs"/);
-    assert.match(source, /CA_DIR="\$DATA_DIR\/ca"/);
+    assert.match(source, /DATA_DIR="\$\{OKPROXY_DATA_DIR:-\/var\/lib\/okproxy\}"/);
+    assert.match(source, /TRUST_ACTIVE_LINK="\$TRUST_ROOT\/current"/);
+    assert.match(source, /CERT_DIR="\$TRUST_ACTIVE_LINK\/certs"/);
+    assert.match(source, /CA_DIR="\$TRUST_ACTIVE_LINK\/ca"/);
   });
 
   it('allows only the verified management port and fails closed on unknown/denied ports', () => {
