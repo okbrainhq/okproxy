@@ -137,14 +137,46 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
   const activeStreams = new Map();
   const activeWebSockets = new Map();
 
+  // Session generation fencing. VirtualSocket bumps `sessionGeneration` once
+  // every lane is gone. Target-side callbacks (http response data/end, socket
+  // errors) can still fire after that; without fencing they would write frames
+  // into a reused stream ID on the next session. Every per-stream write is
+  // checked against the generation captured when the stream was created, and a
+  // session reset aborts all in-flight streams without writing.
+  function currentGeneration() {
+    return typeof connection.sessionGeneration === 'number' ? connection.sessionGeneration : 0;
+  }
+
+  function isStaleGeneration(generation) {
+    return currentGeneration() !== generation;
+  }
+
+  function writeForGeneration(generation, buf) {
+    if (isStaleGeneration(generation)) return false;
+    return connection.write(buf);
+  }
+
   // Set max listeners if connection exposes a raw socket
   if (connection.socket) {
     connection.socket.setMaxListeners(maxStreams + 10);
   }
 
   function handleFrame(frame) {
-    if (activeWebSockets.has(frame.streamId)) {
+    const existingWs = activeWebSockets.get(frame.streamId);
+    if (existingWs) {
+      if (isStaleGeneration(existingWs.generation)) {
+        existingWs.cleanup(false);
+        return;
+      }
       handleWebSocketFrame(frame);
+      return;
+    }
+
+    const existingStream = activeStreams.get(frame.streamId);
+    if (existingStream && isStaleGeneration(existingStream.generation)) {
+      // Frame belongs to a new session reusing an old stream ID; drop the stale
+      // target work rather than mixing the two.
+      abortStreamState(existingStream);
       return;
     }
 
@@ -168,6 +200,40 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
         streamState.destroy();
       }
     }
+  }
+
+  function abortStreamState(state) {
+    if (!state || state.completed) return;
+    state.cleanup();
+    if (state.res && !state.res.destroyed) state.res.destroy();
+    if (state.req && !state.req.destroyed) state.req.destroy();
+  }
+
+  /**
+   * Abort every in-flight stream/WebSocket after the virtual session was lost.
+   * Never writes to the tunnel: the session (and its stream IDs) is gone.
+   */
+  function handleSessionReset() {
+    for (const state of [...activeStreams.values()]) {
+      abortStreamState(state);
+    }
+    activeStreams.clear();
+    for (const wsState of [...activeWebSockets.values()]) {
+      try { wsState.cleanup(false); } catch { /* ignore */ }
+    }
+    activeWebSockets.clear();
+  }
+
+  /**
+   * Abort one stream because the virtual socket detected an unrecoverable
+   * transport failure (ordering gap / flow-control timeout). Prevents silent
+   * corruption of an ordered response.
+   */
+  function abortStream(streamId) {
+    const state = activeStreams.get(streamId);
+    if (state) abortStreamState(state);
+    const wsState = activeWebSockets.get(streamId);
+    if (wsState) wsState.cleanup(false);
   }
 
   function handleWebSocketFrame(frame) {
@@ -240,6 +306,7 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
         return;
       }
 
+      const generation = currentGeneration();
       const singleFlow = isSingleFlowRequest(upgradeInfo);
       if (typeof connection.setStreamMode === 'function') {
         connection.setStreamMode(streamId, { singleFlow });
@@ -268,7 +335,7 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
         proxyReq.setTimeout(targetTimeout, () => {
           upgradeTimeoutTriggered = true;
           proxyReq.destroy();
-          connection.write(encodeFrame(streamId, FrameType.ERROR, Buffer.from('Upgrade timeout')));
+          writeForGeneration(generation, encodeFrame(streamId, FrameType.ERROR, Buffer.from('Upgrade timeout')));
           cleanup(false);
         });
       }
@@ -280,7 +347,8 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
         cleanup: null,
         reassemblyBuffer: Buffer.alloc(0),
         closeFramePending: false,
-        cleanupCalled: false
+        cleanupCalled: false,
+        generation
       };
 
       function cleanup(sendFin = true) {
@@ -296,7 +364,7 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
         }
 
         if (sendFin) {
-          connection.write(encodeFrame(streamId, FrameType.FIN, Buffer.alloc(0)));
+          writeForGeneration(wsState.generation, encodeFrame(streamId, FrameType.FIN, Buffer.alloc(0)));
         }
 
         if (typeof connection.clearStreamMode === 'function') {
@@ -326,7 +394,7 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
           }
         }
 
-        connection.write(encodeFrame(streamId, FrameType.UPGRADE, JSON.stringify({
+        writeForGeneration(wsState.generation, encodeFrame(streamId, FrameType.UPGRADE, JSON.stringify({
           status: 101,
           headers: responseHeaders
         })));
@@ -339,7 +407,7 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
           while (pendingOffset < pendingLargeFrame.length) {
             const end = Math.min(pendingOffset + MAX_FRAME_SIZE, pendingLargeFrame.length);
             const chunk = pendingLargeFrame.subarray(pendingOffset, end);
-            const canWrite = connection.write(encodeFrame(streamId, FrameType.DATA, chunk));
+            const canWrite = writeForGeneration(wsState.generation, encodeFrame(streamId, FrameType.DATA, chunk));
             if (!canWrite) {
               proxySocket.pause();
               pendingOffset = end;
@@ -378,7 +446,7 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
             }
 
             if (rawFrame.length <= MAX_FRAME_SIZE) {
-              const canWrite = connection.write(encodeFrame(streamId, FrameType.DATA, rawFrame));
+              const canWrite = writeForGeneration(wsState.generation, encodeFrame(streamId, FrameType.DATA, rawFrame));
               if (!canWrite) {
                 proxySocket.pause();
                 waitForConnectionDrain(connection, () => {
@@ -394,7 +462,7 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
 
             if (isCloseFrame) {
               setImmediate(() => {
-                if (!connection.write(encodeFrame(streamId, FrameType.FIN, Buffer.alloc(0)))) {
+                if (!writeForGeneration(wsState.generation, encodeFrame(streamId, FrameType.FIN, Buffer.alloc(0)))) {
                   waitForConnectionDrain(connection, cleanup, streamId);
                 } else {
                   cleanup();
@@ -437,7 +505,7 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
         if (upgradeTimeoutTriggered) return;
         console.error(`[CLIENT WS ERROR] WebSocket upgrade failed for ${upgradeInfo.path}:`, err.message, `(code: ${err.code || 'none'})`);
         const errorDetail = err.code ? `Upgrade failed: ${err.code}` : 'Upgrade failed';
-        connection.write(encodeFrame(streamId, FrameType.ERROR, Buffer.from(errorDetail)));
+        writeForGeneration(generation, encodeFrame(streamId, FrameType.ERROR, Buffer.from(errorDetail)));
         cleanup(false);
       });
 
@@ -455,6 +523,7 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
   function startProxyRequest(streamId, payload) {
     try {
       const reqInfo = JSON.parse(payload.toString());
+      const generation = currentGeneration();
       const singleFlow = isSingleFlowRequest(reqInfo);
       if (typeof connection.setStreamMode === 'function') {
         connection.setStreamMode(streamId, { singleFlow });
@@ -475,14 +544,14 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
       let streamState = null;
 
       function sendPlainResponse(status, message) {
-        connection.write(encodeFrame(streamId, FrameType.HEADERS, JSON.stringify({
+        writeForGeneration(generation, encodeFrame(streamId, FrameType.HEADERS, JSON.stringify({
           status,
           headers: { 'content-type': 'text/plain' }
         })));
         if (message) {
-          connection.write(encodeFrame(streamId, FrameType.DATA, Buffer.from(message)));
+          writeForGeneration(generation, encodeFrame(streamId, FrameType.DATA, Buffer.from(message)));
         }
-        connection.write(encodeFrame(streamId, FrameType.FIN, Buffer.alloc(0)));
+        writeForGeneration(generation, encodeFrame(streamId, FrameType.FIN, Buffer.alloc(0)));
       }
 
       const proxyReq = request({
@@ -493,17 +562,19 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
         headers: proxyHeaders,
         agent: targetAgent
       }, (proxyRes) => {
-        if (!streamState || streamState.completed) {
+        if (!streamState || streamState.completed || isStaleGeneration(generation)) {
           proxyRes.resume();
+          if (streamState) abortStreamState(streamState);
           return;
         }
 
+        streamState.res = proxyRes;
         streamState.responseStarted = true;
         streamState.clearTargetTimer();
 
         const filteredHeaders = filterRequestHeaders(proxyRes.headers);
 
-        const canWrite = connection.write(encodeFrame(streamId, FrameType.HEADERS, JSON.stringify({
+        const canWrite = writeForGeneration(generation, encodeFrame(streamId, FrameType.HEADERS, JSON.stringify({
           status: proxyRes.statusCode,
           headers: filteredHeaders
         })));
@@ -515,12 +586,16 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
         let responseEnded = false;
 
         proxyRes.on('data', (chunk) => {
+          if (streamState.completed || isStaleGeneration(generation)) {
+            abortStreamState(streamState);
+            return;
+          }
           let offset = 0;
           let canContinue = true;
           while (offset < chunk.length) {
             const end = Math.min(offset + MAX_FRAME_SIZE, chunk.length);
             const frameChunk = chunk.subarray(offset, end);
-            if (!connection.write(encodeFrame(streamId, FrameType.DATA, frameChunk))) {
+            if (!writeForGeneration(generation, encodeFrame(streamId, FrameType.DATA, frameChunk))) {
               canContinue = false;
             }
             offset = end;
@@ -532,30 +607,40 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
         });
 
         proxyRes.on('end', () => {
+          if (streamState.completed || isStaleGeneration(generation)) return;
           responseEnded = true;
-          connection.write(encodeFrame(streamId, FrameType.FIN, Buffer.alloc(0)));
+          writeForGeneration(generation, encodeFrame(streamId, FrameType.FIN, Buffer.alloc(0)));
           streamState.cleanup();
         });
 
         proxyRes.on('close', () => {
           if (!responseEnded && streamState && !streamState.completed) {
+            if (isStaleGeneration(generation)) {
+              abortStreamState(streamState);
+              return;
+            }
             console.error(`[CLIENT ERROR] Target response closed early for ${reqInfo.method} ${reqInfo.path}`);
-            connection.write(encodeFrame(streamId, FrameType.ERROR, Buffer.from('Target response closed')));
+            writeForGeneration(generation, encodeFrame(streamId, FrameType.ERROR, Buffer.from('Target response closed')));
             streamState.cleanup();
           }
         });
 
         proxyRes.on('error', (err) => {
           if (streamState && streamState.completed) return;
+          if (isStaleGeneration(generation)) {
+            abortStreamState(streamState);
+            return;
+          }
           console.error(`[CLIENT ERROR] Target response error for ${reqInfo.method} ${reqInfo.path}:`, err.message, `(code: ${err.code || 'none'})`);
           const errorDetail = err.code ? `Target error: ${err.code}` : 'Target error';
-          connection.write(encodeFrame(streamId, FrameType.ERROR, Buffer.from(errorDetail)));
+          writeForGeneration(generation, encodeFrame(streamId, FrameType.ERROR, Buffer.from(errorDetail)));
           if (streamState) streamState.cleanup();
         });
       });
 
       streamState = {
         req: proxyReq,
+        generation,
         responseStarted: false,
         requestEnded: false,
         completed: false,
@@ -583,10 +668,14 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
         timeoutTarget() {
           if (this.completed) return;
           this.timedOut = true;
+          if (isStaleGeneration(generation)) {
+            this.cleanup();
+            return;
+          }
           console.error(`[CLIENT TIMEOUT] Target response timeout after ${targetTimeout}ms for ${reqInfo.method} ${reqInfo.path}`);
 
           if (this.responseStarted) {
-            connection.write(encodeFrame(streamId, FrameType.ERROR, Buffer.from('Target response timeout')));
+            writeForGeneration(generation, encodeFrame(streamId, FrameType.ERROR, Buffer.from('Target response timeout')));
           } else {
             sendPlainResponse(504, 'Target response timeout');
           }
@@ -599,6 +688,10 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
 
         writeRequestData(chunk) {
           if (this.completed || this.req.destroyed) return;
+          if (isStaleGeneration(generation)) {
+            abortStreamState(this);
+            return;
+          }
           if (!this.req.write(chunk) && !this.targetRequestBackpressured) {
             this.targetRequestBackpressured = true;
             pauseConnection(connection, streamId);
@@ -611,6 +704,10 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
 
         pauseTargetResponse(proxyRes) {
           if (this.completed || this.targetResponseBackpressured) return;
+          if (isStaleGeneration(generation)) {
+            abortStreamState(this);
+            return;
+          }
           this.targetResponseBackpressured = true;
           proxyRes.pause();
           waitForConnectionDrain(connection, () => {
@@ -621,6 +718,10 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
 
         endRequest() {
           if (this.requestEnded || this.completed) return;
+          if (isStaleGeneration(generation)) {
+            abortStreamState(this);
+            return;
+          }
           this.requestEnded = true;
           this.req.end();
           this.startTargetTimer();
@@ -634,7 +735,6 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
         cleanup() {
           if (this.completed) return;
           this.completed = true;
-          if (this.targetRequestBackpressured) resumeConnection(connection, streamId);
           this.clearTargetTimer();
           activeStreams.delete(streamId);
           if (typeof connection.clearStreamMode === 'function') {
@@ -647,13 +747,17 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
 
       proxyReq.on('error', (err) => {
         if (streamState && (streamState.completed || streamState.timedOut)) return;
+        if (isStaleGeneration(generation)) {
+          if (streamState) abortStreamState(streamState);
+          return;
+        }
 
         console.error(`[CLIENT ERROR] Target error for ${reqInfo.method} ${reqInfo.path}:`, err.message, `(code: ${err.code || 'none'})`);
         if (err.code === 'ECONNREFUSED') {
           sendPlainResponse(502, 'Target service not available');
         } else {
           const errorDetail = err.code ? `Target error: ${err.code}` : 'Target error';
-          connection.write(encodeFrame(streamId, FrameType.ERROR, Buffer.from(errorDetail)));
+          writeForGeneration(generation, encodeFrame(streamId, FrameType.ERROR, Buffer.from(errorDetail)));
         }
         if (streamState) streamState.cleanup();
       });
@@ -745,15 +849,22 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
     return frame;
   }
 
+  const onTransportFailure = ({ streamId }) => abortStream(streamId);
+  connection.on?.('sessionReset', handleSessionReset);
+  connection.on?.('streamFailure', onTransportFailure);
+
   function destroy() {
+    connection.removeListener?.('sessionReset', handleSessionReset);
+    connection.removeListener?.('streamFailure', onTransportFailure);
     targetAgent.destroy();
 
-    for (const [streamId, wsState] of activeWebSockets) {
-      wsState.cleanup();
+    for (const [, wsState] of activeWebSockets) {
+      // Shutdown: never write FIN into a connection that is going away.
+      wsState.cleanup(false);
     }
     activeWebSockets.clear();
 
-    for (const [streamId, streamState] of activeStreams) {
+    for (const [, streamState] of activeStreams) {
       streamState.destroy();
     }
     activeStreams.clear();
@@ -761,7 +872,9 @@ function createProxy(connection, targetPort, targetHost = 'localhost', maxStream
 
   return {
     handleFrame,
-    destroy
+    destroy,
+    handleSessionReset,
+    abortStream
   };
 }
 

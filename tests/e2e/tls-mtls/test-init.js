@@ -1,3 +1,4 @@
+const { VERSION, CAPABILITY, nonce } = require('../../../packages/frame-protocol/transport-session');
 // Test 2: INIT Handshake (TLS version)
 
 const { describe, it } = require('node:test');
@@ -34,7 +35,8 @@ describe('INIT Handshake', () => {
         
         socket.on('connect', () => {
           socket.write(encodeFrame(0, FrameType.INIT, JSON.stringify({
-            version: 1,
+            version: VERSION, capability: CAPABILITY, clientSession: nonce(),
+
             clientId: 'test-handshake'
           })));
         });
@@ -168,7 +170,8 @@ describe('INIT Handshake', () => {
       await new Promise((resolve) => {
         socket.on('connect', () => {
           socket.write(encodeFrame(0, FrameType.INIT, JSON.stringify({
-            version: 1,
+            version: VERSION, capability: CAPABILITY, clientSession: nonce(),
+
             clientId: 'test-streams'
           })));
         });

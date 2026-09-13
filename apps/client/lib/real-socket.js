@@ -1,316 +1,148 @@
-// RealSocket — Single TLS connection bound to a specific network interface
-// Refactored from tls-connection.js with localAddress binding and interface ID in INIT
-
+// One authenticated TLS lane. Reconnect callbacks are fenced by socket identity;
+// the virtual owner validates both session nonces BEFORE enabling data traffic.
 const { connect } = require('node:tls');
 const { readFileSync } = require('node:fs');
-const { encodeFrame, createFrameDecoder, FrameType } = require('../../../packages/frame-protocol');
+const { performance } = require('node:perf_hooks');
 const { EventEmitter } = require('node:events');
-
-const INITIAL_RECONNECT_DELAY = 500;
-const MAX_RECONNECT_DELAY = 3000;
-
-// Default keepalive for single-connection (aggressive)
-const DEFAULT_WATCHDOG_TIMEOUT = 35000;
+const { encodeFrame, createFrameDecoder, FrameType } = require('../../../packages/frame-protocol');
+const { VERSION, CAPABILITY, compatible, validNonce, nonce, SEQ_RESET_THRESHOLD, MAX_LANE_BYTES } = require('../../../packages/frame-protocol/transport-session');
 const DEFAULT_PING_INTERVAL = 3000;
 const DEFAULT_PONG_TIMEOUT = 10000;
-const DEFAULT_BACKPRESSURE_TIMEOUT = 8000;
-
-const CONNECTION_TIMEOUT = 25000;
-const INIT_RESPONSE_TIMEOUT = 10000; // 10s for server INIT ACK
-const SEQ_RESET_THRESHOLD = 0xFFFFFF0F; // 2^32 - 1,000,000 ~ roughly
-
 class RealSocket extends EventEmitter {
-  /**
-   * @param {Object} config
-   * @param {string} config.serverHost
-   * @param {number} config.serverPort
-   * @param {string} config.clientKey
-   * @param {string} config.clientCert
-   * @param {string} config.caCert
-   * @param {string} config.interfaceName - e.g. 'en0'
-   * @param {string} config.localAddress - IP to bind to
-   */
   constructor(config) {
-    super();
-    this.config = config;
-    this.socket = null;
-    this.decoder = null;
-    this.initialized = false;
-    this.destroyed = false;
-    this.reconnectDelay = INITIAL_RECONNECT_DELAY;
-    this.reconnectTimer = null;
-    this.reconnectAttempts = 0;
-    this.watchdogTimer = null;
-    this.lastActivity = 0;
-    this.keepaliveTimer = null;
-    this.lastPongTime = 0;
-    this.lastWriteOk = 0;
-    this._initResponseTimer = null;
+    super(); this.config = config;
+    this.socket = null; this.initialized = false; this.destroyed = false;
+    this.reconnectDelay = 500; this.reconnectAttempts = 0; this.reconnectTimer = null;
+    this.keepaliveTimer = null; this.watchdogTimer = null; this._initResponseTimer = null;
+    this.blockedSince = null; this.lastActivity = 0; this.lastPongTime = 0;
     this.serverSettings = { maxConcurrentStreams: 100 };
-    // Keepalive timing — allows multipath to relax
+    this.clientSession = config.clientSession || nonce();
+    this.serverSession = null;
     this._pingInterval = config.pingInterval || DEFAULT_PING_INTERVAL;
     this._pongTimeout = config.pongTimeout || DEFAULT_PONG_TIMEOUT;
-    this._watchdogTimeout = config.watchdogTimeout || DEFAULT_WATCHDOG_TIMEOUT;
-    this._backpressureTimeout = config.backpressureTimeout || DEFAULT_BACKPRESSURE_TIMEOUT;
+    this._watchdogTimeout = config.watchdogTimeout || 35000;
+    this._backpressureTimeout = config.backpressureTimeout || 8000;
   }
-
-  start() {
-    this.destroyed = false;
-    this._connect();
-  }
-
+  start() { this.destroyed = false; this._connect(); }
   _connect() {
     if (this.destroyed) return;
-
-    const tlsOptions = {
-      host: this.config.serverHost,
-      port: this.config.serverPort,
-      key: readFileSync(this.config.clientKey),
-      cert: readFileSync(this.config.clientCert),
-      ca: readFileSync(this.config.caCert),
-      rejectUnauthorized: true
-    };
-
-    if (this.config.localAddress) {
-      tlsOptions.localAddress = this.config.localAddress;
-    }
-
-    const connectionTimeout = setTimeout(() => {
-      console.log(`[${new Date().toISOString()}] [${this.config.interfaceName}] Connection timeout (${CONNECTION_TIMEOUT/1000}s), destroying socket`);
-      if (this.socket) this.socket.destroy();
-    }, CONNECTION_TIMEOUT);
-
+    const hello = this.config.getSession?.() || { clientSession: this.clientSession };
+    const sock = connect({ host: this.config.serverHost, port: this.config.serverPort,
+      key: readFileSync(this.config.clientKey), cert: readFileSync(this.config.clientCert),
+      ca: readFileSync(this.config.caCert), rejectUnauthorized: true,
+      ...(this.config.localAddress ? { localAddress: this.config.localAddress } : {}) });
+    this.socket = sock; this.initialized = false; this.serverSession = null;
+    this.blockedSince = null;
     this.emit('status', 'connecting');
-
-    this.socket = connect(tlsOptions, () => {
-      clearTimeout(connectionTimeout);
-      this.socket.setKeepAlive(true, 30000);
-
-      // Intercept write for backpressure detection
-      this.lastWriteOk = Date.now();
-      const originalWrite = this.socket.write.bind(this.socket);
-      this.socket.write = (data, encoding, cb) => {
-        const result = originalWrite(data, encoding, cb);
-        if (result) this.lastWriteOk = Date.now();
-        return result;
-      };
-      this.socket.on('drain', () => {
-        this.lastWriteOk = Date.now();
-      });
-
-      // Send INIT with interface name
-      this.socket.write(encodeFrame(0, FrameType.INIT, JSON.stringify({
-        interface: this.config.interfaceName,
-        maxFrameSize: 1048576,
-        domains: this.config.domains || []
+    const timeout = setTimeout(() => sock.destroy(), 25000);
+    const current = () => !this.destroyed && this.socket === sock && !sock.destroyed;
+    sock.on('secureConnect', () => {
+      if (!current()) return;
+      clearTimeout(timeout); sock.setKeepAlive(true, 30000);
+      this._writeRaw(sock, encodeFrame(0, FrameType.INIT, JSON.stringify({
+        version: VERSION, capability: CAPABILITY, clientSession: hello.clientSession,
+        interface: this.config.interfaceName, maxFrameSize: 1048576, domains: this.config.domains || []
       })));
-
-      // Set a timeout for INIT response
-      const initResponseTimer = setTimeout(() => {
-        if (!this.initialized && this.socket && !this.socket.destroyed) {
-          console.log(`[${new Date().toISOString()}] [${this.config.interfaceName}] INIT response timeout (${INIT_RESPONSE_TIMEOUT/1000}s)`);
-          this.socket.destroy();
-        }
-      }, INIT_RESPONSE_TIMEOUT);
-
-      // Store for cleanup
-      this._initResponseTimer = initResponseTimer;
+      this._initResponseTimer = setTimeout(() => sock.destroy(), 10000);
     });
-
-    this.initialized = false;
-
-    this.decoder = createFrameDecoder(
-      (frame) => {
-        this._recordActivity();
-
-        if (!this.initialized) {
-          if (frame.streamId === 0 && frame.type === FrameType.INIT) {
-            this.initialized = true;
-            clearTimeout(connectionTimeout);
-            if (this._initResponseTimer) {
-              clearTimeout(this._initResponseTimer);
-              this._initResponseTimer = null;
-            }
-            this.reconnectDelay = INITIAL_RECONNECT_DELAY;
-            if (this.reconnectAttempts > 0) {
-              console.log(`[${new Date().toISOString()}] [${this.config.interfaceName}] Reconnected after ${this.reconnectAttempts} attempt(s)`);
-            }
-            this.reconnectAttempts = 0;
-            try {
-              const settings = JSON.parse(frame.payload.toString());
-              if (settings.maxConcurrentStreams) {
-                this.serverSettings.maxConcurrentStreams = settings.maxConcurrentStreams;
-              }
-            } catch { /* use defaults */ }
-            this._startWatchdog();
-            this._startKeepalive();
-            this.emit('status', 'connected');
-            this.emit('connected');
-            return;
-          }
-          this.socket.destroy();
-          return;
+    const decoder = createFrameDecoder(frame => {
+      if (!current()) return;
+      this.lastActivity = this._now();
+      if (!this.initialized) {
+        if (frame.streamId !== 0 || frame.type !== FrameType.INIT || frame.seqNo !== 0) { sock.destroy(); return; }
+        let settings;
+        try { settings = JSON.parse(frame.payload.toString()); } catch { sock.destroy(); return; }
+        if (!compatible(settings) || settings.clientSession !== hello.clientSession || !validNonce(settings.serverSession) ||
+            !Number.isInteger(settings.maxConcurrentStreams) || settings.maxConcurrentStreams < 1 || settings.maxConcurrentStreams > 4096) {
+          sock.destroy(); return;
         }
-
-        // Handle control frames
-        if (frame.streamId === 0) {
-          if (frame.type === FrameType.PING) {
-            console.log(`[${this.config.interfaceName}] ${new Date().toISOString()} received PING, sending PONG`);
-            this.socket.write(encodeFrame(0, FrameType.PONG, Buffer.alloc(0)));
-            return;
-          }
-          if (frame.type === FrameType.PONG) {
-            console.log(`[${this.config.interfaceName}] ${new Date().toISOString()} received PONG`);
-            this.lastPongTime = Date.now();
-            return;
-          }
-          if (frame.type === FrameType.RESET_SEQ) {
-            this.emit('resetSeq', frame);
-            return;
-          }
+        // A callback may synchronously cancel this lane and every old lane.
+        if (this.config.acceptSession && !this.config.acceptSession(settings, this, hello)) { sock.destroy(); return; }
+        if (!current()) return;
+        this.serverSession = settings.serverSession;
+        this.clientSession = hello.clientSession;
+        this.serverSettings = settings;
+        this.initialized = true;
+        clearTimeout(this._initResponseTimer); this._initResponseTimer = null;
+        this.reconnectDelay = 500; this.reconnectAttempts = 0;
+        this._startKeepalive(); this._startWatchdog();
+        this.emit('status', 'connected'); this.emit('connected'); return;
+      }
+      if (frame.streamId === 0) {
+        if (frame.seqNo === 0 && frame.payload.length === 0 && frame.type === FrameType.PING) {
+          this._writeRaw(sock, encodeFrame(0, FrameType.PONG, Buffer.alloc(0))); return;
         }
-
-        // Data frames
-        this.emit('frame', frame);
-      },
-      (err) => {
-        console.error(`[${this.config.interfaceName}] Protocol error:`, err.message);
-        this.socket.destroy();
+        if (frame.seqNo === 0 && frame.payload.length === 0 && frame.type === FrameType.PONG) { this.lastPongTime = this._now(); return; }
+        this.emit('protocolFailure', 'unexpected-control-or-RESET_SEQ'); sock.destroy(); return;
       }
-    );
-
-    this.socket.on('data', this.decoder);
-
-    this.socket.on('error', (err) => {
-      clearTimeout(connectionTimeout);
-      if (err.code !== 'ECONNREFUSED' && err.code !== 'ECONNRESET') {
-        console.error(`[${this.config.interfaceName}] TLS error:`, err.message);
-      }
-    });
-
-    this.socket.on('close', () => {
-      clearTimeout(connectionTimeout);
-      if (this._initResponseTimer) {
-        clearTimeout(this._initResponseTimer);
-        this._initResponseTimer = null;
-      }
+      this.emit('frame', frame);
+    }, () => sock.destroy());
+    this.decoder = decoder;
+    sock.on('data', decoder);
+    sock.on('drain', () => { if (this.socket === sock) this.blockedSince = null; });
+    sock.on('error', () => sock.destroy());
+    sock.on('close', () => {
+      decoder.destroy();
+      clearTimeout(timeout);
+      if (this.socket !== sock) return;
+      const established = this.initialized;
       this.initialized = false;
-      this._stopWatchdog();
-      this._stopKeepalive();
-      this.emit('status', 'disconnected');
-      if (!this.destroyed) {
-        this._scheduleReconnect();
-      }
+      clearTimeout(this._initResponseTimer); this._initResponseTimer = null;
+      this._stopKeepalive(); this._stopWatchdog();
+      this.emit('status', 'disconnected', established);
+      if (!this.destroyed) this._scheduleReconnect();
     });
   }
-
+  _writeRaw(sock, data) {
+    if (!sock || sock.destroyed) return false;
+    try {
+      const result = sock.write(data);
+      if (!result && this.blockedSince === null) this.blockedSince = this._now();
+      if (sock.writableLength > (this.config.maxLaneBufferBytes || MAX_LANE_BYTES)) {
+        this.emit('protocolFailure', 'lane-buffer-limit'); sock.destroy(); return false;
+      }
+      return result;
+    } catch { sock.destroy(); return false; }
+  }
   _scheduleReconnect() {
-    if (this.reconnectTimer) return;
+    if (this.reconnectTimer || this.destroyed) return;
     this.reconnectAttempts++;
-    console.log(`[${new Date().toISOString()}] [${this.config.interfaceName}] Reconnect attempt #${this.reconnectAttempts} in ${this.reconnectDelay}ms...`);
-    this.reconnectTimer = setTimeout(() => {
-      this.reconnectTimer = null;
-      this._connect();
-    }, this.reconnectDelay);
-    this.reconnectDelay = Math.min(this.reconnectDelay * 2, MAX_RECONNECT_DELAY);
+    this.reconnectTimer = setTimeout(() => { this.reconnectTimer = null; this._connect(); }, this.reconnectDelay);
+    this.reconnectDelay = Math.min(this.reconnectDelay * 2, 3000);
   }
-
-  _startWatchdog() {
-    this.lastActivity = Date.now();
-    if (this.watchdogTimer) clearInterval(this.watchdogTimer);
-    this.watchdogTimer = setInterval(() => {
-      if (!this.initialized || !this.socket || this.socket.destroyed) return;
-      const idleTime = Date.now() - this.lastActivity;
-      if (idleTime > this._watchdogTimeout) {
-        console.log(`[${new Date().toISOString()}] [${this.config.interfaceName}] watchdog: no activity for ${Math.round(idleTime/1000)}s, closing`);
-        this.socket.destroy();
-      }
-    }, 5000);
-  }
-
-  _stopWatchdog() {
-    if (this.watchdogTimer) {
-      clearInterval(this.watchdogTimer);
-      this.watchdogTimer = null;
-    }
-  }
-
+  _now() { return performance.now(); }
+  _recordActivity() { this.lastActivity = this._now(); }
   _startKeepalive() {
-    this.lastPongTime = Date.now();
-    if (this.keepaliveTimer) clearInterval(this.keepaliveTimer);
+    this._stopKeepalive(); this.lastPongTime = this._now();
     this.keepaliveTimer = setInterval(() => {
-      if (!this.initialized || !this.socket || this.socket.destroyed) return;
-
-      if (Date.now() - this.lastWriteOk > this._backpressureTimeout) {
-        console.log(`[${new Date().toISOString()}] [${this.config.interfaceName}] backpressure: socket not drained, reconnecting`);
-        this.socket.destroy();
-        return;
-      }
-
-      if (Date.now() - this.lastPongTime > this._pongTimeout) {
-        console.log(`[${new Date().toISOString()}] [${this.config.interfaceName}] keepalive: no PONG for ${Math.round((Date.now() - this.lastPongTime) / 1000)}s, reconnecting`);
-        this.socket.destroy();
-        return;
-      }
-
-      console.log(`[${this.config.interfaceName}] ${new Date().toISOString()} sending PING`);
-      this.socket.write(encodeFrame(0, FrameType.PING, Buffer.alloc(0)));
+      if (!this.isConnected()) return;
+      if (this.socket.writableNeedDrain && this.blockedSince === null) this.blockedSince = this._now();
+      if ((this.blockedSince !== null && this._now() - this.blockedSince > this._backpressureTimeout) ||
+          this._now() - this.lastPongTime > this._pongTimeout) { this.socket.destroy(); return; }
+      this._writeRaw(this.socket, encodeFrame(0, FrameType.PING, Buffer.alloc(0)));
     }, this._pingInterval);
   }
-
-  _stopKeepalive() {
-    if (this.keepaliveTimer) {
-      clearInterval(this.keepaliveTimer);
-      this.keepaliveTimer = null;
-    }
+  _startWatchdog() {
+    this._stopWatchdog(); this.lastActivity = this._now();
+    this.watchdogTimer = setInterval(() => {
+      if (this.isConnected() && this._now() - this.lastActivity > this._watchdogTimeout) this.socket.destroy();
+    }, 5000);
   }
-
-  _recordActivity() {
-    this.lastActivity = Date.now();
-  }
-
-  write(data) {
-    if (this.socket && !this.socket.destroyed && this.initialized) {
-      return this.socket.write(data);
-    }
-    return false;
-  }
-
-  isConnected() {
-    return this.socket && !this.socket.destroyed && this.initialized;
-  }
-
-  pause() {
-    if (this.socket && !this.socket.destroyed && typeof this.socket.pause === 'function') {
-      this.socket.pause();
-    }
-  }
-
-  resume() {
-    if (this.socket && !this.socket.destroyed && typeof this.socket.resume === 'function') {
-      this.socket.resume();
-    }
-  }
-
+  _stopKeepalive() { clearInterval(this.keepaliveTimer); this.keepaliveTimer = null; }
+  _stopWatchdog() { clearInterval(this.watchdogTimer); this.watchdogTimer = null; }
+  write(data) { return this.isConnected() ? this._writeRaw(this.socket, data) : false; }
+  isConnected() { return Boolean(this.socket && !this.socket.destroyed && this.initialized); }
+  // Raw lane pauses cannot keep control readable. Reject instead of hiding a
+  // timeout; production flow control lives in TransportSession's bounded queues.
+  pause() { this.emit('protocolFailure', 'raw-lane-pause-forbidden'); this.socket?.destroy(); }
+  resume() {}
   destroy() {
-    this.destroyed = true;
-    this._stopWatchdog();
-    this._stopKeepalive();
-    if (this._initResponseTimer) {
-      clearTimeout(this._initResponseTimer);
-      this._initResponseTimer = null;
-    }
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
-    if (this.socket) {
-      this.socket.destroy();
-      this.socket = null;
-    }
-    this.emit('status', 'failed');
-    this.removeAllListeners();
+    this.destroyed = true; this.initialized = false;
+    this._stopKeepalive(); this._stopWatchdog();
+    clearTimeout(this._initResponseTimer); this._initResponseTimer = null;
+    clearTimeout(this.reconnectTimer); this.reconnectTimer = null;
+    this.socket?.destroy();
+    this.emit('status', 'failed'); this.removeAllListeners();
   }
 }
-
 module.exports = { RealSocket, SEQ_RESET_THRESHOLD, DEFAULT_PING_INTERVAL, DEFAULT_PONG_TIMEOUT };

@@ -78,7 +78,7 @@ class ClientSession {
   constructor({ serial, domains, maxStreams = 100 }) {
     this.serial = String(serial);
     this.domains = new Set(domains);
-    this.pool = new ConnectionPool({ clientSerial: serial });
+    this.pool = new ConnectionPool({ clientSerial: serial, maxTrackedStreams: maxStreams });
     this.nextStreamId = 1;
     this.activeStreamIds = new Set();
     this.maxStreams = maxStreams;
@@ -101,16 +101,12 @@ class ClientSession {
   }
 
   allocateStreamId() {
-    const attempts = this.maxStreams;
-    for (let i = 0; i < attempts; i++) {
-      const id = this.nextStreamId++;
-      if (this.nextStreamId > 2147483647) this.nextStreamId = 1;
-      if (!this.activeStreamIds.has(id)) {
-        this.activeStreamIds.add(id);
-        return id;
-      }
+    if (this.evicted || this.activeStreamIds.size >= this.maxStreams || this.nextStreamId > 0x7fffffff) {
+      throw new Error('Stream allocation limit (IDs never wrap)');
     }
-    throw new Error('No available stream IDs');
+    const id = this.nextStreamId++;
+    this.activeStreamIds.add(id);
+    return id;
   }
 
   releaseStreamId(streamId) {

@@ -2,8 +2,8 @@
 // TLS E2E Test Runner (full suite including long timeout tests)
 //
 // Included suites:
-//   - node:test files listed in testFiles (server/client/protocol e2e)
-//   - CLI unit tests: tests/unit/test-parse-args.js (pure argument parsing)
+//   - all node:test regressions in the TLS e2e and unit directories
+//     (including CLI, HTTP/metadata and transport tests)
 //   - standalone gzip suite: tests/e2e/tls-mtls/test-gzip.js (not node:test;
 //     spawned as a child process)
 //
@@ -21,37 +21,16 @@
 const { run } = require('node:test');
 const { join } = require('node:path');
 
+const { readdirSync } = require('node:fs');
 const testFiles = [
-  'test-frames.js',
-  'test-init.js',
-  'test-connection.js',
-  'test-http-get.js',
-  'test-http-post.js',
-  'test-concurrent.js',
-  'test-streaming.js',
-  'test-sse.js',
-  'test-sse-timeout.js', // Tests SSE connections stay open beyond 30s timeout
-  'test-large-body.js',
-  'test-disconnect.js',
-  'test-reconnect.js',
-  'test-malformed.js',
-  'test-oversized-frame.js',
-  'test-ping-pong.js',
-  'test-backpressure.js',
-  'test-max-streams.js',
-  'test-stream-timeout.js',
-  'test-cors.js',
-  'test-security.js',
-  'test-revocation.js',
-  'test-websocket.js',
-  'test-websocket-bugs.js',
-  'test-bugfixes.js',
-  'test-multipath.js',
-  'test-multipath-e2e.js',
-  'test-multi-client-domains.js',
-  // CLI unit tests (previously omitted from the runners)
-  join('..', '..', 'unit', 'test-parse-args.js'),
-  join('..', '..', 'unit', 'test-gzip-step.js')
+  // Keep mandatory deployment runner suites explicit; discover other unit and
+  // transport regressions without duplicating them. Gzip runs standalone once.
+  '../../unit/test-parse-args.js',
+  '../../unit/test-gzip-step.js',
+  ...readdirSync(join(__dirname, '../../unit'))
+    .filter(f => /^test-.*\.js$/.test(f) && !['test-parse-args.js', 'test-gzip-step.js'].includes(f))
+    .sort().map(f => '../../unit/' + f),
+  ...readdirSync(__dirname).filter(f => /^test-.*\.js$/.test(f) && f !== 'test-gzip.js').sort()
 ];
 
 // Files that need longer timeout (in ms)
@@ -121,7 +100,7 @@ async function main() {
       let failed = 0;
 
       for await (const event of stream) {
-        if (event.type === 'test:pass') {
+        if (event.type === 'test:pass' && event.data.details?.type !== 'suite') {
           passed++;
         } else if (event.type === 'test:fail') {
           failed++;

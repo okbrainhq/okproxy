@@ -1,3 +1,4 @@
+const { VERSION, CAPABILITY, nonce } = require('../../../packages/frame-protocol/transport-session');
 // Test 14: PING/PONG Timeout (TLS version)
 
 const { describe, it } = require('node:test');
@@ -51,6 +52,7 @@ describe('PING/PONG Keepalive', () => {
       await new Promise((resolve) => {
         socket.on('connect', () => {
           socket.write(encodeFrame(0, FrameType.INIT, JSON.stringify({
+            version: VERSION, capability: CAPABILITY, clientSession: nonce(),
             interface: 'test-no-pong'
           })));
           
@@ -102,6 +104,7 @@ describe('PING/PONG Keepalive', () => {
       await new Promise((resolve) => {
         socket.on('connect', () => {
           socket.write(encodeFrame(0, FrameType.INIT, JSON.stringify({
+            version: VERSION, capability: CAPABILITY, clientSession: nonce(),
             interface: 'test-timeout-cleanup'
           })));
           setTimeout(resolve, 300);

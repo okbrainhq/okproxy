@@ -157,9 +157,12 @@ function main() {
   console.log('Starting TLS tunnel server...');
   console.log('Options:', options);
 
+  // Default (non-cert-bound) mode must poll the CRL too: the `ca` CLI revokes
+  // out of process, so the in-process event never fires. MultiClientManager
+  // starts its own watcher, so only the plain pool is given the options here.
   const connectionPool = options.certBoundDomains
     ? new MultiClientManager(options)
-    : new ConnectionPool();
+    : new ConnectionPool(options);
 
   const tlsServer = createTLSServer(connectionPool, options);
 

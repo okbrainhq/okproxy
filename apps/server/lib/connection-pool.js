@@ -1,272 +1,142 @@
-// ConnectionPool — Server-side multipath/parallel connection manager
-// Accepts multiple TLS connections from the same client, dedups inbound, and pins each outbound stream to one connection
+// Server transport integration. Every established lane belongs to one v2
+// session; lane loss is session failure, never an implicit stream migration.
+const { encodeFrame, FrameType } = require('../../../packages/frame-protocol');
+const { TransportSession, onceAnyDrain, nonce, MAX_LANE_BYTES, MAX_LANES, SEQ_RESET_THRESHOLD, positive } = require('../../../packages/frame-protocol/transport-session');
+const { isRevoked } = require('./ca');
 
-const { encodeFrame, FrameType, CONTROL_FRAME_TYPES, DedupWindow } = require('../../../packages/frame-protocol');
+const DEFAULT_REVOCATION_WATCH_INTERVAL_MS = 5000;
 
-const SEQ_RESET_THRESHOLD = 0xFFFFFF0F; // 2^32 - 1,000,000
-
-// Grace period before cleaning up completed-stream dedup/seq state.
-const STREAM_CLEANUP_GRACE_MS = 60000;
+/**
+ * Safe serial normalization for CRL lookups: trim, drop empty/absent values.
+ * ca.isRevoked() interprets TLS-reported serials as hex and reports malformed
+ * input as "not revoked" (it neither throws nor evicts), so this only guards
+ * against null/blank/whitespace serials.
+ */
+function normalizeSerial(value) {
+  if (value === undefined || value === null) return null;
+  const serial = String(value).trim();
+  return serial ? serial : null;
+}
 
 class ConnectionPool {
   constructor(options = {}) {
-    this.connections = new Map(); // `${clientSerial}:${interfaceName}` -> socket
-    this.dedupWindows = new Map(); // streamId -> DedupWindow
-    this.seqCounters = new Map(); // streamId -> nextSeqNo
-    this.cleanupTimers = new Map(); // streamId -> setTimeout handle (TTL cleanup)
-    this.activeStreams = new Map(); // streamId -> { frameHandler, errorHandler }
-    this.clientSerial = options.clientSerial ? String(options.clientSerial) : null; // Active authenticated client identity
-    this.streamOutboundConnections = new Map(); // streamId -> connection key (server -> client single-flow)
-    this.streamInboundConnections = new Map(); // streamId -> Set<socket> (client -> server)
-    this.streamOptions = new Map(); // streamId -> { singleFlow }
+    this.options = options;
+    this.connections = new Map();
+    this.activeStreams = new Map();
+    this.clientSerial = options.clientSerial ? String(options.clientSerial) : null;
+    this.clientSession = null;
+    this.sessionId = nonce();
+    this.streamOutboundConnections = new Map();
+    this.streamOptions = new Map();
     this.roundRobinCursor = 0;
+    this.maxLaneBufferBytes = positive(options.maxLaneBufferBytes, MAX_LANE_BYTES);
+    this.caDir = options.caDir || './data/ca';
+    this.revocationWatchTimer = null;
+    this._closing = false;
+    this.transport = this._newTransport();
+    if (options.revocationWatch) this.startRevocationWatch(options.revocationWatchIntervalMs);
   }
-
-  /**
-   * Register a new connection. Replaces existing one with same interface name.
-   * Returns false when a different client identity is already active.
-   */
+  _newTransport() {
+    return new TransportSession({ ...this.options, initiator: true,
+      deliver: frame => this._routeToHandler(frame),
+      fatal: reason => this.evictAll(reason),
+      retire: id => this.clearStreamMode(id)
+    });
+  }
   add(clientSerial, interfaceName, socket) {
     const serial = String(clientSerial);
-    if (this.clientSerial && this.clientSerial !== serial) {
-      return false;
-    }
-
-    this.clientSerial = serial;
+    if (this._closing || (this.clientSerial && this.clientSerial !== serial)) return false;
+    const peer = socket._okproxyClientSession;
+    if (this.clientSession && this.clientSession !== peer) return false;
     const key = `${serial}:${interfaceName}`;
-
-    // Replace existing connection for this interface
-    if (this.connections.has(key)) {
-      const old = this.connections.get(key);
-      this._forgetConnection(key, old);
-      try { old.destroy(); } catch {}
-    }
+    // Replacing a still-live lane may discard its unique bytes. Reject the new
+    // lane rather than pretending another connection is a redundant copy.
+    if (this.connections.has(key) || this.connections.size >= MAX_LANES) return false;
+    if (this.transport.failed) this.transport = this._newTransport();
+    this.clientSerial = serial;
+    this.clientSession = peer;
+    socket._okproxyTransportSession = this.sessionId;
     this.connections.set(key, socket);
     return true;
   }
-
-  /**
-   * Remove a connection
-   */
+  owns(socket) {
+    return socket && !socket.destroyed && socket._okproxyTransportSession === this.sessionId &&
+      [...this.connections.values()].includes(socket);
+  }
   remove(socket) {
-    let removedKey = null;
-    for (const [name, s] of this.connections) {
-      if (s === socket) {
-        removedKey = name;
-        this.connections.delete(name);
-        break;
-      }
-    }
-
-    if (removedKey) {
-      this._forgetConnection(removedKey, socket);
-    }
-
-    // If no connections left, clean up all streams
-    if (this.connections.size === 0) {
-      this.clientSerial = null;
-      this._cleanupAllStreams();
-    }
+    if ([...this.connections.values()].includes(socket)) this._evictAll('transport-lane-lost');
   }
-
-  get count() {
-    return this.connections.size;
-  }
-
-  /**
-   * Process an incoming data frame from any connection.
-   * Handles dedup and routes to stream handlers.
-   * @returns {'new' | 'duplicate'}
-   */
+  get count() { return this.connections.size; }
   onFrame(frame, socket = null) {
-    // Control frames are handled per-connection, skip
-    if (frame.streamId === 0 && CONTROL_FRAME_TYPES.has(frame.type)) {
-      return 'new';
-    }
-
-    const streamId = frame.streamId;
-    if (socket) this._markInboundConnection(streamId, socket);
-
-    // Stream lifecycle — FIN/ERROR: dedup before delivery
-    if (frame.type === FrameType.FIN || frame.type === FrameType.ERROR) {
-      let window = this.dedupWindows.get(streamId);
-      if (!window) {
-        window = new DedupWindow(frame.seqNo);
-        window.checkAndAdd(frame.seqNo);
-        this.dedupWindows.set(streamId, window);
-      } else {
-        const result = window.checkAndAdd(frame.seqNo);
-        if (result === 'duplicate') return 'duplicate';
-      }
-      // Keep dedupWindow for late multipath duplicates.
-      // Do NOT delete seqCounters: the outbound seqNo must keep growing
-      // across stream-ID reuses so the client's dedup window sees a
-      // higher seqNo instead of treating the new stream as a duplicate.
-      // Schedule TTL cleanup to bound memory for long-lived tunnels.
-      this._scheduleStreamCleanup(streamId);
-      this._routeToHandler(frame);
-      return 'new';
-    }
-
-    // HEADERS / UPGRADE — dedup if window already exists
-    if (frame.type === FrameType.HEADERS || frame.type === FrameType.UPGRADE) {
-      let window = this.dedupWindows.get(streamId);
-      if (!window) {
-        window = new DedupWindow(frame.seqNo);
-        this.dedupWindows.set(streamId, window);
-      }
-      if (window.checkAndAdd(frame.seqNo) === 'duplicate') return 'duplicate';
-      this._cancelStreamCleanup(streamId); // Stream (re)started — cancel pending cleanup
-      this._routeToHandler(frame);
-      return 'new';
-    }
-
-    // DATA frames — dedup check
-    let window = this.dedupWindows.get(streamId);
-    if (!window) {
-      window = new DedupWindow(frame.seqNo);
-      window.checkAndAdd(frame.seqNo);
-      this.dedupWindows.set(streamId, window);
-      this._routeToHandler(frame);
-      return 'new';
-    }
-
-    const result = window.checkAndAdd(frame.seqNo);
-    if (result === 'duplicate') return 'duplicate';
-
-    this._routeToHandler(frame);
-    return 'new';
+    if (socket && !this.owns(socket)) return 'invalid';
+    if (frame.type === FrameType.RESET_SEQ) { this.handleResetSeq(frame); return 'failed'; }
+    // Allocation/handler membership is checked BEFORE windows or lane maps.
+    if (!this.activeStreams.has(frame.streamId)) return this.transport.known.has(frame.streamId) ? 'duplicate' : 'invalid';
+    return this.transport.receive(frame);
   }
-
   _routeToHandler(frame) {
     const handler = this.activeStreams.get(frame.streamId);
     if (!handler) return;
-
-    if (frame.type === FrameType.ERROR && handler.errorHandler) {
-      handler.errorHandler(new Error(frame.payload.toString()));
-    } else if (handler.frameHandler) {
-      handler.frameHandler(frame);
+    if (frame.type === FrameType.ERROR) {
+      this.unregisterStream(frame.streamId);
+      try { handler.errorHandler?.(new Error(frame.payload.toString())); } catch {}
+    } else handler.frameHandler?.(frame);
+  }
+  send(buf) {
+    if (this._closing || this.transport.failed) return false;
+    const id = buf.readUInt32BE(0), type = buf.readUInt8(4);
+    if (type === FrameType.RESET_SEQ || id === 0) { this.transport.fail('unexpected-control-send'); return false; }
+    const opening = type === FrameType.HEADERS || type === FrameType.UPGRADE;
+    if (!this.transport.prepare(buf)) {
+      // Router sends OPEN before registering its handler. Throw here so that
+      // early failure is surfaced as 502, not mistaken for writable backpressure.
+      if (opening) throw new Error('Transport cannot allocate/send stream');
+      return false;
     }
+    const targets = this._isSingleFlowStream(id) ? this._selectOutboundConnection(id) : this._allLiveConnections();
+    const result = this._writeToConnections(buf, targets);
+    if (type === FrameType.ERROR) this.transport.drop(id);
+    if (opening && this.transport.failed) throw new Error('Transport failed sending opening frame');
+    return result;
   }
-
-  /**
-   * Send a frame to the client — assigns seqNo. Normal streams keep the
-   * traditional multipath behavior (broadcast to every tunnel connection).
-   * Streams marked singleFlow are pinned to one connection.
-   */
-  send(frameBuf) {
-    const type = frameBuf.readUInt8(4);
-
-    if (CONTROL_FRAME_TYPES.has(type)) {
-      return this._writeToConnections(frameBuf, this._allLiveConnections());
+  _allLiveConnections() { return [...this.connections.entries()].filter(([, socket]) => !socket.destroyed); }
+  _writeToConnections(buf, entries) {
+    if (!entries.length) { this.transport.fail('no-writable-lane'); return false; }
+    let writable = false;
+    for (const [, socket] of entries) {
+      if (this.transport.failed) return false;
+      try {
+        if (socket.destroyed) throw new Error('lane closed');
+        // false still means queued! Never retry or reset its sequence number.
+        writable = socket.write(buf) || writable;
+        if (socket.writableLength > this.maxLaneBufferBytes) throw new Error('lane-buffer-limit');
+      } catch (err) { this.transport.fail(err.message); return false; }
     }
-
-    const streamId = frameBuf.readUInt32BE(0);
-    let seqNo = (this.seqCounters.get(streamId) || 0) + 1;
-
-    if (seqNo > SEQ_RESET_THRESHOLD) {
-      this._sendResetSeq(streamId);
-      seqNo = 0;
+    return writable;
+  }
+  registerStream(id, handlers, options = {}) {
+    if (!this.count || this._closing || this.transport.failed || this.activeStreams.has(id)) {
+      try { handlers.errorHandler?.(new Error('Transport stream registration failed')); } catch {}
+      return false;
     }
-
-    this.seqCounters.set(streamId, seqNo);
-    frameBuf.writeUInt32BE(seqNo, 5);
-
-    // Outbound ERROR means the server is aborting the stream — both
-    // directions are done. Schedule TTL cleanup.
-    // (Outbound FIN is just end-of-request-body; the client's response
-    // may still be active, so no cleanup here — it's scheduled when
-    // the server receives the client's inbound FIN/ERROR in onFrame().)
-    if (type === FrameType.ERROR) {
-      this._scheduleStreamCleanup(streamId);
+    let state = this.transport.streams.get(id);
+    if (!state && !this.transport.failed) state = this.transport.open(id);
+    if (!state || this.activeStreams.has(id) || !this.count) {
+      try { handlers.errorHandler?.(new Error('Transport stream registration failed')); } catch {}
+      return false;
     }
-
-    const targets = this._isSingleFlowStream(streamId)
-      ? this._selectOutboundConnection(streamId)
-      : this._allLiveConnections();
-
-    return this._writeToConnections(frameBuf, targets);
+    this.activeStreams.set(id, handlers);
+    if (Object.hasOwn(options, 'singleFlow')) this.setStreamMode(id, options);
+    return true;
   }
-
-  onceDrain(callback) {
-    this._onceDrainOnSockets(this._allLiveConnections().map(([, sock]) => sock), callback);
+  unregisterStream(id) { this.activeStreams.delete(id); this.transport.drop(id); this.clearStreamMode(id); }
+  getStreamHandler(id) { return this.activeStreams.get(id) || null; }
+  setStreamMode(id, options = {}) {
+    if (options.singleFlow) this.streamOptions.set(id, { singleFlow: true });
+    else this.clearStreamMode(id);
   }
-
-  onceDrainForStream(streamId, callback) {
-    const sockets = this._isSingleFlowStream(streamId) ? this._getOutboundSocketsForStream(streamId) : [];
-    this._onceDrainOnSockets(sockets.length > 0 ? sockets : this._allLiveConnections().map(([, sock]) => sock), callback);
-  }
-
-  pause() {
-    for (const sock of this.connections.values()) {
-      if (!sock.destroyed && typeof sock.pause === 'function') sock.pause();
-    }
-  }
-
-  resume() {
-    for (const sock of this.connections.values()) {
-      if (!sock.destroyed && typeof sock.resume === 'function') sock.resume();
-    }
-  }
-
-  pauseStream(streamId) {
-    const sockets = this._getInboundSocketsForStream(streamId);
-    if (sockets.length === 0) return this.pause();
-    for (const sock of sockets) {
-      if (!sock.destroyed && typeof sock.pause === 'function') sock.pause();
-    }
-  }
-
-  resumeStream(streamId) {
-    const sockets = this._getInboundSocketsForStream(streamId);
-    if (sockets.length === 0) return this.resume();
-    for (const sock of sockets) {
-      if (!sock.destroyed && typeof sock.resume === 'function') sock.resume();
-    }
-  }
-
-  _allLiveConnections() {
-    return [...this.connections.entries()].filter(([, sock]) => !sock.destroyed);
-  }
-
-  _writeToConnections(frameBuf, entries) {
-    let connected = 0;
-    let backpressured = false;
-
-    for (const [, sock] of entries) {
-      if (!sock.destroyed) {
-        connected++;
-        if (!sock.write(frameBuf)) backpressured = true;
-      }
-    }
-
-    return connected > 0 && !backpressured;
-  }
-
-  setStreamMode(streamId, options = {}) {
-    const current = this.streamOptions.get(streamId) || {};
-    if (typeof options.singleFlow === 'boolean') {
-      current.singleFlow = options.singleFlow;
-    }
-
-    if (current.singleFlow) {
-      this.streamOptions.set(streamId, current);
-    } else {
-      this.streamOptions.delete(streamId);
-      this.streamOutboundConnections.delete(streamId);
-    }
-  }
-
-  clearStreamMode(streamId) {
-    this.streamOptions.delete(streamId);
-    this.streamOutboundConnections.delete(streamId);
-    this.streamInboundConnections.delete(streamId);
-  }
-
-  _isSingleFlowStream(streamId) {
-    return this.streamOptions.get(streamId)?.singleFlow === true;
-  }
-
+  clearStreamMode(id) { this.streamOptions.delete(id); this.streamOutboundConnections.delete(id); }
+  _isSingleFlowStream(id) { return this.streamOptions.get(id)?.singleFlow === true; }
   _selectOutboundConnection(streamId) {
     const existingKey = this.streamOutboundConnections.get(streamId);
     const existing = existingKey ? this.connections.get(existingKey) : null;
@@ -307,155 +177,118 @@ class ConnectionPool {
     return sock && !sock.destroyed ? [sock] : [];
   }
 
-  _markInboundConnection(streamId, socket) {
-    if (socket.destroyed) return;
-    let sockets = this.streamInboundConnections.get(streamId);
-    if (!sockets) {
-      sockets = new Set();
-      this.streamInboundConnections.set(streamId, sockets);
-    }
-    sockets.add(socket);
+
+  onceDrain(callback) { return onceAnyDrain(this._allLiveConnections().map(([, s]) => s), callback); }
+  onceDrainForStream(id, callback) {
+    const state = this.transport.streams.get(id);
+    if (!state) return () => {};
+    const sockets = this._isSingleFlowStream(id) ? this._getOutboundSocketsForStream(id) : this._allLiveConnections().map(([, s]) => s);
+    return onceAnyDrain(sockets, callback, state);
   }
-
-  _getInboundSocketsForStream(streamId) {
-    const sockets = this.streamInboundConnections.get(streamId);
-    if (!sockets) return [];
-    return [...sockets].filter(sock => !sock.destroyed);
-  }
-
-  _onceDrainOnSockets(sockets, callback) {
-    const waiting = sockets.filter(sock => !sock.destroyed && sock.writableNeedDrain);
-
-    if (waiting.length === 0) {
-      process.nextTick(callback);
-      return;
-    }
-
-    let pending = waiting.length;
-    let callbackCalled = false;
-
-    const finishOne = () => {
-      pending--;
-      if (pending <= 0 && !callbackCalled) {
-        callbackCalled = true;
-        callback();
-      }
-    };
-
-    for (const sock of waiting) {
-      let settled = false;
-      const done = () => {
-        if (settled) return;
-        settled = true;
-        sock.removeListener('drain', done);
-        sock.removeListener('close', done);
-        sock.removeListener('error', done);
-        finishOne();
-      };
-      sock.once('drain', done);
-      sock.once('close', done);
-      sock.once('error', done);
-    }
-  }
-
-  _forgetConnection(key, socket) {
-    for (const [streamId, assignedKey] of this.streamOutboundConnections) {
-      if (assignedKey === key) this.streamOutboundConnections.delete(streamId);
-    }
-
-    for (const [streamId, sockets] of this.streamInboundConnections) {
-      sockets.delete(socket);
-      if (sockets.size === 0) this.streamInboundConnections.delete(streamId);
-    }
-  }
-
-  _sendResetSeq(streamId) {
-    const frame = encodeFrame(0, FrameType.RESET_SEQ, JSON.stringify({
-      streams: [streamId]
-    }), 0);
-
-    for (const [name, sock] of this.connections) {
-      if (!sock.destroyed) {
-        sock.write(frame);
-      }
-    }
-
-    this.seqCounters.set(streamId, 0);
-  }
-
-  /**
-   * Handle an incoming RESET_SEQ from the client.
-   * Clears only dedup windows (incoming) — not outbound seqCounters.
-   */
-  handleResetSeq(frame) {
-    try {
-      const data = JSON.parse(frame.payload.toString());
-      for (const streamId of data.streams) {
-        this.dedupWindows.delete(streamId);
-        this._cancelStreamCleanup(streamId); // Protect seqCounters from stale TTL timer
-        // Do NOT reset seqCounters — RESET_SEQ from client means
-        // "I reset my outbound", so we only clear our incoming dedup.
-      }
-    } catch {}
-  }
-
-  registerStream(streamId, handlers, options = {}) {
-    this.activeStreams.set(streamId, handlers);
-    if (Object.prototype.hasOwnProperty.call(options, 'singleFlow')) {
-      this.setStreamMode(streamId, { singleFlow: Boolean(options.singleFlow) });
-    }
-  }
-
-  unregisterStream(streamId) {
-    this.activeStreams.delete(streamId);
-    this.clearStreamMode(streamId);
-  }
-
-  getStreamHandler(streamId) {
-    return this.activeStreams.get(streamId) || null;
-  }
-
-  _cleanupAllStreams() {
-    for (const [streamId, handlers] of this.activeStreams) {
-      if (handlers.errorHandler) {
-        handlers.errorHandler(new Error('Client disconnected'));
-      }
-    }
+  pauseStream(id) { this.transport.pause(id); }
+  resumeStream(id) { this.transport.resume(id); }
+  pause() { this.transport.pauseAll(); }
+  resume() { this.transport.resumeAll(); }
+  isPaused() { return false; } // TLS reads NEVER pause for a data consumer
+  handleResetSeq() { this.transport.fail('RESET_SEQ-forbidden-in-v2'); }
+  _sendResetSeq() { this.transport.fail('sequence-exhausted'); }
+  _failStream(id, reason) { this.transport.fail(reason); }
+  _cleanupAllStreams(reason = 'Client disconnected') {
+    const handlers = [...this.activeStreams.values()];
     this.activeStreams.clear();
-    for (const timer of this.cleanupTimers.values()) clearTimeout(timer);
-    this.cleanupTimers.clear();
-    this.dedupWindows.clear();
-    this.seqCounters.clear();
-    this.streamOutboundConnections.clear();
-    this.streamInboundConnections.clear();
-    this.streamOptions.clear();
+    this.transport.clear();
+    this.streamOptions.clear(); this.streamOutboundConnections.clear();
+    for (const handler of handlers) {
+      try { handler.errorHandler?.(new Error(reason)); } catch (err) {
+        console.error('[connection-pool] cleanup handler:', err.message);
+      }
+    }
+  }
+  evictBySerial(serial, reason = 'revoked') {
+    return this.clientSerial === String(serial) ? this.evictAll(reason) : 0;
+  }
+  evictAll(reason = 'evicted') { return this._evictAll(reason); }
+  _evictAll(reason) {
+    if (this._closing) return 0;
+    this._closing = true;
+    const sockets = [...this.connections.values()];
+    this.connections.clear(); // fences late decoder and close callbacks FIRST
+    this.transport.failed = true;
+    this.sessionId = nonce();
+    this.clientSession = null;
+    this.clientSerial = null;
+    this._cleanupAllStreams(reason);
+    for (const socket of sockets) { try { socket.destroy(); } catch {} }
+    this._closing = false;
+    return sockets.length;
   }
 
   /**
-   * Schedule TTL cleanup of dedup/seq state for a completed stream.
-   * The grace period catches late multipath duplicates while bounding memory.
+   * Bounded CRL polling for the default (non-cert-bound) pool.
+   *
+   * The in-process `certificate-revoked` event only fires when revocation
+   * happens in this process. The `ca` CLI revokes from a separate process, so a
+   * live tunnel would keep serving until its next handshake unless the CRL is
+   * polled. Cert-bound mode is already covered by
+   * MultiClientManager#startRevocationWatch; inner session pools never receive
+   * `revocationWatch`, so exactly one watcher exists per server.
+   *
+   * @param {number} [intervalMs] poll interval (default 5000)
+   * @returns {() => void} stop function
    */
-  _scheduleStreamCleanup(streamId) {
-    this._cancelStreamCleanup(streamId);
-    const timer = setTimeout(() => {
-      this.cleanupTimers.delete(streamId);
-      this.dedupWindows.delete(streamId);
-      this.seqCounters.delete(streamId);
-      this.streamOutboundConnections.delete(streamId);
-      this.streamInboundConnections.delete(streamId);
-      this.streamOptions.delete(streamId);
-    }, STREAM_CLEANUP_GRACE_MS);
-    if (typeof timer.unref === 'function') timer.unref();
-    this.cleanupTimers.set(streamId, timer);
+  startRevocationWatch(intervalMs = DEFAULT_REVOCATION_WATCH_INTERVAL_MS) {
+    this.stopRevocationWatch();
+    const interval = Number.isFinite(intervalMs) && intervalMs > 0
+      ? Math.floor(intervalMs)
+      : DEFAULT_REVOCATION_WATCH_INTERVAL_MS;
+    this.revocationWatchTimer = setInterval(() => {
+      try {
+        this.evictRevokedSessions();
+      } catch (err) {
+        console.error(`[${new Date().toISOString()}] Revocation watch failed:`, err && err.message);
+      }
+    }, interval);
+    if (typeof this.revocationWatchTimer.unref === 'function') this.revocationWatchTimer.unref();
+    return () => this.stopRevocationWatch();
   }
 
-  _cancelStreamCleanup(streamId) {
-    const timer = this.cleanupTimers.get(streamId);
-    if (timer) {
-      clearTimeout(timer);
-      this.cleanupTimers.delete(streamId);
+  stopRevocationWatch() {
+    if (this.revocationWatchTimer) {
+      clearInterval(this.revocationWatchTimer);
+      this.revocationWatchTimer = null;
     }
+  }
+
+  /**
+   * Evict this pool's tunnel when its authenticated serial appears in the CRL.
+   * Eviction requires a *loadable* CRL that lists the serial: a missing or
+   * unreadable CRL, an unknown serial or malformed input evicts nothing and
+   * never throws — the existing authorization simply stands and keeps serving.
+   * That is the inherited `isRevoked()` storage-failure limitation; this watcher
+   * is NOT a fail-closed guarantee for CRL read failures.
+   * @returns {number} connections evicted
+   */
+  evictRevokedSessions() {
+    const serial = normalizeSerial(this.clientSerial);
+    if (!serial || this._closing) return 0;
+    let revoked = false;
+    try {
+      revoked = isRevoked(serial, this.caDir);
+    } catch (err) {
+      console.error(`[${new Date().toISOString()}] Revocation check failed for serial ${serial}:`, err && err.message);
+      return 0;
+    }
+    if (!revoked) return 0;
+    const evicted = this.evictBySerial(serial, 'certificate revoked');
+    if (evicted > 0) {
+      console.log(`[${new Date().toISOString()}] Evicted revoked tunnel (serial: ${serial})`);
+    }
+    return evicted;
+  }
+
+  /** Release the CRL watcher. Call on shutdown or in tests. */
+  dispose() {
+    this.stopRevocationWatch();
   }
 }
-
 module.exports = { ConnectionPool, SEQ_RESET_THRESHOLD };
