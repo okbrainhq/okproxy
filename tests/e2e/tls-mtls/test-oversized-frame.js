@@ -1,3 +1,4 @@
+const { VERSION, CAPABILITY, nonce } = require('../../../packages/frame-protocol/transport-session');
 // Test 13: Oversized Frame Rejection (TLS version)
 
 const { describe, it } = require('node:test');
@@ -21,7 +22,8 @@ describe('Oversized Frame Rejection', () => {
         socket.on('connect', () => {
           // First send INIT
           socket.write(encodeFrame(0, FrameType.INIT, JSON.stringify({
-            version: 1,
+            version: VERSION, capability: CAPABILITY, clientSession: nonce(),
+
             clientId: 'test-oversized'
           })));
 
@@ -71,7 +73,8 @@ describe('Oversized Frame Rejection', () => {
       await new Promise((resolve) => {
         socket.on('connect', () => {
           socket.write(encodeFrame(0, FrameType.INIT, JSON.stringify({
-            version: 1,
+            version: VERSION, capability: CAPABILITY, clientSession: nonce(),
+
             clientId: 'test-mem'
           })));
 

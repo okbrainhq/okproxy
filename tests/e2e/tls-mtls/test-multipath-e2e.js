@@ -1,3 +1,4 @@
+const { VERSION, CAPABILITY, nonce } = require('../../../packages/frame-protocol/transport-session');
 // Test: Multipath end-to-end with multiple connections
 // Creates multiple connections to verify dedup and failover
 
@@ -41,7 +42,7 @@ describe('Multipath E2E - Dedup', () => {
 });
 
 describe('Multipath E2E - Connection Failover', () => {
-  it('should continue working when one connection drops', async () => {
+  it('should recover a fresh session after any lane drops', async () => {
     const env = await createTestEnv({ keepaliveInterval: 60000 });
     try {
       await env.startClient();
@@ -69,7 +70,10 @@ describe('Multipath E2E - Connection Failover', () => {
 
       await new Promise(r => setTimeout(r, 300));
 
-      // Request should still work through the surviving connection
+      const deadline = Date.now() + 6000;
+      while (!vs.isConnected() && Date.now() < deadline) await new Promise(r => setTimeout(r, 20));
+      assert.ok(vs.isConnected(), 'fresh session reconnects');
+      // No replay promise: only new requests use the new session.
       const res = await httpRequest({
         hostname: 'localhost',
         port: env.ports.httpPort,
@@ -104,6 +108,7 @@ describe('Multipath E2E - RESET_SEQ', () => {
       await new Promise((resolve) => {
         socket.on('connect', () => {
           socket.write(encodeFrame(0, FrameType.INIT, JSON.stringify({
+            version: VERSION, capability: CAPABILITY, clientSession: env.virtualSocket().clientSession,
             interface: 'reset-test',
             maxFrameSize: 1048576
           })));
@@ -128,7 +133,7 @@ describe('Multipath E2E - RESET_SEQ', () => {
       })));
 
       await new Promise(r => setTimeout(r, 200));
-      assert.ok(!socket.destroyed, 'Connection should stay alive after RESET_SEQ');
+      assert.ok(socket.destroyed, 'v2 must fail the session on RESET_SEQ');
 
       socket.destroy();
     } finally {

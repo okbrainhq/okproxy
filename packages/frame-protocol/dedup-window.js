@@ -9,6 +9,16 @@ class DedupWindow {
     this.bits = new Uint8Array(this.bytes);
   }
 
+  /**
+   * Reset the window to a new base, forgetting all previously seen seqNos.
+   * Standalone utility only. The v2 transport never resets/reuses a window.
+   * @param {number} firstSeqNo - Base seqNo for the restarted window
+   */
+  reset(firstSeqNo) {
+    this.base = firstSeqNo >>> 0;
+    this.bits.fill(0);
+  }
+
   // Calculate offset from base (unsigned 32-bit wraps correctly)
   _offset(seqNo) {
     return (seqNo - this.base) >>> 0;

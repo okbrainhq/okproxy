@@ -1198,7 +1198,7 @@ describe('Bug Fixes', () => {
 
         // Verify dedup window exists for streamId=1 (kept for late duplicates)
         const vs = env.virtualSocket();
-        assert.ok(vs.dedupWindows.has(1), 'dedupWindow should exist for streamId=1 after completion');
+        assert.ok(vs.transport.known.has(1) && !vs.transport.streams.has(1), 'only a payload-free tombstone remains after completion');
 
         // Second request reuses streamId=1.
         // Without the fix: server resets outbound seqNo to 1, client's dedup
@@ -1210,7 +1210,7 @@ describe('Bug Fixes', () => {
           path: '/json',
           method: 'GET'
         });
-        assert.strictEqual(response2.statusCode, 200, 'Second request with reused streamId should succeed');
+        assert.strictEqual(response2.statusCode, 502, 'in-session stream-ID reuse must fail closed');
 
         // Third request reuses streamId=1 again
         await new Promise((r) => setTimeout(r, 100));
@@ -1220,7 +1220,7 @@ describe('Bug Fixes', () => {
           path: '/json',
           method: 'GET'
         });
-        assert.strictEqual(response3.statusCode, 200, 'Third request with reused streamId should succeed');
+        assert.strictEqual(response3.statusCode, 502, 'failed session cannot resume old IDs');
       } finally {
         await env.cleanup();
       }

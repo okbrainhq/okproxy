@@ -8,6 +8,67 @@ const DEFAULT_KEY = './.certs/client-key.pem';
 const DEFAULT_CERT = './.certs/client-cert.pem';
 const DEFAULT_CA = './.ca/ca-cert.pem';
 
+/**
+ * Parse a `host:port` endpoint string with IPv6 bracket support.
+ *
+ * Accepts `localhost:8080`, `192.168.0.1:80`, `example.com:443`, `[::1]:9443`
+ * and `[2001:db8::1]:443`. Unbracketed IPv6 literals (multiple colons) are
+ * rejected as ambiguous so a missing/incorrect port cannot be silently
+ * misparsed.
+ *
+ * @param {string} value - raw CLI value
+ * @param {string} [optionName] - flag name used in error messages
+ * @returns {{host: string, port: number}|{error: string}}
+ */
+function parseHostPort(value, optionName = 'value') {
+  const format = `Error: ${optionName} requires host:port format (e.g., localhost:8080 or [::1]:8080)`;
+
+  if (typeof value !== 'string') return { error: format };
+  const raw = value.trim();
+  if (raw.length === 0) return { error: format };
+
+  let host;
+  let portStr;
+
+  if (raw.startsWith('[')) {
+    const close = raw.indexOf(']');
+    if (close < 0) {
+      return { error: `Error: Invalid ${optionName} "${value}". Missing "]" in IPv6 address.` };
+    }
+    host = raw.slice(1, close);
+    const rest = raw.slice(close + 1);
+    if (!rest.startsWith(':')) return { error: format };
+    portStr = rest.slice(1);
+    if (!/^[0-9A-Fa-f:.]+$/.test(host)) {
+      return { error: `Error: Invalid IPv6 address in ${optionName} "${value}".` };
+    }
+  } else {
+    const colonCount = (raw.match(/:/g) || []).length;
+    if (colonCount === 0) return { error: format };
+    if (colonCount > 1) {
+      return { error: `Error: ${optionName} "${value}" looks like an IPv6 address. Use the bracketed form [addr]:port.` };
+    }
+    const idx = raw.indexOf(':');
+    host = raw.slice(0, idx);
+    portStr = raw.slice(idx + 1);
+  }
+
+  if (host.length === 0) {
+    return { error: `Error: ${optionName} is missing a host.` };
+  }
+  if (!/^[A-Za-z0-9._:-]+$/.test(host)) {
+    return { error: `Error: Invalid host in ${optionName} "${value}".` };
+  }
+  if (!/^\d+$/.test(portStr)) {
+    return { error: `Error: Invalid ${optionName} port "${portStr}". Must be 1-65535.` };
+  }
+  const port = Number(portStr);
+  if (!Number.isSafeInteger(port) || port < 1 || port > 65535) {
+    return { error: `Error: Invalid ${optionName} port "${portStr}". Must be 1-65535.` };
+  }
+  return { host, port };
+}
+
 function parseArgs(argv) {
   const args = argv || process.argv.slice(2);
   const options = {
@@ -28,36 +89,26 @@ function parseArgs(argv) {
   for (let i = 0; i < args.length; i++) {
     const arg = args[i];
     switch (arg) {
-      case '--server':
-        const server = args[++i];
-        if (!server.includes(':')) {
-          console.error(`Error: --server requires host:port format (e.g., localhost:8080)`);
+      case '--server': {
+        const parsed = parseHostPort(args[++i], '--server');
+        if (parsed.error) {
+          console.error(parsed.error);
           process.exit(1);
         }
-        const [host, port] = server.split(':');
-        options.serverHost = host;
-        const serverPort = parseInt(port, 10);
-        if (isNaN(serverPort) || serverPort < 1 || serverPort > 65535) {
-          console.error(`Error: Invalid server port ${port}. Must be 1-65535.`);
-          process.exit(1);
-        }
-        options.serverPort = serverPort;
+        options.serverHost = parsed.host;
+        options.serverPort = parsed.port;
         break;
-      case '--target':
-        const target = args[++i];
-        if (!target.includes(':')) {
-          console.error(`Error: --target requires host:port format (e.g., localhost:3000)`);
+      }
+      case '--target': {
+        const parsed = parseHostPort(args[++i], '--target');
+        if (parsed.error) {
+          console.error(parsed.error);
           process.exit(1);
         }
-        const [tHost, tPort] = target.split(':');
-        options.targetHost = tHost;
-        const targetPort = parseInt(tPort, 10);
-        if (isNaN(targetPort) || targetPort < 1 || targetPort > 65535) {
-          console.error(`Error: Invalid target port ${tPort}. Must be 1-65535.`);
-          process.exit(1);
-        }
-        options.targetPort = targetPort;
+        options.targetHost = parsed.host;
+        options.targetPort = parsed.port;
         break;
+      }
       case '--target-timeout':
         const targetTimeoutValue = args[++i];
         const targetTimeout = parseInt(targetTimeoutValue, 10);
@@ -112,8 +163,8 @@ function parseArgs(argv) {
 Usage: node index.js [options]
 
 Options:
-  --server <host:port>    Tunnel server address (default: localhost:9443)
-  --target <host:port>    Local target service (default: localhost:3000)
+  --server <host:port>    Tunnel server address; bracket IPv6 (default: localhost:9443)
+  --target <host:port>    Local target service; bracket IPv6 (default: localhost:3000)
   --target-timeout <ms>   Target response/upgrade timeout; 0 disables (default: 30000)
   --target-keepalive-timeout <ms> Target idle keep-alive timeout; 0 disables idle expiry (default: 3600000)
   --parallel-sockets <n>  Parallel tunnel sockets per interface, 1-32 (default: 1)
@@ -197,4 +248,4 @@ if (require.main === module) {
   main();
 }
 
-module.exports = { main, parseArgs };
+module.exports = { main, parseArgs, parseHostPort };

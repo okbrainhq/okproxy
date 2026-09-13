@@ -20,7 +20,7 @@ const FrameType = {
   PING: 0x06,
   PONG: 0x07,
   UPGRADE: 0x08,
-  RESET_SEQ: 0x09   // Sequence counter reset for long-lived streams
+  RESET_SEQ: 0x09   // Reserved legacy code; receiving it fails a v2 session
 };
 
 // Control frame types (connection-local, not duplicated)
@@ -66,7 +66,7 @@ function createFrameDecoder(onFrame, onError, maxFrameSize = MAX_FRAME_SIZE) {
   let buffer = Buffer.alloc(0);
   let destroyed = false;
 
-  return function decoder(chunk) {
+  function decoder(chunk) {
     if (destroyed) return;
 
     buffer = buffer.length === 0 ? chunk : Buffer.concat([buffer, chunk]);
@@ -93,10 +93,14 @@ function createFrameDecoder(onFrame, onError, maxFrameSize = MAX_FRAME_SIZE) {
 
       onFrame({ streamId, type, seqNo, payload });
     }
-  };
+  }
+  decoder.destroy = () => { destroyed = true; buffer = Buffer.alloc(0); };
+  return decoder;
 }
 
 const { DedupWindow } = require('./dedup-window');
+const { OrderedDedupWindow, ORDER_STATUS } = require('./ordered-window');
+const { MAX_STREAM_ID } = require('./transport-session');
 
 module.exports = {
   encodeFrame,
@@ -105,5 +109,8 @@ module.exports = {
   MAX_FRAME_SIZE,
   HEADER_SIZE,
   CONTROL_FRAME_TYPES,
-  DedupWindow
+  DedupWindow,
+  OrderedDedupWindow,
+  ORDER_STATUS,
+  MAX_STREAM_ID
 };

@@ -1,3 +1,4 @@
+const { VERSION, CAPABILITY, nonce } = require('../../../packages/frame-protocol/transport-session');
 // Test: Multipath VirtualSocket and DedupWindow
 // Tests the dedup window, multiple connections, and connection pool
 
@@ -109,6 +110,7 @@ describe('ConnectionPool - Multiple Connections', () => {
       await new Promise((resolve) => {
         socket2.on('connect', () => {
           socket2.write(encodeFrame(0, FrameType.INIT, JSON.stringify({
+            version: VERSION, capability: CAPABILITY, clientSession: env.virtualSocket().clientSession,
             interface: 'en1',
             maxFrameSize: 1048576
           })));
@@ -119,7 +121,7 @@ describe('ConnectionPool - Multiple Connections', () => {
       await new Promise(r => setTimeout(r, 200));
 
       // Both connections should be registered
-      assert.ok(env.connectionPool.count >= 1, 'Connection pool should have connections');
+      assert.equal(env.connectionPool.count, 2, 'Both compatible lanes must be registered');
       
       socket2.destroy();
     } finally {
@@ -127,7 +129,7 @@ describe('ConnectionPool - Multiple Connections', () => {
     }
   });
 
-  it('should replace connection for same interface', async () => {
+  it('should reject replacement of a still-live interface', async () => {
     const env = await createTestEnv();
     try {
       await env.startClient();
@@ -150,6 +152,7 @@ describe('ConnectionPool - Multiple Connections', () => {
       await new Promise((resolve) => {
         socket2.on('connect', () => {
           socket2.write(encodeFrame(0, FrameType.INIT, JSON.stringify({
+            version: VERSION, capability: CAPABILITY, clientSession: env.virtualSocket().clientSession,
             interface: 'default',
             maxFrameSize: 1048576
           })));
@@ -161,7 +164,8 @@ describe('ConnectionPool - Multiple Connections', () => {
 
       // The new connection should replace the old one for same interface
       const count2 = env.connectionPool.count;
-      assert.ok(count2 > 0, 'Pool should still have connections');
+      assert.equal(count2, count1, 'live lane was not replaced');
+      assert.ok(socket2.destroyed, 'duplicate interface must be rejected');
 
       socket2.destroy();
     } finally {
@@ -222,6 +226,9 @@ describe('Path-selected single-flow streams', () => {
     const b = { isConnected: () => true, socket: { writableNeedDrain: false }, writes: [], write(buf) { this.writes.push(buf); return true; } };
     vs.realSockets.set('default#1', a);
     vs.realSockets.set('default#2', b);
+    vs.serverSession = nonce(); vs._sessionActive = true;
+    for (const rs of [a, b]) { rs.clientSession = vs.clientSession; rs.serverSession = vs.serverSession; }
+    vs.transport.open(1); vs.transport.open(2);
 
     vs.write(encodeFrame(1, FrameType.HEADERS, '{}'));
     vs.write(encodeFrame(1, FrameType.DATA, Buffer.from('normal-stream')));
@@ -263,124 +270,9 @@ describe('Multipath - HTTP Request', () => {
 
 // Bug-fix regression tests
 
-describe('Bugfix: FIN/ERROR dedup (Bug 1)', () => {
-  it('should deliver FIN only once across duplicate connections', () => {
-    const vs = new VirtualSocket({
-      serverHost: 'localhost',
-      serverPort: 9999,
-      clientKey: 'none',
-      clientCert: 'none',
-      caCert: 'none'
-    });
-
-    const finFrames = [];
-    vs.on('frame', (f) => {
-      if (f.type === FrameType.FIN || f.type === FrameType.ERROR) {
-        finFrames.push(f);
-      }
-    });
-
-    // Simulate duplicate FIN (stream 5, seqNo 7) from two connections
-    vs._onFrame({ streamId: 5, type: FrameType.FIN, seqNo: 7 });
-    vs._onFrame({ streamId: 5, type: FrameType.FIN, seqNo: 7 }); // duplicate
-
-    assert.strictEqual(finFrames.length, 1, 'FIN should be delivered only once');
-    assert.strictEqual(finFrames[0].streamId, 5);
-    assert.strictEqual(finFrames[0].type, FrameType.FIN);
-  });
-
-  it('should deliver ERROR only once across duplicate connections', () => {
-    const vs = new VirtualSocket({
-      serverHost: 'localhost',
-      serverPort: 9999,
-      clientKey: 'none',
-      clientCert: 'none',
-      caCert: 'none'
-    });
-
-    const errorFrames = [];
-    vs.on('frame', (f) => {
-      if (f.type === FrameType.ERROR) {
-        errorFrames.push(f);
-      }
-    });
-
-    vs._onFrame({ streamId: 8, type: FrameType.ERROR, seqNo: 3 });
-    vs._onFrame({ streamId: 8, type: FrameType.ERROR, seqNo: 3 }); // duplicate
-
-    assert.strictEqual(errorFrames.length, 1, 'ERROR should be delivered only once');
-  });
-});
-
-describe('Bugfix: HEADERS dedup on server (Bug 2)', () => {
-  it('should dedup duplicate HEADERS from multiple connections', () => {
-    const pool = new ConnectionPool();
-
-    let headCount = 0;
-    pool.registerStream(10, {
-      frameHandler: (f) => {
-        if (f.type === FrameType.HEADERS) headCount++;
-      }
-    });
-
-    // First HEADERS — should route
-    const result1 = pool.onFrame({ streamId: 10, type: FrameType.HEADERS, seqNo: 0 });
-    assert.strictEqual(result1, 'new');
-    assert.strictEqual(headCount, 1);
-
-    // Duplicate HEADERS — should be dedup'd
-    const result2 = pool.onFrame({ streamId: 10, type: FrameType.HEADERS, seqNo: 0 });
-    assert.strictEqual(result2, 'duplicate');
-    assert.strictEqual(headCount, 1, 'HEADERS should not be routed again');
-  });
-});
-
-describe('Bugfix: RESET_SEQ does not reset outbound (Bug 3)', () => {
-  it('should not reset outbound seqCounters when receiving RESET_SEQ', () => {
-    const vs = new VirtualSocket({
-      serverHost: 'localhost',
-      serverPort: 9999,
-      clientKey: 'none',
-      clientCert: 'none',
-      caCert: 'none'
-    });
-
-    // Set a known outbound counter
-    vs.seqCounters.set(5, 99);
-    vs.seqCounters.set(8, 200);
-
-    // Receive RESET_SEQ for stream 5
-    vs._handleResetSeq({
-      streamId: 0,
-      type: FrameType.RESET_SEQ,
-      seqNo: 0,
-      payload: Buffer.from(JSON.stringify({ streams: [5] }))
-    });
-
-    // Outbound counter for stream 5 should NOT be reset
-    assert.strictEqual(vs.seqCounters.get(5), 99,
-      'outbound counter should NOT be reset by incoming RESET_SEQ');
-    assert.strictEqual(vs.seqCounters.get(8), 200,
-      'unrelated outbound counter should be unchanged');
-    // dedup window for stream 5 should be cleared
-    assert.strictEqual(vs.dedupWindows.has(5), false,
-      'dedup window for stream 5 should be cleared');
-  });
-
-  it('server-side RESET_SEQ should not reset outbound seqCounters', () => {
-    const pool = new ConnectionPool();
-    pool.seqCounters.set(5, 77);
-
-    pool.handleResetSeq({
-      payload: Buffer.from(JSON.stringify({ streams: [5] }))
-    });
-
-    assert.strictEqual(pool.seqCounters.get(5), 77,
-      'server outbound counter should NOT be reset by incoming RESET_SEQ');
-    assert.strictEqual(pool.dedupWindows.has(5), false,
-      'server dedup window should be cleared');
-  });
-});
+// v2 ordering, cancellation and no-wrap regressions replace unsafe legacy
+// FIN-without-OPEN and RESET-as-recovery assertions.
+// See tests/unit/test-transport-v2.js (included by run-all).
 
 describe('Bugfix: ready emitted once (Bug 4)', () => {
   it('should emit ready only once', () => {
@@ -400,7 +292,8 @@ describe('Bugfix: ready emitted once (Bug 4)', () => {
     assert.strictEqual(readyCount, 0);
 
     // Add a connected socket
-    const fakeRS = { isConnected: () => true };
+    vs.serverSession = nonce(); vs._sessionActive = true;
+    const fakeRS = { isConnected: () => true, clientSession: vs.clientSession, serverSession: vs.serverSession };
     vs.realSockets.set('en0', fakeRS);
 
     vs._checkReady();
