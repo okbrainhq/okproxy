@@ -41,7 +41,17 @@ struct ConnectionView: View {
                         .disabled(model.isRunningClient)
                     Button("Stop Client") { model.stopClient() }
                         .disabled(!model.isRunningClient)
+                    Button("Force Stop") { model.forceStopClient() }
+                        .help("Reclaim the client and any leftover supervised processes immediately, even when the supervisor is wedged. Always available.")
                 }
+                if let notice = model.lastStopNotice {
+                    Label(notice, systemImage: "exclamationmark.triangle")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
+                Button("Clean Up Leftover Processes") { model.reclaimLeftoverProcesses() }
+                    .font(.caption)
+                    .help("Kill supervised processes recorded by an earlier run that was crashed, force quit or killed.")
             }
         }
         .formStyle(.grouped)

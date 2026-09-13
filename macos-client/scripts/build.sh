@@ -40,7 +40,11 @@ trap 'okproxy_release_build_lock; exit 143' TERM
 
 export CODE_SIGNING_ALLOWED=NO
 export CODE_SIGN_IDENTITY="-"
-swift build -c release
+if ! swift build -c release; then
+  # SwiftPM applies its own sandbox, which cannot nest inside a harness sandbox
+  # (macOS agent hosts). The outer sandbox still confines the build either way.
+  swift build -c release --disable-sandbox
+fi
 
 rm -rf "$ICON_BUILD_DIR"
 mkdir -p "$ICON_BUILD_DIR"

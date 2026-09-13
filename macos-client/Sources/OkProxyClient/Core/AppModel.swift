@@ -15,6 +15,8 @@ final class AppModel: ObservableObject {
     @Published var latestNodeVersion: String?
     @Published var isNodeSetup = false
     @Published var isRepoSetup = false
+    /// Set when the last client stop had to be forced, or could not be verified.
+    @Published var lastStopNotice: String?
 
     private let supervisor: ProcessSupervisor
     private let gate = OperationGate()
@@ -22,6 +24,7 @@ final class AppModel: ObservableObject {
     private var activeClientToken: UUID?
     private var nodeVersionToken: UUID?
     private var updateCheckTask: Task<Void, Never>?
+    private var shutdownDeadlineTask: Task<Void, Never>?
     private var lastAvailabilitySummary: String?
 
     /// True while a client shutdown transaction holds the gate.
@@ -51,6 +54,9 @@ final class AppModel: ObservableObject {
         }
         refreshInstallStatus()
         logs.append("App launched (\(appEnvironment))")
+        // Self-heal first: a helper stranded by a crash, a force quit or an
+        // external kill must never keep this launch from stopping its client.
+        sweepLeftoversFromPreviousLaunch()
         if settings.startClientAutomatically {
             Task { @MainActor in
                 await Task.yield()
@@ -445,6 +451,19 @@ final class AppModel: ObservableObject {
         let caPath = settings.caCertPath.expandedTildePath
         guard validateClientPreflight(indexPath: indexPath, keyPath: keyPath, certPath: certPath, caPath: caPath) else { return }
 
+        // Never start a second client on top of a leftover that an earlier stop
+        // could not verify. Reclaim first and refuse only when that fails.
+        let orphans = supervisor.reclaimOrphanedRuns(reason: "client start preflight")
+        if orphans.needsAttention {
+            let detail = orphans.unverified.joined(separator: "; ")
+            logs.append("Refusing to start the client: leftover supervised processes could not be reclaimed (\(detail)). Use “Clean Up Leftover Processes”, then retry.")
+            lastStopNotice = detail
+            return
+        }
+        if orphans.inspectedRecords > 0 {
+            logs.append(orphans.summary)
+        }
+
         var args = [indexPath, "--server", server.serialized, "--target", target.serialized, "--key", keyPath, "--cert", certPath, "--ca", caPath]
         if settings.multipath { args.append("--multipath") }
         if settings.preserveHost { args.append("--preserve-host") }
@@ -467,6 +486,11 @@ final class AppModel: ObservableObject {
             onExit: { [weak self] result in
                 guard let self, self.activeClientToken == token else { return }
                 self.logs.append("Client exited with \(Self.describe(result))")
+                if result.cleanupAttention {
+                    self.lastStopNotice = "The client exited without verifiable descendant cleanup; recorded leftovers were swept."
+                } else if let reason = result.failureReason {
+                    self.lastStopNotice = "Client supervision ended without a confirmed exit: \(reason)"
+                }
                 self.finishClientExit(token: token)
             }
         )
@@ -504,15 +528,56 @@ final class AppModel: ObservableObject {
         }
 
         logs.append("Stopping client…")
-        supervisor.stop(client, gracePeriod: 2.0) { [weak self] stopped in
+        supervisor.stop(client, gracePeriod: 2.0) { [weak self] outcome in
             guard let self, self.activeClientToken == token else { return }
-            guard stopped, client.hasConfirmedExit else {
-                self.logs.append("Stop timed out or ownership failed; client/start gate retained until confirmed cleanup.")
-                return
-            }
-            self.finishClientExit(token: token)
-            self.logs.append("Client stopped.")
+            self.completeStop(outcome, token: token)
         }
+    }
+
+    /// Escape hatch that always works, even when the graceful path is wedged.
+    /// Available from the menu bar and the Connection tab.
+    func forceStopClient() {
+        guard let client = activeClient, let token = activeClientToken else {
+            // Nothing is owned in memory: still reclaim whatever is recorded on
+            // disk, and clear a client transaction that can never complete.
+            let report = supervisor.reclaimRecordedRuns(reason: "user requested a force stop")
+            logs.append(report.summary)
+            if report.needsAttention {
+                lastStopNotice = report.unverified.joined(separator: "; ")
+            }
+            if let stale = gate.active, stale == .clientStop || stale == .clientStart {
+                gate.release(stale)
+                logs.append("Cleared the unfinished \(stale.label) transaction: no process was owned for it.")
+            }
+            isRunningClient = false
+            activeClient = nil
+            activeClientToken = nil
+            return
+        }
+        if gate.active == nil { _ = gate.acquire(.clientStop) }
+        logs.append("Force-stopping the client…")
+        supervisor.forceStop(client) { [weak self] outcome in
+            guard let self, self.activeClientToken == token else { return }
+            self.completeStop(outcome, token: token, forced: true)
+        }
+    }
+
+    /// One terminal path for every stop.
+    ///
+    /// The operation gate is ALWAYS released here: an app that can never stop its
+    /// client (or never quit) is worse than one that stops it and reports that
+    /// cleanup had to be forced. The outcome only decides what the user is told.
+    private func completeStop(_ outcome: StopOutcome, token: UUID, forced: Bool = false) {
+        guard activeClientToken == token else { return }
+        switch outcome {
+        case .confirmedClean:
+            logs.append("Client stopped.")
+            lastStopNotice = nil
+        case .cleanupIncomplete(let reason), .forcedUnconfirmed(let reason):
+            logs.append("Client \(forced ? "force-stopped" : "stopped") with attention: \(reason)")
+            lastStopNotice = reason
+        }
+        finishClientExit(token: token)
     }
 
     func showMainWindow() {
@@ -527,15 +592,53 @@ final class AppModel: ObservableObject {
         // Central exclusion until exit: no new setup/start transaction can begin.
         gate.shutdown()
         logs.append("Quitting: stopping all owned child processes…")
-        // applicationWillTerminate performs the final synchronous sweep, so this
-        // only needs to give children a graceful window.
-        supervisor.stopAll(gracePeriod: 2.0) { [weak self] stopped in
-            guard stopped else {
-                self?.logs.append("Shutdown timed out or ownership failed; shutdown gate retained, not reporting success.")
-                return
+
+        // Hard deadline: a child that refuses to die must never be able to keep
+        // the app running. `applicationWillTerminate` repeats the synchronous
+        // sweep when AppKit gets there first.
+        shutdownDeadlineTask?.cancel()
+        shutdownDeadlineTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 6_000_000_000)
+            guard let self, !Task.isCancelled else { return }
+            self.shutdownDeadlineTask = nil
+            self.logs.append("Shutdown deadline reached; forcing termination with a hard sweep.")
+            let report = ProcessSupervisor.shared.terminateAllNow(gracePeriod: 1.0)
+            if report.needsAttention { self.lastStopNotice = report.summary }
+            NSApplication.shared.terminate(nil)
+        }
+
+        // `stopAll` is bounded at every rung, so this completion always arrives.
+        supervisor.stopAll(gracePeriod: 2.0) { [weak self] report in
+            guard let self else { return }
+            self.shutdownDeadlineTask?.cancel()
+            self.shutdownDeadlineTask = nil
+            if report.needsAttention {
+                self.lastStopNotice = report.summary
+                self.logs.append("Shutdown: \(report.summary)")
             }
             NSApplication.shared.terminate(nil)
         }
+    }
+
+    /// Reclaims supervised processes stranded by an earlier launch (crash, force
+    /// quit, external kill). Runs once at startup, before any autostart.
+    private func sweepLeftoversFromPreviousLaunch() {
+        let report = supervisor.sweepStaleRunRecords()
+        guard report.inspectedRecords > 0 else { return }
+        logs.append(report.summary)
+        if report.needsAttention {
+            let detail = report.unverified.joined(separator: "; ")
+            lastStopNotice = detail
+            logs.append("Some leftover supervised processes could not be reclaimed: \(detail)")
+        }
+    }
+
+    /// User-facing escape hatch for leftovers recorded by earlier or forced runs.
+    func reclaimLeftoverProcesses() {
+        let report = supervisor.reclaimRecordedRuns(reason: "user requested a leftover cleanup")
+        logs.append(report.summary)
+        lastStopNotice = report.needsAttention ? report.unverified.joined(separator: "; ") : nil
+        refreshInstallStatus()
     }
 
     // MARK: - Setup plumbing
