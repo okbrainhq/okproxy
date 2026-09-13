@@ -2,7 +2,8 @@
 // Note: openssl CLI is a runtime dependency for CA operations only
 
 const { execFileSync } = require('node:child_process');
-const { existsSync, mkdirSync, writeFileSync, readFileSync, chmodSync, appendFileSync, copyFileSync, unlinkSync, statSync } = require('node:fs');
+const { existsSync, mkdirSync, writeFileSync, readFileSync, chmodSync, appendFileSync, copyFileSync, unlinkSync, statSync, renameSync } = require('node:fs');
+const { EventEmitter } = require('node:events');
 const { join } = require('node:path');
 const { normalizeDomains } = require('./domain-utils');
 const { tmpdir } = require('node:os');
@@ -32,6 +33,29 @@ function createTempCAFile(caDir) {
 // In-memory cache for certificate revocation list (CRL)
 // This avoids reading from disk on every TLS connection
 const crlCache = new Map(); // caDir -> { revokedSerials: Set, lastModified: number }
+
+// In-process CA event bus. Revocation has to reach live session managers so
+// already-authenticated tunnel sessions can be evicted immediately instead of
+// only being rejected on the next TLS handshake.
+//
+// Note: the `ca` CLI (apps/server/bin/tunnel-ca.js) revokes in a separate
+// process, so its revocations cannot be observed here. Servers must also poll
+// the CRL (see MultiClientManager#evictRevokedSessions) — that hook is
+// documented in docs/http-server-fixes.md and is intentionally not wired into
+// tls-server.js from this change.
+const caEvents = new EventEmitter();
+caEvents.setMaxListeners(0);
+
+/**
+ * Subscribe to in-process certificate revocation events.
+ * @param {(event: {serial: string, caDir: string, domains: string[]}) => void} listener
+ * @returns {() => void} unsubscribe function
+ */
+function onCertificateRevoked(listener) {
+  if (typeof listener !== 'function') throw new TypeError('listener must be a function');
+  caEvents.on('certificate-revoked', listener);
+  return () => caEvents.off('certificate-revoked', listener);
+}
 
 /**
  * Initialize Certificate Authority
@@ -98,12 +122,45 @@ function readJsonFile(path, fallback) {
   try { return JSON.parse(readFileSync(path, 'utf8')); } catch { return fallback; }
 }
 
+/**
+ * Atomically write a JSON metadata file.
+ *
+ * CA metadata (certs.json / issued-domains.json) is read by the routing hot
+ * path. A plain writeFileSync can leave a truncated file if the process dies
+ * mid-write, which previously made every public request throw while parsing.
+ * Write to a sibling temp file and rename() into place so readers only ever
+ * observe a complete document.
+ */
 function writeJsonFile(path, value) {
-  writeFileSync(path, JSON.stringify(value, null, 2) + '\n', { mode: 0o600 });
+  const payload = JSON.stringify(value, null, 2) + '\n';
+  const tempPath = `${path}.tmp-${process.pid}-${randomBytes(6).toString('hex')}`;
+  try {
+    writeFileSync(tempPath, payload, { mode: 0o600 });
+    renameSync(tempPath, path);
+  } catch (err) {
+    try { unlinkSync(tempPath); } catch { /* best-effort cleanup */ }
+    throw err;
+  }
+}
+
+/**
+ * Validate parsed certificate metadata.
+ * Returns a usable `{ version, certs }` shape even when the file is missing,
+ * truncated, or hand-edited into an unexpected shape. Non-object entries are
+ * dropped so callers cannot crash on `cert.status` / `cert.domains`.
+ */
+function normalizeCertMetadata(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return { version: 1, certs: [] };
+  }
+  const certs = Array.isArray(raw.certs)
+    ? raw.certs.filter((cert) => cert && typeof cert === 'object' && !Array.isArray(cert))
+    : [];
+  return { version: Number.isFinite(raw.version) ? raw.version : 1, certs };
 }
 
 function loadCertMetadata(caDir = DEFAULT_CA_DIR) {
-  return readJsonFile(join(caDir, 'certs.json'), { version: 1, certs: [] });
+  return normalizeCertMetadata(readJsonFile(join(caDir, 'certs.json'), null));
 }
 
 function saveCertMetadata(caDir, metadata) {
@@ -115,7 +172,11 @@ function rebuildIssuedDomainIndex(caDir = DEFAULT_CA_DIR) {
   const domains = {};
   for (const cert of metadata.certs || []) {
     if (cert.status !== 'valid') continue;
-    for (const domain of cert.domains || []) {
+    const certDomains = Array.isArray(cert.domains) ? cert.domains : [];
+    for (const domainValue of certDomains) {
+      if (typeof domainValue !== 'string') continue;
+      const domain = domainValue.trim().toLowerCase();
+      if (!domain) continue;
       if (!domains[domain]) domains[domain] = { serials: [], status: 'valid' };
       domains[domain].serials.push(String(cert.serial));
     }
@@ -144,8 +205,9 @@ function issueClientCertificate(outputDir, caDir = DEFAULT_CA_DIR, options = {})
     const revokedSerials = new Set(crl.split('\n').filter(Boolean));
     for (const cert of metadata.certs || []) {
       if (cert.status !== 'valid' || revokedSerials.has(String(cert.serial))) continue;
+      const certDomains = Array.isArray(cert.domains) ? cert.domains : [];
       for (const domain of domains) {
-        if ((cert.domains || []).includes(domain)) {
+        if (certDomains.includes(domain)) {
           throw new Error(`Domain already issued to valid certificate ${cert.serial}: ${domain}`);
         }
       }
@@ -390,17 +452,34 @@ function loadCRLIntoCache(caDir) {
  * @param {string} caDir - CA directory
  */
 function revokeCertificate(serial, caDir = DEFAULT_CA_DIR) {
-  appendFileSync(join(caDir, 'crl.txt'), `${serial}\n`);
-  const metadata = loadCertMetadata(caDir);
-  const serialString = String(serial);
-  for (const cert of metadata.certs || []) {
-    if (String(cert.serial) === serialString) cert.status = 'revoked';
+  const serialString = String(serial === undefined || serial === null ? '' : serial).trim();
+  if (!serialString) throw new Error('Serial is required to revoke a certificate');
+
+  // The CRL is the security-critical record: write it first so revocation
+  // takes effect even if metadata maintenance below fails.
+  appendFileSync(join(caDir, 'crl.txt'), `${serialString}\n`);
+
+  let domains = [];
+  try {
+    const metadata = loadCertMetadata(caDir);
+    for (const cert of metadata.certs || []) {
+      if (String(cert.serial) === serialString) {
+        cert.status = 'revoked';
+        domains = Array.isArray(cert.domains) ? cert.domains.slice() : [];
+      }
+    }
+    saveCertMetadata(caDir, metadata);
+    rebuildIssuedDomainIndex(caDir);
+  } catch (err) {
+    console.error(`[${new Date().toISOString()}] Failed to update certificate metadata for revoked serial ${serialString}:`, err.message);
   }
-  saveCertMetadata(caDir, metadata);
-  rebuildIssuedDomainIndex(caDir);
+
   // Invalidate cache for this CA directory
   crlCache.delete(caDir);
-  console.log(`Certificate revoked (serial: ${serial})`);
+  console.log(`Certificate revoked (serial: ${serialString})`);
+
+  // Notify in-process listeners so live tunnel sessions can be evicted.
+  caEvents.emit('certificate-revoked', { serial: serialString, caDir, domains });
 }
 
 /**
@@ -458,7 +537,7 @@ function listCertificates(caDir = DEFAULT_CA_DIR) {
         name: cert.name || '-',
         issuedAt: cert.issuedAt,
         revoked: cert.status === 'revoked' || revokedSerials.has(String(cert.serial)),
-        domains: (cert.domains || []).join(',')
+        domains: Array.isArray(cert.domains) ? cert.domains.join(',') : ''
       }));
     }
     const issued = readFileSync(join(caDir, 'issued.txt'), 'utf8');
@@ -483,5 +562,6 @@ module.exports = {
   listCertificates,
   isValidHostname,
   rebuildIssuedDomainIndex,
-  loadCertMetadata
+  loadCertMetadata,
+  onCertificateRevoked
 };

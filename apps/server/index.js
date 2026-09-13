@@ -29,7 +29,12 @@ function parseArgs(argv) {
     certBoundDomains: false,
     issuedDomainIndex: './.ca/issued-domains.json',
     maxBodySize: undefined,
-    httpHost: undefined
+    httpHost: undefined,
+    // Certificate revocation must also reach *live* sessions. The in-process CA
+    // event only covers revocations in this process; the `ca` CLI runs
+    // separately, so poll the CRL as well (see docs/http-server-fixes.md).
+    revocationWatch: true,
+    revocationWatchIntervalMs: 5000
   };
 
   for (let i = 0; i < args.length; i++) {
@@ -84,6 +89,17 @@ function parseArgs(argv) {
       case '--cert-bound-domains':
         options.certBoundDomains = true;
         break;
+      case '--no-revocation-watch':
+        options.revocationWatch = false;
+        break;
+      case '--revocation-watch-interval':
+        const watchInterval = parseInt(args[++i], 10);
+        if (!Number.isFinite(watchInterval) || watchInterval < 1) {
+          console.error(`Error: Invalid revocation watch interval "${args[i]}". Must be a positive integer of milliseconds.`);
+          process.exit(1);
+        }
+        options.revocationWatchIntervalMs = watchInterval;
+        break;
       case '--issued-domain-index':
         options.issuedDomainIndex = args[++i];
         break;
@@ -122,6 +138,8 @@ Options:
   --http-headers-timeout <ms> HTTP headers timeout (default: 3605000)
   --cert-bound-domains        Enable certificate-bound Host routing
   --issued-domain-index <p>   Issued domain index (default: ./.ca/issued-domains.json)
+  --no-revocation-watch       Disable CRL polling that evicts live revoked sessions
+  --revocation-watch-interval <ms> CRL poll interval (default: 5000)
   --http-host <host>          HTTP listen host (recommended: 127.0.0.1)
   --max-body-size <bytes>     Max HTTP request body size in bytes (default: 230686720, i.e. 220MB)
   --help                      Show this help
@@ -156,19 +174,27 @@ function main() {
     console.log(`HTTP server listening on ${addr}`);
   });
 
-  process.on('SIGINT', () => {
-    console.log('\nShutting down...');
+  let shuttingDown = false;
+  const shutdown = (signal) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log(`\nShutting down (${signal})...`);
+    // Stop CRL polling and detach the CA revocation listener so the process
+    // can exit cleanly and no watcher outlives the servers.
+    if (typeof connectionPool.dispose === 'function') {
+      try {
+        connectionPool.dispose();
+      } catch (err) {
+        console.error('Failed to dispose client manager:', err && err.message ? err.message : err);
+      }
+    }
     tlsServer.close();
     httpServer.close();
     process.exit(0);
-  });
+  };
 
-  process.on('SIGTERM', () => {
-    console.log('\nShutting down...');
-    tlsServer.close();
-    httpServer.close();
-    process.exit(0);
-  });
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
 }
 
 if (require.main === module) {
