@@ -110,6 +110,79 @@ function shouldUseSingleFlow(reqUrl, headers = {}, method = 'GET') {
   return false;
 }
 
+// Headers involved in the WebSocket handshake negotiation. The browser's
+// offers are forwarded upstream so the target can select a subprotocol or
+// extension, but the target's selection must be relayed back to the browser —
+// dropping it makes the two peers disagree about negotiated semantics (e.g.
+// permessage-deflate frames the browser never agreed to).
+const WS_OFFER_HEADERS = ['sec-websocket-protocol', 'sec-websocket-extensions'];
+
+function splitHeaderTokens(value) {
+  const source = Array.isArray(value) ? value.join(', ') : value;
+  if (typeof source !== 'string' || source.trim() === '') return [];
+  return source.split(',').map(token => token.trim()).filter(Boolean);
+}
+
+function getHeaderValue(headers, name) {
+  if (!headers) return undefined;
+  for (const [key, value] of Object.entries(headers)) {
+    if (key.toLowerCase() === name) return value;
+  }
+  return undefined;
+}
+
+function extensionTokenName(token) {
+  const name = String(token).split(';')[0].trim().toLowerCase();
+  return name || null;
+}
+
+function stripWebSocketOffers(headers) {
+  const stripped = {};
+  for (const [key, value] of Object.entries(headers || {})) {
+    if (WS_OFFER_HEADERS.includes(key.toLowerCase())) continue;
+    stripped[key] = value;
+  }
+  return stripped;
+}
+
+/**
+ * Decide which negotiation headers from the upstream 101 response may be
+ * relayed to the browser.
+ *
+ * Only values the browser actually offered are accepted. If the target
+ * "accepts" a subprotocol/extension that was never offered, the handshake is
+ * internally inconsistent — the tunnel cannot un-negotiate upstream, so the
+ * router fails closed instead of silently forwarding a broken handshake.
+ *
+ * @returns {{lines: string[]} | {error: string}}
+ */
+function resolveWebSocketNegotiation(responseHeaders, offeredProtocols, offeredExtensions) {
+  const lines = [];
+
+  const rawProtocol = getHeaderValue(responseHeaders, 'sec-websocket-protocol');
+  if (rawProtocol !== undefined && String(rawProtocol).trim() !== '') {
+    const selected = String(rawProtocol).trim();
+    if (!offeredProtocols.includes(selected)) {
+      return { error: `subprotocol-not-offered:${selected}` };
+    }
+    lines.push(`Sec-WebSocket-Protocol: ${selected}`);
+  }
+
+  const rawExtensions = getHeaderValue(responseHeaders, 'sec-websocket-extensions');
+  if (rawExtensions !== undefined && String(rawExtensions).trim() !== '') {
+    const tokens = splitHeaderTokens(rawExtensions);
+    for (const token of tokens) {
+      const name = extensionTokenName(token);
+      if (!name || !offeredExtensions.includes(name)) {
+        return { error: `extension-not-offered:${token}` };
+      }
+    }
+    if (tokens.length > 0) lines.push(`Sec-WebSocket-Extensions: ${tokens.join(', ')}`);
+  }
+
+  return { lines };
+}
+
 function waitForDrain(target, callback) {
   if (!target || target.destroyed || !target.writableNeedDrain) {
     process.nextTick(callback);
@@ -237,6 +310,7 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
     normalizeNonNegativeInteger(options.httpHeadersTimeout, 0),
     httpKeepAliveTimeout + HTTP_HEADERS_TIMEOUT_BUFFER
   );
+  const stripWebSocketNegotiation = Boolean(options.stripWebSocketNegotiation);
 
   function resolveRequestRoute(hostHeader) {
     if (!certBoundDomains) {
@@ -247,9 +321,35 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
     const route = connectionPool.resolveByHost(hostHeader);
     if (route.status === 'invalid-host') return { error: 400, message: 'Bad Request' };
     if (route.status === 'unknown') return { error: 404, message: 'Unknown tunnel domain' };
+    if (route.status === 'metadata-error') return { error: 503, message: 'Domain metadata unavailable' };
     if (route.status === 'disconnected') return { error: 502, message: `Tunnel client not connected for ${route.domain}` };
     if (!route.session || !route.session.hasConnections()) return { error: 502, message: `Tunnel client not connected for ${route.domain}` };
     return { pool: route.session.pool, domain: route.domain, session: route.session };
+  }
+
+  // Domain metadata (issued-domains.json) can be corrupt/unreadable. Routing
+  // must never throw from inside a request handler: an uncaught exception
+  // would take down the whole public listener. Fail closed with a controlled
+  // 503 instead.
+  function safeResolveRequestRoute(hostHeader) {
+    try {
+      return resolveRequestRoute(hostHeader);
+    } catch (err) {
+      console.error(`[503] Failed to resolve route for host "${hostHeader}":`, err && err.message ? err.message : err);
+      return { error: 503, message: 'Service Unavailable' };
+    }
+  }
+
+  function routeMaxStreams(route) {
+    const sessionMax = route && route.session && Number.isFinite(route.session.maxStreams)
+      ? route.session.maxStreams
+      : maxStreams;
+    return sessionMax > 0 ? sessionMax : maxStreams;
+  }
+
+  function streamLimitReached(route, pool) {
+    if (!pool || !pool.activeStreams) return false;
+    return pool.activeStreams.size >= routeMaxStreams(route);
   }
 
   function allocateStream(route) {
@@ -280,7 +380,7 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
       return;
     }
 
-    const route = resolveRequestRoute(req.headers.host);
+    const route = safeResolveRequestRoute(req.headers.host);
     if (route.error) {
       console.error(`[${route.error}] ${route.message} for ${req.method} ${req.url} from ${req.socket.remoteAddress}`);
       res.statusCode = route.error;
@@ -289,8 +389,9 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
     }
 
     const selectedPool = route.pool;
-    if (selectedPool.activeStreams.size >= maxStreams) {
-      console.error(`[503] Max concurrent streams exceeded (${selectedPool.activeStreams.size}/${maxStreams}) for ${req.method} ${req.url}`);
+    const streamLimit = routeMaxStreams(route);
+    if (streamLimitReached(route, selectedPool)) {
+      console.error(`[503] Max concurrent streams exceeded (${selectedPool.activeStreams.size}/${streamLimit}) for ${req.method} ${req.url}`);
       res.statusCode = 503;
       res.end('Max concurrent streams exceeded');
       return;
@@ -312,25 +413,68 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
     const clientIp = req.socket.remoteAddress || '127.0.0.1';
     const publicProto = req.headers['x-forwarded-proto'] || (req.socket.encrypted ? 'https' : 'http');
     const singleFlow = shouldUseSingleFlow(req.url, req.headers, req.method);
-    if (typeof selectedPool.setStreamMode === 'function') {
-      selectedPool.setStreamMode(streamId, { singleFlow });
-    }
     let bodySize = 0;
     let cleanedUp = false;
+    let terminalSent = false;
+    let headersSent = false;
     let requestBackpressured = false;
     let responseBackpressured = false;
+    // Declared before any early-return path so cleanup() is safe to call from
+    // the request-forwarding failure path below.
+    let streamTimer = null;
 
-    const sentHeaders = selectedPool.send(encodeFrame(streamId, FrameType.HEADERS, JSON.stringify({
-      method: req.method,
-      path: req.url,
-      headers: sanitizeRequestHeaders(req.headers),
-      clientSerial: route.session?.serial,
-      publicHost: route.domain || req.headers.host,
-      publicProto,
-      remoteAddress: clientIp,
-      tunnelMode: singleFlow ? 'single-flow' : 'multipath',
-      tunnel: { singleFlow }
-    })));
+    if (typeof selectedPool.setStreamMode === 'function') {
+      try {
+        selectedPool.setStreamMode(streamId, { singleFlow });
+      } catch (err) {
+        console.error('Failed to set stream mode:', err && err.message ? err.message : err);
+      }
+    }
+
+    // Terminal notification is once-only. Every abort path funnels through
+    // cleanup(terminal) so the tunnel client is told exactly once that the
+    // stream is over, and late callbacks cannot send a second notification.
+    function sendTerminal(type, message) {
+      if (terminalSent) return;
+      terminalSent = true;
+      selectedPool.send(encodeFrame(streamId, type,
+        message === undefined || message === null ? Buffer.alloc(0) : Buffer.from(String(message))));
+    }
+
+    function failResponse(statusCode, message) {
+      if (res.writableEnded || res.destroyed) return;
+      if (headersSent || res.headersSent) {
+        // Response headers already reached the public client. Appending an
+        // error status/body here would graft text onto an in-flight response
+        // (e.g. "Bad Gateway" inside a 200). Destroy to signal truncation.
+        res.destroy();
+        return;
+      }
+      res.statusCode = statusCode;
+      res.end(message);
+    }
+
+    let sentHeaders = false;
+    try {
+      sentHeaders = selectedPool.send(encodeFrame(streamId, FrameType.HEADERS, JSON.stringify({
+        method: req.method,
+        path: req.url,
+        headers: sanitizeRequestHeaders(req.headers),
+        clientSerial: route.session?.serial,
+        publicHost: route.domain || req.headers.host,
+        publicProto,
+        remoteAddress: clientIp,
+        tunnelMode: singleFlow ? 'single-flow' : 'multipath',
+        tunnel: { singleFlow }
+      })));
+    } catch (err) {
+      // Forwarding failed after the stream ID was allocated: release it
+      // instead of leaking the stream slot.
+      console.error('[502] Failed to forward request headers:', err && err.message ? err.message : err);
+      cleanup({ type: FrameType.ERROR, message: 'Failed to forward request headers' });
+      failResponse(502, 'Bad Gateway');
+      return;
+    }
 
     if (!sentHeaders) {
       requestBackpressured = true;
@@ -341,18 +485,12 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
       }, streamId);
     }
 
-    let streamTimer = null;
-
     function scheduleStreamTimeout(isReset) {
       if (streamTimer) clearTimeout(streamTimer);
       streamTimer = setTimeout(() => {
         console.error(`[504] Stream timeout${isReset ? ' (reset)' : ''} for ${req.method} ${req.url} (stream ${streamId}, client ${clientIp})`);
-        selectedPool.send(encodeFrame(streamId, FrameType.ERROR, Buffer.from('Stream timeout')));
-        cleanup();
-        if (!res.writableEnded) {
-          res.statusCode = 504;
-          res.end('Gateway timeout');
-        }
+        cleanup({ type: FrameType.ERROR, message: 'Stream timeout' });
+        failResponse(504, 'Gateway timeout');
       }, streamTimeout);
     }
 
@@ -370,10 +508,7 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
       if (bodySize > maxBodySize) {
         console.error(`[413] Request body too large: ${bodySize} bytes (max: ${maxBodySize}) for stream ${streamId}`);
         abortTunnelStream('Request body too large');
-        if (!res.writableEnded) {
-          res.statusCode = 413;
-          res.end('Request body too large');
-        }
+        failResponse(413, 'Request body too large');
         req.destroy();
         return;
       }
@@ -406,31 +541,43 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
     });
 
     req.on('error', (err) => {
+      if (cleanedUp) return;
       console.error('Request error:', err.message);
-      cleanup();
+      // Aborted request bodies must still tell the tunnel client to stop the
+      // local target request, otherwise it leaks until the target times out.
+      cleanup({ type: FrameType.ERROR, message: 'Public request error' });
+      // Never leave the public response hanging: send 502 or truncate an
+      // in-flight response (failResponse destroys when headers were flushed).
+      failResponse(502, 'Bad Gateway');
     });
 
-    function cleanup() {
+    function cleanup(terminal = null) {
       if (cleanedUp) return;
       cleanedUp = true;
+      try {
+        if (terminal) sendTerminal(terminal.type, terminal.message);
+      } catch (err) {
+        console.error('Failed to send terminal frame:', err && err.message ? err.message : err);
+      }
       if (requestBackpressured) req.resume();
-      if (responseBackpressured) resumePool(selectedPool, streamId);
+      if (responseBackpressured) { responseBackpressured = false; resumePool(selectedPool, streamId); }
       clearTimeout(streamTimer);
+      streamTimer = null;
       selectedPool.unregisterStream(streamId);
       releaseStream(route, streamId);
     }
 
     function abortTunnelStream(message) {
-      if (!cleanedUp) selectedPool.send(encodeFrame(streamId, FrameType.ERROR, Buffer.from(message)));
-      cleanup();
+      cleanup({ type: FrameType.ERROR, message });
     }
 
-    let headersSent = false;
     selectedPool.registerStream(streamId, {
       frameHandler: (frame) => {
+        if (cleanedUp) return;
         resetStreamTimeout();
 
         if (frame.type === FrameType.HEADERS) {
+          if (headersSent || res.destroyed) return;
           try {
             const headers = JSON.parse(frame.payload.toString());
             res.statusCode = headers.status || 200;
@@ -447,11 +594,11 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
             resetStreamTimeout();
           } catch (err) {
             console.error('Invalid headers frame:', err.message);
-            cleanup();
-            res.statusCode = 502;
-            res.end('Invalid response');
+            cleanup({ type: FrameType.ERROR, message: 'Invalid response headers' });
+            failResponse(502, 'Invalid response');
           }
         } else if (frame.type === FrameType.DATA) {
+          if (res.destroyed || res.writableEnded) return;
           if (!headersSent) {
             res.statusCode = 200;
             headersSent = true;
@@ -471,38 +618,46 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
         } else if (frame.type === FrameType.FIN) {
           resetStreamTimeout();
           cleanup();
-          if (!res.writableEnded) res.end();
+          if (!res.writableEnded && !res.destroyed) res.end();
         } else if (frame.type === FrameType.ERROR) {
           const errorMsg = frame.payload?.toString() || 'Unknown error';
           console.error(`[502] Client sent ERROR frame for ${req.method} ${req.url} (stream ${streamId}): ${errorMsg}`);
+          // Inbound terminal frame: the client already ended the stream, so no
+          // terminal notification is sent back. Any later frame is ignored at
+          // the top of this handler.
           cleanup();
-          if (!res.writableEnded) {
-            res.statusCode = 502;
-            res.end('Bad Gateway');
-          }
+          failResponse(502, 'Bad Gateway');
         }
       },
       errorHandler: (err) => {
+        if (cleanedUp) return;
         console.error(`[502] Stream error for ${req.method} ${req.url} (stream ${streamId}):`, err.message);
         cleanup();
-        if (!res.writableEnded) {
-          res.statusCode = 502;
-          res.end('Bad Gateway');
-        }
+        failResponse(502, 'Bad Gateway');
       }
     });
 
 
     res.on('close', () => {
-      if (!res.writableEnded) {
-        console.error(`[INFO] Client closed connection early for ${req.method} ${req.url} (stream ${streamId})`);
-        abortTunnelStream('Public client closed connection');
-      }
+      if (cleanedUp || res.writableEnded) return;
+      console.error(`[INFO] Client closed connection early for ${req.method} ${req.url} (stream ${streamId})`);
+      abortTunnelStream('Public client closed connection');
     });
   });
 
+  // No client-supplied metadata or route lookup may throw out of the upgrade
+  // listener; an uncaught exception here would crash the public listener.
   server.on('upgrade', (req, socket, head) => {
-    const route = resolveRequestRoute(req.headers.host);
+    try {
+      handleUpgrade(req, socket, head);
+    } catch (err) {
+      console.error('[502] Unhandled WebSocket upgrade error:', err && err.message ? err.message : err);
+      try { socket.destroy(); } catch { /* ignore */ }
+    }
+  });
+
+  function handleUpgrade(req, socket, head) {
+    const route = safeResolveRequestRoute(req.headers.host);
     if (route.error) {
       socket.write(`HTTP/1.1 ${route.error} ${getStatusText(route.error)}\r\nConnection: close\r\n\r\n`);
       socket.destroy();
@@ -514,6 +669,14 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
     const webSockets = route.session ? route.session.activeWebSockets : server._legacyActiveWebSockets || (server._legacyActiveWebSockets = new Set());
 
     if (webSockets.size >= maxWebSocketStreams) {
+      socket.write('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n');
+      socket.destroy();
+      return;
+    }
+
+    // Stream IDs are the hard cap; check it here as well as in the HTTP path so
+    // a flood of upgrades cannot exhaust the stream table.
+    if (streamLimitReached(route, selectedPool)) {
       socket.write('HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\n\r\n');
       socket.destroy();
       return;
@@ -535,211 +698,342 @@ function createHTTPServer(connectionPool, tcpServer, options = {}) {
     }
     webSockets.add(streamId);
 
-    for (const [name, sock] of selectedPool.connections) {
-      sock.setMaxListeners(maxStreams + maxWebSocketStreams + 10);
-    }
+    // Every path below must release the stream exactly once; the catch block
+    // covers setup failures that would otherwise leak the allocated stream ID.
+    let cleanupFn = null;
+    try {
+      // `cleanup` is hoisted within this block; keep a handle so the catch can
+      // use the same once-only teardown (terminal frame + socket destroy).
+      cleanupFn = cleanup;
 
-    const singleFlow = shouldUseSingleFlow(req.url, req.headers, req.method);
-    if (typeof selectedPool.setStreamMode === 'function') {
-      selectedPool.setStreamMode(streamId, { singleFlow });
-    }
+      for (const [name, sock] of selectedPool.connections) {
+        sock.setMaxListeners(maxStreams + maxWebSocketStreams + 10);
+      }
 
-    const upgradePayload = JSON.stringify({
-      protocol: 'websocket',
-      method: req.method,
-      path: req.url,
-      headers: sanitizeRequestHeaders(req.headers),
-      clientSerial: route.session?.serial,
-      publicHost: route.domain || req.headers.host,
-      publicProto: req.headers['x-forwarded-proto'] || (req.socket.encrypted ? 'https' : 'http'),
-      remoteAddress: req.socket.remoteAddress || '127.0.0.1',
-      tunnelMode: singleFlow ? 'single-flow' : 'multipath',
-      tunnel: { singleFlow }
-    });
+      const singleFlow = shouldUseSingleFlow(req.url, req.headers, req.method);
+      if (typeof selectedPool.setStreamMode === 'function') {
+        selectedPool.setStreamMode(streamId, { singleFlow });
+      }
 
-    selectedPool.send(encodeFrame(streamId, FrameType.UPGRADE, upgradePayload));
+      const requestHeaders = sanitizeRequestHeaders(req.headers);
+      const offeredProtocols = stripWebSocketNegotiation ? [] : splitHeaderTokens(req.headers['sec-websocket-protocol']);
+      const offeredExtensions = stripWebSocketNegotiation
+        ? []
+        : splitHeaderTokens(req.headers['sec-websocket-extensions']).map(extensionTokenName).filter(Boolean);
 
-    let wsBuffer = Buffer.alloc(0);
-    let targetToBrowserBuffer = Buffer.alloc(0);
-    let upgradeResponseReceived = false;
-    let cleanupCalled = false;
-    let closeFramePending = false;
-    let browserBackpressured = false;
-    const WS_IDLE_TIMEOUT = 300000;
-    let idleTimer = null;
+      const upgradePayload = JSON.stringify({
+        protocol: 'websocket',
+        method: req.method,
+        path: req.url,
+        headers: stripWebSocketNegotiation ? stripWebSocketOffers(requestHeaders) : requestHeaders,
+        clientSerial: route.session?.serial,
+        publicHost: route.domain || req.headers.host,
+        publicProto: req.headers['x-forwarded-proto'] || (req.socket.encrypted ? 'https' : 'http'),
+        remoteAddress: req.socket.remoteAddress || '127.0.0.1',
+        tunnelMode: singleFlow ? 'single-flow' : 'multipath',
+        tunnel: { singleFlow }
+      });
 
-    function resetIdleTimer() {
-      if (idleTimer) clearTimeout(idleTimer);
-      idleTimer = setTimeout(() => {
-        if (!cleanupCalled) {
+      selectedPool.send(encodeFrame(streamId, FrameType.UPGRADE, upgradePayload));
+
+      let wsBuffer = Buffer.alloc(0);
+      let targetToBrowserBuffer = Buffer.alloc(0);
+      let upgradeResponseReceived = false;
+      let cleanupCalled = false;
+      let terminalSent = false;
+      let closeFramePending = false;
+      let browserBackpressured = false;
+      let browserInputPaused = false;
+      let pumpScheduled = false;
+      let pendingLargeFrame = null;
+      let pendingOffset = 0;
+      const WS_IDLE_TIMEOUT = 300000;
+      let idleTimer = null;
+
+      function sendTerminal(type, message) {
+        if (terminalSent) return;
+        terminalSent = true;
+        selectedPool.send(encodeFrame(streamId, type,
+          message === undefined || message === null ? Buffer.alloc(0) : Buffer.from(String(message))));
+      }
+
+      function cleanup(terminal = null) {
+        if (cleanupCalled) return;
+        cleanupCalled = true;
+        try {
+          if (terminal) sendTerminal(terminal.type, terminal.message);
+        } catch (err) {
+          console.error('Failed to send terminal frame:', err && err.message ? err.message : err);
+        }
+        if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; }
+        pendingLargeFrame = null;
+        pendingOffset = 0;
+        if (browserBackpressured) { browserBackpressured = false; resumePool(selectedPool, streamId); }
+        browserInputPaused = false;
+        webSockets.delete(streamId);
+        selectedPool.unregisterStream(streamId);
+        releaseStream(route, streamId);
+        socket.destroy();
+      }
+
+      function writeUpgradeFailure(status, message) {
+        if (socket.destroyed) return;
+        const detail = message === undefined || message === null ? '' : String(message);
+        const body = detail ? `WebSocket upgrade failed: ${detail}\r\n` : '';
+        const lines = [`HTTP/1.1 ${status} ${getStatusText(status)}`, 'Connection: close', `Content-Length: ${Buffer.byteLength(body)}`, '', ''];
+        const terminalMessage = detail ? `WebSocket upgrade failed: ${detail}` : 'WebSocket upgrade failed';
+        socket.write(lines.join('\r\n') + body, () => cleanup({ type: FrameType.ERROR, message: terminalMessage }));
+      }
+
+      function resetIdleTimer() {
+        if (idleTimer) clearTimeout(idleTimer);
+        idleTimer = setTimeout(() => {
+          if (cleanupCalled) return;
           if (upgradeResponseReceived) {
             const closeFrame = buildWebSocketFrame(0x08, Buffer.from([0x03, 0xe9]));
-            socket.write(closeFrame, () => cleanup());
+            socket.write(closeFrame, () => cleanup({ type: FrameType.FIN }));
           } else {
+            cleanup({ type: FrameType.ERROR, message: 'WebSocket upgrade timeout' });
+          }
+        }, WS_IDLE_TIMEOUT);
+      }
+
+      resetIdleTimer();
+
+      selectedPool.registerStream(streamId, {
+        frameHandler: (frame) => {
+          if (cleanupCalled) return;
+
+          if (frame.type === FrameType.UPGRADE) {
+            if (upgradeResponseReceived) return;
+            resetIdleTimer();
+            try {
+              const response = JSON.parse(frame.payload.toString());
+              if (response.status !== 101) {
+                const errorStatus = response.status || 502;
+                const errorBody = `WebSocket upgrade failed: ${errorStatus}\r\n`;
+                const headerLines = [`HTTP/1.1 ${errorStatus} ${getStatusText(errorStatus)}`, 'Connection: close', `Content-Length: ${Buffer.byteLength(errorBody)}`, '', ''];
+                socket.write(headerLines.join('\r\n') + errorBody, () => cleanup({ type: FrameType.ERROR, message: 'WebSocket upgrade failed' }));
+                return;
+              }
+
+              // Relay the target's selected subprotocol/extensions, but only
+              // if the browser actually offered them. Anything else is an
+              // inconsistent handshake we refuse to expose to the browser.
+              const negotiation = resolveWebSocketNegotiation(response.headers || {}, offeredProtocols, offeredExtensions);
+              if (negotiation.error) {
+                console.error(`[502] Refusing WebSocket upgrade for ${req.url}: ${negotiation.error}`);
+                writeUpgradeFailure(502, negotiation.error);
+                return;
+              }
+
+              const headers = response.headers || {};
+              const headerLines = [
+                'HTTP/1.1 101 Switching Protocols',
+                `Upgrade: ${headers.upgrade || 'websocket'}`,
+                `Connection: ${headers.connection || 'Upgrade'}`,
+                `Sec-WebSocket-Accept: ${getHeaderValue(headers, 'sec-websocket-accept') || ''}`,
+                ...negotiation.lines,
+                '',
+                ''
+              ];
+              upgradeResponseReceived = true;
+              socket.write(headerLines.join('\r\n'), (err) => {
+                if (err) cleanup({ type: FrameType.ERROR, message: 'WebSocket write failed' });
+              });
+            } catch (err) {
+              console.error('Invalid UPGRADE response:', err.message);
+              cleanup({ type: FrameType.ERROR, message: 'Invalid upgrade response' });
+            }
+          } else if (frame.type === FrameType.DATA && upgradeResponseReceived) {
+            resetIdleTimer();
+            targetToBrowserBuffer = Buffer.concat([targetToBrowserBuffer, frame.payload]);
+            while (targetToBrowserBuffer.length >= 2 && !closeFramePending) {
+              const result = parseWebSocketFrame(targetToBrowserBuffer, true);
+              if (!result) break;
+              const { frameSize, opcode, remaining } = result;
+              const completeFrame = targetToBrowserBuffer.subarray(0, frameSize);
+              targetToBrowserBuffer = remaining;
+              const isCloseFrame = opcode === 0x08;
+              if (isCloseFrame) closeFramePending = true;
+              const canWrite = socket.write(completeFrame, (err) => {
+                if (err) cleanup({ type: FrameType.ERROR, message: 'WebSocket write failed' });
+                else if (isCloseFrame) cleanup();
+              });
+              if (!canWrite && !browserBackpressured && !isCloseFrame) {
+                browserBackpressured = true;
+                pausePool(selectedPool, streamId);
+                waitForDrain(socket, () => {
+                  browserBackpressured = false;
+                  if (!cleanupCalled) resumePool(selectedPool, streamId);
+                });
+              }
+              if (isCloseFrame) break;
+            }
+            if (targetToBrowserBuffer.length > MAX_WS_BUFFER_SIZE) {
+              console.error('WebSocket reassembly buffer overflow - closing connection');
+              cleanup({ type: FrameType.ERROR, message: 'WebSocket buffer overflow' });
+            }
+          } else if (frame.type === FrameType.FIN) {
+            if (!closeFramePending) cleanup();
+          } else if (frame.type === FrameType.ERROR) {
+            // Inbound terminal frame: the client already gave up, so no
+            // terminal notification is sent back.
             cleanup();
           }
+        },
+        errorHandler: (err) => {
+          if (cleanupCalled) return;
+          console.error('WebSocket stream error:', err.message);
+          cleanup({ type: FrameType.ERROR, message: 'WebSocket stream error' });
         }
-      }, WS_IDLE_TIMEOUT);
-    }
+      });
 
-    function cleanup() {
-      if (cleanupCalled) return;
-      cleanupCalled = true;
-      if (idleTimer) clearTimeout(idleTimer);
-      if (browserBackpressured) resumePool(selectedPool, streamId);
-      webSockets.delete(streamId);
-      selectedPool.unregisterStream(streamId);
-      releaseStream(route, streamId);
-      socket.destroy();
-    }
-
-    resetIdleTimer();
-
-    selectedPool.registerStream(streamId, {
-      frameHandler: (frame) => {
-        if (frame.type === FrameType.UPGRADE) {
-          resetIdleTimer();
+      function scheduleBrowserPump() {
+        if (pumpScheduled || cleanupCalled) return;
+        pumpScheduled = true;
+        process.nextTick(() => {
+          pumpScheduled = false;
           try {
-            const response = JSON.parse(frame.payload.toString());
-            if (response.status !== 101) {
-              const errorStatus = response.status || 502;
-              const errorHeaders = response.headers || {};
-              const errorBody = errorHeaders['content-length'] ? '' : `WebSocket upgrade failed: ${errorStatus}\r\n`;
-              const headerLines = [`HTTP/1.1 ${errorStatus} ${getStatusText(errorStatus)}`, 'Connection: close', `Content-Length: ${Buffer.byteLength(errorBody)}`, '', ''];
-              socket.write(headerLines.join('\r\n') + errorBody, () => cleanup());
+            pumpBrowserFrames();
+          } catch (err) {
+            // A pump failure must never escape as an uncaught exception (that
+            // would take down the public listener); fail the stream closed.
+            console.error('[502] WebSocket output pump failed:', err && err.message ? err.message : err);
+            cleanup({ type: FrameType.ERROR, message: 'WebSocket pump failure' });
+          }
+        });
+      }
+
+      function pauseBrowserInput() {
+        if (browserInputPaused || cleanupCalled) return;
+        browserInputPaused = true;
+        socket.pause();
+      }
+
+      function resumeBrowserInput() {
+        if (!browserInputPaused) return;
+        browserInputPaused = false;
+        if (!cleanupCalled && !socket.destroyed) socket.resume();
+      }
+
+      // Send one oversized frame's chunks. Returns false when the pump must
+      // stop and wait for the pool drain; the retained pendingOffset/pending
+      // frame make the remainder resumable.
+      function flushPendingLargeFrame() {
+        const frame = pendingLargeFrame;
+        if (!frame) return true;
+        while (pendingOffset < frame.length) {
+          const end = Math.min(pendingOffset + MAX_FRAME_SIZE, frame.length);
+          const canWrite = selectedPool.send(encodeFrame(streamId, FrameType.DATA, frame.subarray(pendingOffset, end)));
+          pendingOffset = end;
+          if (!canWrite) {
+            pauseBrowserInput();
+            waitForPoolDrain(selectedPool, () => {
+              resumeBrowserInput();
+              scheduleBrowserPump();
+            }, streamId);
+            return false;
+          }
+        }
+        pendingLargeFrame = null;
+        pendingOffset = 0;
+        return true;
+      }
+
+      // Resumable browser->target pump. Frames are consumed from wsBuffer one
+      // at a time and the pump re-schedules itself after every pool drain, so
+      // frames already buffered in wsBuffer are never stranded waiting for a
+      // new socket 'data' event.
+      function pumpBrowserFrames() {
+        if (cleanupCalled) return;
+
+        if (pendingLargeFrame && !flushPendingLargeFrame()) return;
+
+        while (wsBuffer.length >= 2) {
+          const result = parseWebSocketFrame(wsBuffer, true);
+          if (!result) break;
+          const { frameSize, opcode, remaining } = result;
+          const rawFrame = Buffer.from(wsBuffer.subarray(0, frameSize));
+          wsBuffer = remaining;
+
+          if (rawFrame.length <= MAX_FRAME_SIZE) {
+            if (!selectedPool.send(encodeFrame(streamId, FrameType.DATA, rawFrame))) {
+              pauseBrowserInput();
+              waitForPoolDrain(selectedPool, () => {
+                resumeBrowserInput();
+                scheduleBrowserPump();
+              }, streamId);
               return;
             }
+          } else {
+            pendingLargeFrame = rawFrame;
+            pendingOffset = 0;
+            pauseBrowserInput();
+            if (!flushPendingLargeFrame()) return;
+          }
 
-            const headers = response.headers || {};
-            const headerLines = ['HTTP/1.1 101 Switching Protocols', `Upgrade: ${headers.upgrade || 'websocket'}`, `Connection: ${headers.connection || 'Upgrade'}`, `Sec-WebSocket-Accept: ${headers['sec-websocket-accept'] || ''}`, '', ''];
-            upgradeResponseReceived = true;
-            socket.write(headerLines.join('\r\n'), (err) => { if (err) cleanup(); });
-          } catch (err) {
-            console.error('Invalid UPGRADE response:', err.message);
-            cleanup();
-          }
-        } else if (frame.type === FrameType.DATA && upgradeResponseReceived) {
-          resetIdleTimer();
-          targetToBrowserBuffer = Buffer.concat([targetToBrowserBuffer, frame.payload]);
-          while (targetToBrowserBuffer.length >= 2 && !closeFramePending) {
-            const result = parseWebSocketFrame(targetToBrowserBuffer, true);
-            if (!result) break;
-            const { frameSize, opcode, remaining } = result;
-            const completeFrame = targetToBrowserBuffer.subarray(0, frameSize);
-            targetToBrowserBuffer = remaining;
-            const isCloseFrame = opcode === 0x08;
-            if (isCloseFrame) closeFramePending = true;
-            const canWrite = socket.write(completeFrame, (err) => {
-              if (err) cleanup();
-              else if (isCloseFrame) cleanup();
-            });
-            if (!canWrite && !browserBackpressured && !isCloseFrame) {
-              browserBackpressured = true;
-              pausePool(selectedPool, streamId);
-              waitForDrain(socket, () => {
-                browserBackpressured = false;
-                if (!cleanupCalled) resumePool(selectedPool, streamId);
-              });
-            }
-            if (isCloseFrame) break;
-          }
-          if (targetToBrowserBuffer.length > MAX_WS_BUFFER_SIZE) {
-            console.error('WebSocket reassembly buffer overflow - closing connection');
-            cleanup();
-          }
-        } else if (frame.type === FrameType.FIN) {
-          if (!closeFramePending) cleanup();
-        } else if (frame.type === FrameType.ERROR) {
-          cleanup();
+          if (opcode === 0x08) return;
         }
-      },
-      errorHandler: (err) => {
-        console.error('WebSocket stream error:', err.message);
-        cleanup();
+
+        if (!pendingLargeFrame) resumeBrowserInput();
       }
-    });
 
-    let pendingLargeFrame = null;
-    let pendingOffset = 0;
-
-    function sendLargeFrameChunk() {
-      while (pendingOffset < pendingLargeFrame.length) {
-        const end = Math.min(pendingOffset + MAX_FRAME_SIZE, pendingLargeFrame.length);
-        const canWrite = selectedPool.send(encodeFrame(streamId, FrameType.DATA, pendingLargeFrame.subarray(pendingOffset, end)));
-        pendingOffset = end;
-        if (!canWrite) {
-          socket.pause();
-          waitForPoolDrain(selectedPool, sendLargeFrameChunk, streamId);
+      function appendBrowserData(chunk) {
+        const bufferedBytes = wsBuffer.length + (pendingLargeFrame ? pendingLargeFrame.length - pendingOffset : 0);
+        if (bufferedBytes + chunk.length > MAX_WS_BUFFER_SIZE) {
+          console.error('WebSocket buffer overflow - destroying connection');
+          cleanup({ type: FrameType.ERROR, message: 'WebSocket buffer overflow' });
           return;
         }
+        wsBuffer = wsBuffer.length === 0 ? Buffer.from(chunk) : Buffer.concat([wsBuffer, chunk]);
+        scheduleBrowserPump();
       }
-      pendingLargeFrame = null;
-      pendingOffset = 0;
-      socket.resume();
+
+      socket.on('data', (chunk) => {
+        if (cleanupCalled) return;
+        resetIdleTimer();
+        appendBrowserData(chunk);
+      });
+
+      if (headBuffer.length > 0) {
+        resetIdleTimer();
+        appendBrowserData(headBuffer);
+        headBuffer = Buffer.alloc(0);
+      }
+
+      socket.on('end', () => {
+        if (cleanupCalled) return;
+        cleanup({ type: FrameType.FIN });
+      });
+
+      socket.on('close', () => {
+        if (cleanupCalled) return;
+        cleanup({ type: FrameType.FIN });
+      });
+
+      socket.on('error', (err) => {
+        if (cleanupCalled) return;
+        console.error('WebSocket socket error:', err.message);
+        cleanup({ type: FrameType.ERROR, message: 'WebSocket socket error' });
+      });
+    } catch (err) {
+      console.error('[502] WebSocket upgrade setup failed:', err && err.message ? err.message : err);
+      if (cleanupFn) {
+        try {
+          cleanupFn({ type: FrameType.ERROR, message: 'WebSocket upgrade failed' });
+        } catch { /* ignore */ }
+      } else {
+        try {
+          selectedPool.send(encodeFrame(streamId, FrameType.ERROR, Buffer.from('WebSocket upgrade failed')));
+          webSockets.delete(streamId);
+          selectedPool.unregisterStream(streamId);
+          releaseStream(route, streamId);
+        } catch { /* ignore */ }
+        socket.destroy();
+      }
     }
-
-    function processBrowserData(chunk) {
-      if (wsBuffer.length + chunk.length > MAX_WS_BUFFER_SIZE) {
-        console.error('WebSocket buffer overflow - destroying connection');
-        cleanup();
-        return;
-      }
-      wsBuffer = Buffer.concat([wsBuffer, chunk]);
-      while (wsBuffer.length >= 2) {
-        if (pendingLargeFrame) break;
-        const result = parseWebSocketFrame(wsBuffer, true);
-        if (!result) break;
-        const { frameSize, remaining, opcode } = result;
-        const rawFrame = Buffer.from(wsBuffer.subarray(0, frameSize));
-        wsBuffer = remaining;
-        if (rawFrame.length <= MAX_FRAME_SIZE) {
-          if (!selectedPool.send(encodeFrame(streamId, FrameType.DATA, rawFrame))) {
-            socket.pause();
-            waitForPoolDrain(selectedPool, () => {
-              if (!cleanupCalled) socket.resume();
-            }, streamId);
-          }
-        } else {
-          pendingLargeFrame = rawFrame;
-          pendingOffset = 0;
-          socket.pause();
-          sendLargeFrameChunk();
-          if (pendingLargeFrame) break;
-        }
-        if (opcode === 0x08) return;
-      }
-    }
-
-    socket.on('data', (chunk) => {
-      resetIdleTimer();
-      processBrowserData(chunk);
-    });
-
-    if (headBuffer.length > 0) {
-      resetIdleTimer();
-      processBrowserData(headBuffer);
-      headBuffer = Buffer.alloc(0);
-    }
-
-    socket.on('end', () => {
-      if (!cleanupCalled) {
-        selectedPool.send(encodeFrame(streamId, FrameType.FIN, Buffer.alloc(0)));
-        cleanup();
-      }
-    });
-
-    socket.on('close', () => {
-      if (!cleanupCalled) {
-        selectedPool.send(encodeFrame(streamId, FrameType.FIN, Buffer.alloc(0)));
-        cleanup();
-      }
-    });
-
-    socket.on('error', (err) => {
-      console.error('WebSocket socket error:', err.message);
-      cleanup();
-    });
-  });
+  }
 
   server.keepAliveTimeout = httpKeepAliveTimeout;
   server.headersTimeout = httpHeadersTimeout;
@@ -752,5 +1046,6 @@ module.exports = {
   isWebSocketUpgrade,
   buildWebSocketFrame,
   parseWebSocketFrame,
-  shouldUseSingleFlow
+  shouldUseSingleFlow,
+  resolveWebSocketNegotiation
 };
