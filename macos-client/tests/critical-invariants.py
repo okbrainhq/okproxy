@@ -195,16 +195,41 @@ with tempfile.TemporaryDirectory(prefix='okproxy-critical-') as tmp:
     owned = (SRC/'OwnedChildProcess.swift').read_text()
     shell = (SRC/'ShellRunner.swift').read_text()
     supervisor = (SRC/'ProcessSupervisor.swift').read_text()
+    records = (SRC/'RunRecord.swift').read_text()
+    helper = (ROOT/'Sources/OkProxyProcessHelper/main.c').read_text()
     assert 'var fileActions: posix_spawn_file_actions_t? = nil' in owned
     assert 'var attributes: posix_spawnattr_t? = nil' in owned
     assert 'killpg(' not in owned
     for name in ('func pollExit()', 'func signalGroup('):
         section = owned.split(name)[1].split('\n    }')[0]
         assert 'stateLock.lock()' in section and 'defer { stateLock.unlock() }' in section
+    # Every child reaches exactly one terminal state: a lost waitpid, a helper
+    # killed by a signal, and a forced reclaim all report instead of going quiet.
+    assert 'func terminalOutcome()' in owned and 'func seal(reason: String)' in owned
+    assert 'supervisor exit could not be confirmed' in owned
+    assert 'without confirming cleanup' in owned
+    # The macOS hang: the helper parked itself in pause() on killpg EPERM, so
+    # Swift's waitpid never returned and every gate stayed retained forever.
+    assert not any(line.strip().startswith('for (;;) pause') for line in helper.splitlines())
+    assert 'okproxy helper ownership failure' not in helper
+    assert 'EPERM' in helper and 'wait_for_group_to_clear' in helper
+    assert 'HELPER_CLEANUP_ATTENTION' in helper and 'attention=1' in helper
+    # Stop is bounded at every rung and always reports an outcome.
+    assert 'static func forceReclaim' in supervisor and 'RunRecordStore.reclaim' in supervisor
+    assert 'case confirmedClean' in supervisor and 'case cleanupIncomplete' in supervisor
+    assert 'case forcedUnconfirmed' in supervisor
+    assert 'terminateSupervisorNow()' in owned and 'supervisor did not exit after SIGKILL' in supervisor
+    # The model releases the stop gate on every outcome, not only on success.
+    complete = model.split('private func completeStop')[1].split('private func')[0]
+    assert complete.index('case .cleanupIncomplete') < complete.index('finishClientExit(token: token)')
+    assert 'guard stopped, client.hasConfirmedExit else' not in model
+    assert 'func forceStopClient()' in model and 'reclaimOrphanedRuns' in model
+    # PID-reuse safety: nothing is signalled before its identity is verified.
+    assert 'ProcessTable.identity(of:' in records and 'matchesExecutable' in records
+    assert 'KERN_PROC_PGRP' in records
     append = shell.split('func append(_ text: String)')[1].split('func flush()')[0]
     assert 'queue.sync' in append and 'queue.async' not in append
-    assert 'completion?(!child.isRunning)' in supervisor
     assert 'role == .client && hasRunningClient' in supervisor
-    assert 'guard stopped, client.hasConfirmedExit else' in model and 'recoverNodeTransaction()' in model
-    passed('STRUCTURAL ONLY: Swift typed handles, shared lock, bounded append, stop gate/start guard')
+    assert 'recoverNodeTransaction()' in model
+    passed('STRUCTURAL ONLY: terminal child outcomes, bounded stop escalation, identity-checked reclaim, gate release')
 print(f'{count} checks passed; Swift/macOS build and execution NOT performed')

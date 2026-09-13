@@ -143,3 +143,157 @@ timeout retention, combining-mark flood, oversized chunks, scalar cuts, and a
 stalled consumer. Those runtime checks were **SKIPPED: swiftc unavailable**;
 they are wired into scripts/test.sh for the later authorized Mac validation.
 No Swift SDK compilation, GUI/service execution, other device, or commit.
+
+## Follow-up (macOS live) — the client could not be stopped at all
+
+Reported from a running production install: the app could not stop the client,
+could not update the repository (needed because the server had been updated),
+and could not quit. Five `OkProxyProcessHelper` processes were parked forever
+and had to be `SIGKILL`ed by hand; `ps` showed only helpers, no workload, i.e.
+every supervised child had already exited.
+
+```
+[2026-09-13T11:00:14Z] Stopping client…
+[2026-09-13T11:00:14Z] okproxy helper ownership failure: Operation not permitted
+[2026-09-13T11:00:18Z] Stop timed out or ownership failed; client/start gate retained until confirmed cleanup.
+[2026-09-13T11:00:28Z] Stop the client before running repository update.
+[2026-09-13T11:00:46Z] Quitting: stopping all owned child processes…
+[2026-09-13T11:00:50Z] Shutdown timed out or ownership failed; shutdown gate retained, not reporting success.
+```
+
+### Root cause (measured on macOS, not inferred)
+
+The helper sent the final group signal and treated any error other than `ESRCH`
+as an ownership failure, then parked in `for (;;) pause();`. Darwin returns
+**EPERM — not ESRCH —** for `kill(-pgid, sig)` when the group has no signalable
+member left, which is exactly the state after the workload leader exits and only
+its unreaped zombie (kept deliberately by `waitid … WNOWAIT`) stands in for the
+group. Measured on this host with the production helper source:
+
+| state of the process group | `kill(-pgid, SIGKILL)` |
+| --- | --- |
+| leader alive | `0` |
+| leader exited, unreaped (zombie), no other member | **`-1 EPERM`** |
+| zombie leader + one live member | `0` |
+| no such group | `-1 ESRCH` |
+
+Any leader exit reaches that branch — a natural exit, a client crash, and every
+`node --version` probe — so the helper never exited. Swift's `waitpid` therefore
+never returned, `isRunning` stayed true forever, and the stop transaction, the
+start/setup gate and the AppKit termination reply stayed retained forever.
+Linux returns `0` for the same call, which is why the Linux helper fixtures
+never caught it.
+
+### Fix
+
+* **Helper (`Sources/OkProxyProcessHelper/main.c`) never parks itself.** A
+  refused group signal is classified by probing the group (`KERN_PROC_PGRP`,
+  zombies excluded): delivered / already empty / genuinely unresolved. An
+  unresolved group is swept member by member and re-checked; the leader is
+  reaped with a bounded `WNOHANG` wait. Anything still unverified is recorded
+  (`attention=1` in the run record) and reported as exit code `126`, so "cannot
+  confirm" is a result instead of a hang. Setup failures stay `125`.
+* **Exactly one terminal outcome per child** (`Core/OwnedChildProcess.swift`):
+  a lost `waitpid`, a helper killed on a signal, and a forced reclaim now
+  produce a terminal `ChildExit` with a reason, instead of a silent return that
+  left callers waiting forever.
+* **Bounded stop escalation** (`Core/ProcessSupervisor.swift`): graceful group
+  `SIGTERM` → helper force control → reclaim (signal the recorded group,
+  `SIGKILL` the helper, verify). Every rung is time-boxed, every outcome is
+  reported, and every outcome releases the client gate.
+* **Durable reclaim handle** (`Core/RunRecord.swift`, new): the helper records
+  helper pid, workload pid and the workload's process group under
+  `<state-dir>/run/`. Startup reclaims leftovers from earlier launches; **Force
+  Stop** and **Clean Up Leftover Processes** are always available; a client
+  start refuses to run a second client on top of an unverifiable leftover. No
+  PID is signalled before its identity is verified (uid, `p_comm`, process
+  group, start time), so PID/pgid reuse cannot cause a stray kill.
+* **Quit always completes**: `applicationShouldTerminate` and `quit()` carry a
+  hard deadline that replies anyway after a bounded hard sweep. "Refusing to
+  terminate" is no longer a state the app can get stuck in.
+* **The control signals are never inherited as ignored**: the launcher now asks
+  `posix_spawn` to reset `SIGTERM`/`SIGINT`/`SIGUSR1` to their default
+  disposition in the child (`POSIX_SPAWN_SETSIGDEF`). A launcher that ignores
+  `SIGINT` (a non-interactive shell, for example) otherwise makes an immediate
+  cancellation be discarded by the kernel before the child can install its
+  handler, which turned a "stop it now" request into a 60-second wait.
+* **Cleanup reporting is not racy**: after the final group `SIGKILL`, the helper
+  allows a bounded settle (0.5 s) for descendants to leave the process table
+  before calling the cleanup unverified, so an ordinary stop no longer reports
+  attention because a just-killed child was still visible.
+
+### Policy change (explicit)
+
+Previous rule: *fail closed — retain ownership and the operation gate forever*.
+On this failure mode that made the app permanently unusable with no recovery
+path. New rule: *always stop, always report* — cleanup that cannot be verified
+is forced, surfaced in the log and the Connection tab, and enforced before the
+next client start.
+
+### Verification actually run here (macOS workstation, live install)
+
+* `macos-client/tests/macos-stop-guarantees.sh` (new): **12 passed, 0 failed**.
+  Production helper compiled `-Wall -Wextra -Werror`; **25** fast-exit workloads
+  all reaped (slowest 257 ms — the old helper hung forever on every one of them);
+  run records removed after clean cleanup; workload status passed through;
+  `SIGTERM` path cleaned a TERM-resistant descendant (2063 ms), force path 66 ms;
+  and a **`SIGSTOP`ped, otherwise unkillable helper plus its group were reclaimed
+  from the recorded pgid alone**.
+* `python3 macos-client/tests/reviewer3-swift-checks.py`: source invariants plus
+  extracted production regressions — reap-before-callback, duplicate Stop, stale
+  callbacks, **forced completion releases the gate**, force stop with nothing
+  owned clearing a wedged transaction, log buffer bounds.
+* `bash macos-client/tests/macos-robustness-checks.sh`: **86 passed, 0 failed**.
+* `python3 macos-client/tests/critical-invariants.py` (its Linux-host suite, run
+  here with a default `SIGINT` disposition): **25 passed** — including 90
+  immediate-after-`posix_spawn` cancellations and the descendant/leader cases.
+  Its fixtures assume the launching shell does not ignore `SIGINT`; a
+  non-interactive harness shell does, and a signal generated while its
+  disposition is `SIG_IGN` is discarded by the kernel before it can become
+  pending, which is why that suite must run with a default `SIGINT`.
+* `bash macos-client/tests/macos-behavior-checks.sh`: **11 passed, 0 failed**.
+* `macos-client/scripts/test.sh` (Swift build + two suites): passed.
+* **Live install, hands-free end to end**: a stale run record plus a planted
+  leftover process were reclaimed at launch — logged as
+  `startup cleanup: 1 run record(s), 1 reclaimed (1 signal(s))` — and the client
+  then started normally. The supervisor was then frozen with `SIGSTOP` (the
+  previously un-stoppable state) and the app was asked to quit through the real
+  AppKit terminate path. It reclaimed the frozen supervisor and exited:
+
+```
+[2026-09-13T11:57:20Z] Child exit could not be confirmed by waitpid (errno 10); a terminal result is still reported, so no operation stays blocked on it.
+[2026-09-13T11:57:20Z] Shutdown finished with attention: stopped with attention: supervisor had to be reclaimed by force; recorded leftovers were swept
+```
+
+  (The duplicated "attention" prefix in that last line was tidied afterwards; the
+  sweep and the exit path it reports are unchanged.)
+
+  Afterwards the workstation was verified clean: no app, no helper, no `node`
+  process, and no run records left behind. The wedged processes from the report
+  were also killed and the same clean state confirmed.
+* The installed bundle at `macos-client/OkProxy Client.app` (a gitignored build
+  artifact) was refreshed from this build and smoke-tested the same way — start,
+  client start, graceful quit, clean exit — so the app the user runs carries the
+  fix. The source lives on the workspace branch; `scripts/build.sh --prod`
+  reproduces the bundle.
+
+### Limitations stated honestly
+
+* A descendant that deliberately `setsid`/`setpgid`s out of the workload group
+  is still not contained; the reclaim path covers the recorded group only.
+* Reclaim is verified by enumerating the group and by per-PID identity. If group
+  enumeration itself fails, the record is kept and the result is reported as
+  unverified rather than assumed clean.
+* Exit code `126` is shared with a workload that exits `126` itself; the helper's
+  `attention=1` record is what disambiguates, so a missing record means "the
+  workload's own status".
+* The Linux fixture suite cannot exercise Darwin's EPERM classification, which is
+  why `tests/macos-stop-guarantees.sh` exists and must run on macOS; it skips
+  cleanly elsewhere.
+* The in-app **Stop Client / Force Stop / menu** controls were exercised only
+  through the app's own terminate path on this workstation: the macOS GUI agent
+  has no Control grant for this app, and the per-app prompt needs a person at the
+  keyboard, so a click on the status-bar item was not driven. The clicked actions
+  call exactly the same `stop`/`forceStop` code paths that the live quit test and
+  the extracted runtime regressions cover.
+* No other device, deployment, commit or push was touched.

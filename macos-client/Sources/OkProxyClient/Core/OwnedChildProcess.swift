@@ -1,12 +1,17 @@
 import Darwin
 import Foundation
 
-/// Result of a supervised child, delivered only after `waitpid` confirms exit.
+/// Result of a supervised child, delivered only after the helper's exit was
+/// confirmed or the child was explicitly reclaimed.
 struct ChildExit {
     let exitCode: Int32
     let signal: Int32?
     let capturedOutput: String?
     let failureReason: String?
+    /// The helper reaped its workload but could not verify descendant cleanup
+    /// (helper exit code 126). The app sweeps and reports instead of pretending
+    /// the stop was clean.
+    var cleanupAttention: Bool = false
 
     var didFailToSpawn: Bool { failureReason != nil }
 
@@ -31,6 +36,12 @@ enum ChildSpawnError: Error {
 
 /// Owns only the persistent helper PID. Signaling and nonblocking reaping share
 /// one synchronous lock; no main-actor callback is needed to invalidate identity.
+///
+/// Every child reaches exactly one terminal state. A failed `waitpid`, a helper
+/// that exited on a signal, and a reclaim that had to SIGKILL the helper all
+/// produce a terminal `ChildExit`; none of them may leave the caller waiting for
+/// a completion that can never arrive, because that is what turns one stuck
+/// supervisor into an app that can no longer stop, start, or update anything.
 final class OwnedChildProcess {
     let id = UUID()
     let role: ProcessRole
@@ -41,14 +52,15 @@ final class OwnedChildProcess {
 
     private let stateLock = NSLock()
     private var confirmedExit: ChildExit?
+    private var terminalFailureCode: Int32?
     private var terminationRequested = false
     private var identityOwned = true
-    private var waitFailure: Int32?
 
-    var ownershipFailure: Int32? {
+    /// Kernel errno behind an unconfirmable exit (ECHILD/EPERM), when there was one.
+    var failureCode: Int32? {
         stateLock.lock()
         defer { stateLock.unlock() }
-        return waitFailure
+        return terminalFailureCode
     }
 
     init(role: ProcessRole, executablePath: String, pid: pid_t, captureURL: URL?) {
@@ -79,7 +91,26 @@ final class OwnedChildProcess {
         stateLock.unlock()
     }
 
-    /// Called off-main. WNOHANG keeps lock hold time bounded.
+    /// The terminal outcome, whichever way the child ended.
+    func terminalOutcome() -> ChildExit? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return confirmedExit
+    }
+
+    /// Terminates supervision of a child that had to be reclaimed by force.
+    /// Records an honest failure reason instead of fabricating a clean exit.
+    func seal(reason: String) {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        identityOwned = false
+        if confirmedExit == nil {
+            confirmedExit = ChildExit(exitCode: 137, signal: SIGKILL, capturedOutput: nil, failureReason: reason)
+        }
+    }
+
+    /// Called off-main. WNOHANG keeps lock hold time bounded. Always leaves a
+    /// terminal state behind when it returns without a status.
     func pollExit() -> Int32? {
         stateLock.lock()
         defer { stateLock.unlock() }
@@ -89,16 +120,30 @@ final class OwnedChildProcess {
         if waited == 0 || (waited == -1 && errno == EINTR) { return nil }
         identityOwned = false // invalidate under the SAME lock as signaling
         if waited == -1 {
-            waitFailure = errno // no fabricated successful exit; retain gate
+            terminalFailureCode = errno
+            confirmedExit = ChildExit(
+                exitCode: -1,
+                signal: nil,
+                capturedOutput: nil,
+                failureReason: "supervisor exit could not be confirmed (errno \(errno))"
+            )
             return nil
         }
         let exit = PosixChildProcess.decode(status: status)
-        guard exit.signal == nil else {
-            waitFailure = ECHILD // helper died without a cleanup acknowledgement
+        if let signal = exit.signal {
+            // The helper was killed rather than finishing its own cleanup: the
+            // workload group may still be alive, so this is reported, never
+            // decoded as a clean stop.
+            terminalFailureCode = ECHILD
+            confirmedExit = ChildExit(
+                exitCode: exit.code,
+                signal: signal,
+                capturedOutput: nil,
+                failureReason: "supervisor exited on signal \(signal) without confirming cleanup"
+            )
             return nil
         }
-        confirmedExit = ChildExit(exitCode: exit.code, signal: nil,
-                                  capturedOutput: nil, failureReason: nil)
+        confirmedExit = ChildExit(exitCode: exit.code, signal: nil, capturedOutput: nil, failureReason: nil)
         return status
     }
 
@@ -112,6 +157,16 @@ final class OwnedChildProcess {
         return kill(pid, signal == SIGKILL ? SIGUSR1 : signal) == 0
     }
 
+    /// Last-resort reclaim of the helper itself, used only after the recorded
+    /// workload group has been signalled by the app. Returns `true` when the
+    /// SIGKILL was delivered.
+    @discardableResult
+    func terminateSupervisorNow() -> Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard identityOwned, pid > 1 else { return false }
+        return kill(pid, SIGKILL) == 0
+    }
 }
 
 enum PosixChildProcess {
@@ -119,6 +174,12 @@ enum PosixChildProcess {
         let pid: pid_t
         let captureURL: URL?
         let readFileDescriptor: Int32
+    }
+
+    /// The helper is shipped alongside the app executable.
+    static var helperExecutablePath: String {
+        URL(fileURLWithPath: CommandLine.arguments[0])
+            .deletingLastPathComponent().appendingPathComponent("OkProxyProcessHelper").path
     }
 
     /// Spawn a child in its own process group with stdin from /dev/null.
@@ -185,7 +246,7 @@ enum PosixChildProcess {
         var attributes: posix_spawnattr_t? = nil
         try check(posix_spawnattr_init(&attributes))
         defer { posix_spawnattr_destroy(&attributes) }
-        try check(posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSIGMASK)))
+        try check(posix_spawnattr_setflags(&attributes, Int16(POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF)))
         try check(posix_spawnattr_setpgroup(&attributes, 0))
         var mask = sigset_t()
         sigemptyset(&mask)
@@ -194,10 +255,19 @@ enum PosixChildProcess {
         sigaddset(&mask, SIGINT)
         sigaddset(&mask, SIGUSR1)
         try check(posix_spawnattr_setsigmask(&attributes, &mask))
+        // A launcher that ignores a control signal (a non-interactive shell
+        // ignores SIGINT, for example) would otherwise make an immediate cancel
+        // be discarded by the kernel before the helper can install its handler.
+        // The helper must always be able to observe a cancellation request.
+        var defaultSignals = sigset_t()
+        sigemptyset(&defaultSignals)
+        sigaddset(&defaultSignals, SIGTERM)
+        sigaddset(&defaultSignals, SIGINT)
+        sigaddset(&defaultSignals, SIGUSR1)
+        try check(posix_spawnattr_setsigdefault(&attributes, &defaultSignals))
 
         // Helper is shipped alongside the app executable; no shell interpolation.
-        let program = URL(fileURLWithPath: CommandLine.arguments[0])
-            .deletingLastPathComponent().appendingPathComponent("OkProxyProcessHelper").path
+        let program = helperExecutablePath
         let argumentStrings = [program, String(getpid()), cwd ?? FileManager.default.currentDirectoryPath,
                                executable] + arguments
 
@@ -236,7 +306,10 @@ enum PosixChildProcess {
     }
 
     /// Reap `pid` with `waitpid`, then read bounded captured output.
-    /// `onExit` runs on a utility queue; callers hop to the main actor.
+    /// `onExit` runs on a utility queue; callers hop to the main actor. The
+    /// callback fires exactly once for every spawn: a lost `waitpid`, an
+    /// externally killed helper and a forced reclaim all deliver a terminal
+    /// `ChildExit` rather than returning silently.
     static func monitor(
         child: OwnedChildProcess,
         captureURL: URL?,
@@ -245,30 +318,35 @@ enum PosixChildProcess {
         onExit: @escaping (ChildExit) -> Void
     ) {
         DispatchQueue.global(qos: .utility).async {
-            var status: Int32?
-            while status == nil {
-                status = child.pollExit()
-                if let failure = child.ownershipFailure {
-                    onOwnershipFailure(failure)
-                    return // registry/gates remain retained; no success callback
+            func finish(_ exit: ChildExit) {
+                var captured: String?
+                if let captureURL {
+                    captured = readCapturedOutput(at: captureURL, maxBytes: maxCapturedBytes)
+                    try? FileManager.default.removeItem(at: captureURL)
                 }
-                if status == nil { usleep(20_000) }
+                onExit(ChildExit(
+                    exitCode: exit.exitCode,
+                    signal: exit.signal,
+                    capturedOutput: exit.capturedOutput ?? captured,
+                    failureReason: exit.failureReason,
+                    cleanupAttention: exit.cleanupAttention
+                ))
             }
 
-            let exit = decode(status: status!)
-            let captured: String?
-            if let captureURL {
-                captured = readCapturedOutput(at: captureURL, maxBytes: maxCapturedBytes)
-                try? FileManager.default.removeItem(at: captureURL)
-            } else {
-                captured = nil
+            while true {
+                if let status = child.pollExit() {
+                    let exit = decode(status: status)
+                    finish(ChildExit(exitCode: exit.code, signal: exit.signal,
+                                     capturedOutput: nil, failureReason: nil))
+                    return
+                }
+                if let terminal = child.terminalOutcome() {
+                    if let code = child.failureCode { onOwnershipFailure(code) }
+                    finish(terminal)
+                    return
+                }
+                usleep(20_000)
             }
-            onExit(ChildExit(
-                exitCode: exit.code,
-                signal: exit.signal,
-                capturedOutput: captured,
-                failureReason: nil
-            ))
         }
     }
 

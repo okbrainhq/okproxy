@@ -95,13 +95,14 @@ enum ShellRunner {
             onOwnershipFailure: { code in
                 reader?.stopAndDrain()
                 Task { @MainActor in
-                    log("Child ownership failed (errno \(code)); operation gate retained. No further signals will be sent.")
+                    log("Child exit could not be confirmed by waitpid (errno \(code)); a terminal result is still reported, so no operation stays blocked on it.")
                 }
             }
         ) { result in
             reader?.stopAndDrain()
             Task { @MainActor in
-                // Ownership is released only now, after waitpid confirmed the exit.
+                // Ownership is released only now, and exactly once per child: a
+                // confirmed exit, a lost waitpid, or a reclaim all arrive here.
                 onExit(result)
             }
         }

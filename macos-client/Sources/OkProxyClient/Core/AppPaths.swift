@@ -63,6 +63,15 @@ enum AppPaths {
         stateDirectory.appendingPathComponent("repo", isDirectory: true)
     }
 
+    /// Run records written by `OkProxyProcessHelper` for supervised children.
+    ///
+    /// They are the only way the app can find a workload's process group again
+    /// after its helper crashed, was killed externally, or had to be reclaimed
+    /// by force, so "stop" stays possible no matter how the previous run ended.
+    static var runDirectory: URL {
+        stateDirectory.appendingPathComponent("run", isDirectory: true)
+    }
+
     static var nodeRoot: URL {
         stateDirectory.appendingPathComponent("node", isDirectory: true)
     }
@@ -75,11 +84,11 @@ enum AppPaths {
         stateDirectory.appendingPathComponent("app.lock")
     }
 
-    /// Create the state/log directories up front. Every writer (log store,
-    /// node install, lock file) can then assume its parent directory exists.
+    /// Create the state/log/run directories up front. Every writer (log store,
+    /// node install, lock file, run records) can then assume its parent exists.
     static func ensureStateDirectories() {
         let fileManager = FileManager.default
-        for directory in [stateDirectory, logsDirectory] {
+        for directory in [stateDirectory, logsDirectory, runDirectory] {
             do {
                 try fileManager.createDirectory(
                     at: directory,

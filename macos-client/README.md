@@ -29,7 +29,9 @@ The app manages fixed paths inside that state directory:
   - The file chooser shows hidden files and dot-directories for keys stored under paths like `.certs`.
   - Toggle `--multipath`, `--preserve-host`, and **Start Client Automatically**.
   - Add optional `--domain` values, one per line.
-  - Start/stop the client process.
+  - Start/stop the client process, with an always-available **Force Stop** and a
+    **Clean Up Leftover Processes** action for supervisors stranded by an earlier
+    run.
 
 - **Logs**
   - A compact live log view is always visible at the bottom of the app.
@@ -61,12 +63,26 @@ first rather than sharing config/logs.
 
 ## Robustness notes
 
+- **Robustness notes**
+
 - `ProcessSupervisor` owns a persistent direct-child `OkProxyProcessHelper`.
   The helper retains its workload leader unreaped through final descendant group
-  signaling. Swift signaling/reaping share a synchronous lock; timeout/error keeps
-  ownership and start gates held rather than reporting success. The build script
-  bundles/signs the helper next to the app executable. See documented containment
-  limits: escaped groups and externally killed helpers are not fully recoverable.
+  signaling. Swift signaling/reaping share a synchronous lock, and **every child
+  reaches exactly one terminal outcome**: a confirmed exit, a lost `waitpid`, an
+  externally killed helper and a forced reclaim are all reported, so no operation
+  gate can be retained indefinitely.
+- Stopping is bounded at every rung: graceful group `SIGTERM` (helper), the
+  helper's force control, then a reclaim that signals the workload group
+  recorded by the helper and `SIGKILL`s the helper itself. A result that could
+  not be verified is reported as `cleanupIncomplete`/`forcedUnconfirmed` instead
+  of silently blocking the app.
+- **Force Stop** (menu bar and Connection tab) and **Clean Up Leftover
+  Processes** are always available. The helper records the workload's process
+  group under `<state-dir>/run/`, so a stranded or frozen supervisor can still
+  be reclaimed after a crash, a force quit or an external kill. Startup reclaims
+  leftovers from earlier launches before autostart. No PID is ever signalled
+  before its identity (uid, executable name, process group, start time) is
+  verified, so PID reuse cannot cause a stray kill.
 - Log output is decoded incrementally (UTF-8 scalars split across reads), the
   output buffer, in-memory history and per-write payloads are bounded with
   explicit overflow markers, at most one delivery is in flight, and all log file
@@ -89,6 +105,7 @@ See `../docs/macos-fixes.md` for details, limitations and Mac validation steps.
 python3 ./tests/critical-invariants.py # Linux: production C helper + offline installer fixtures
 ./tests/macos-robustness-checks.sh   # source checks, plist XML, bash -n, embedded scripts
 ./tests/macos-behavior-checks.sh     # executes the install script + build lock against fixtures
+./tests/macos-stop-guarantees.sh     # macOS: helper exit/cleanup guarantees + reclaim path (skips elsewhere)
 python3 ./tests/reviewer3-swift-checks.py # extracted Swift regressions; skips without swiftc
 ./scripts/test.sh                    # Swift build + focused regressions (requires macOS/Swift)
 ```

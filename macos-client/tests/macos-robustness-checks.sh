@@ -56,7 +56,7 @@ check_contains "$SRC/Core/ProcessSupervisor.swift" 'role == \.setup && hasRunnin
   "setup operations are serialized (single setup role)"
 check_contains "$SRC/Core/OwnedChildProcess.swift" 'POSIX_SPAWN_SETPGROUP' \
   "children are isolated in their own process group via posix_spawn"
-check_contains "$ROOT/Sources/OkProxyProcessHelper/main.c" 'kill\(-child, SIGKILL\)' \
+check_contains "$ROOT/Sources/OkProxyProcessHelper/main.c" 'kill\(-pgid, signal_number\)' \
   "termination signals the owned process group, not just the bash PID"
 check_contains "$SRC/Core/OwnedChildProcess.swift" 'waitpid\(' \
   "ownership is released only after waitpid confirms exit"
@@ -66,6 +66,43 @@ check_absent_in_tree "$SRC" '\b(pkill|pgrep|killall)\b' \
   "no name-based/global process killing"
 check_contains "$SRC/OkProxyClientApp.swift" 'applicationWillTerminate' \
   "app termination performs a final child-process sweep"
+
+# --- Guaranteed stop (the macOS killpg EPERM hang) ---------------------------
+check_contains "$ROOT/Sources/OkProxyProcessHelper/main.c" 'EPERM' \
+  "the helper classifies Darwin's killpg EPERM instead of failing closed"
+check_contains "$ROOT/Sources/OkProxyProcessHelper/main.c" 'HELPER_CLEANUP_ATTENTION' \
+  "the helper reports incomplete cleanup with a distinct exit code"
+if grep -qE '^[[:space:]]*pause\(\);' "$ROOT/Sources/OkProxyProcessHelper/main.c" ||
+   grep -q 'okproxy helper ownership failure' "$ROOT/Sources/OkProxyProcessHelper/main.c"; then
+  fail "the helper never parks itself forever (found the old fail-closed park)"
+else
+  pass "the helper never parks itself forever (no pause() park)"
+fi
+check_contains "$SRC/Core/OwnedChildProcess.swift" 'func terminalOutcome()' \
+  "every child reaches exactly one terminal outcome"
+check_contains "$SRC/Core/ProcessSupervisor.swift" 'static func forceReclaim' \
+  "stop escalates to reclaiming the helper itself"
+check_contains "$SRC/Core/ProcessSupervisor.swift" 'case confirmedClean' \
+  "stop reports an explicit terminal outcome"
+check_contains "$SRC/Core/RunRecord.swift" 'KERN_PROC_PGRP' \
+  "recorded process groups are enumerated through the kernel"
+check_contains "$SRC/Core/RunRecord.swift" 'matchesExecutable' \
+  "no PID is signalled before its identity is verified"
+check_contains "$SRC/Core/AppModel.swift" 'func forceStopClient()' \
+  "an always-available force stop exists"
+check_contains "$SRC/Core/AppModel.swift" 'private func completeStop' \
+  "every stop outcome releases the client gate"
+check_contains "$SRC/OkProxyClientApp.swift" 'reply\(toApplicationShouldTerminate: true\)' \
+  "AppKit termination always replies, even after the hard deadline"
+check_absent_in_tree "$SRC" 'Stop timed out or ownership failed' \
+  "a stop timeout no longer leaves the client gate retained"
+check_absent_in_tree "$SRC" 'shutdown gate retained' \
+  "a shutdown timeout no longer refuses to terminate"
+if [[ -f "$ROOT/tests/macos-stop-guarantees.sh" ]]; then
+  pass "the macOS stop-guarantee behavioral suite is shipped"
+else
+  fail "the macOS stop-guarantee behavioral suite is shipped"
+fi
 
 # --- Single instance --------------------------------------------------------
 check_contains "$SRC/Core/SingleInstanceGuard.swift" 'flock\(descriptor, LOCK_EX [|] LOCK_NB\)' \
@@ -287,11 +324,18 @@ fi
 
 # --- Optional Swift build (only on a macOS/Swift host) ----------------------
 if [[ "$(uname -s)" == Darwin ]] && command -v swift >/dev/null 2>&1; then
-  if (cd "$ROOT" && swift build); then
+  build_log="$(mktemp)"
+  if (cd "$ROOT" && swift build) >"$build_log" 2>&1; then
     pass "swift build"
+  elif grep -q 'sandbox_apply: Operation not permitted' "$build_log" &&
+       (cd "$ROOT" && swift build --disable-sandbox) >"$build_log" 2>&1; then
+    # SwiftPM applies its own sandbox, which cannot nest inside a harness sandbox.
+    pass "swift build (retried with --disable-sandbox: nested sandbox unavailable)"
   else
     fail "swift build"
+    sed -n '1,40p' "$build_log"
   fi
+  rm -f "$build_log"
 else
   skip "swift build (no Swift toolchain on this host; run on macOS or with Swift installed)"
 fi
