@@ -230,20 +230,52 @@ The server deploy uploads only the server TLS files and public CA metadata it ne
 
 It does **not** upload `.ca/ca-key.pem`.
 
-On the server the trust material is stored **outside the git checkout**, in
-`/var/lib/okproxy/certs` (server key/cert) and `/var/lib/okproxy/ca` (CA cert,
-`issued-domains.json`, `crl.txt`), so a clone/update can never delete it. If a
-host still has the legacy in-checkout layout (`/opt/okproxy/certs`,
+On the server the trust material is stored **outside the git checkout**, as a
+release directory referenced through one symlink: `/var/lib/okproxy/current` →
+`/var/lib/okproxy/releases/<release-id>`, i.e. the active paths are
+`/var/lib/okproxy/current/certs` (server key/cert) and
+`/var/lib/okproxy/current/ca` (CA cert, `issued-domains.json`, `crl.txt`), so a
+clone/update can never delete it.
+
+`--upload-certs` never writes into the active directories. Every file is first
+staged in `/var/lib/okproxy/staging/<release-id>/`, validated **on the server**
+(key must match the certificate, certificate must chain to the CA) and promoted
+to `/var/lib/okproxy/releases/<release-id>`. The uploader only stages/validates;
+setup captures old code/unit/trust, makes the release readable by `okproxy`, and
+then replaces the one `current` symlink atomically within its rollback transaction. An upload interrupted halfway
+therefore cannot leave a new certificate next to an old key, and the previously
+active release stays on disk as rollback history (a failed startup restores it
+automatically). Failed stagings are removed with
+`setup-server-remote.sh --trust-release-discard=<release-id>`; validated releases
+are never deleted.
+
+If a host still has the legacy in-checkout layout (`/opt/okproxy/certs`,
 `/opt/okproxy/ca`, `/opt/okproxy/.certs`, `/opt/okproxy/.ca`), the next deploy
 copies the **coherent set that the running service used** (the historically
-active `certs`+`ca` first) into `/var/lib/okproxy` after cryptographic
-validation; partial or mismatched layouts abort instead of guessing, and partial
-material already in `/var/lib/okproxy` is never overwritten. An existing CA is
-never regenerated — if the server pair is missing or incomplete it is re-issued
-from the existing CA (which requires `ca-key.pem` on the host). A new CA is only
-created when both trust directories are genuinely empty (hidden files included);
-any partial state (CA key only, records only, missing `ca-cert.pem`, orphan leaf
-key, …) aborts and preserves the files.
+active `certs`+`ca` first) into the persistent release directory after
+cryptographic validation; partial or mismatched layouts abort instead of
+guessing, and partial material already there is never overwritten. A
+pre-existing real `/var/lib/okproxy/certs`+`ca` layout is adopted into the first
+release (original directories stay unchanged at their absolute paths, so old
+units remain usable on rollback). An existing CA is never regenerated — if the server pair is
+missing or incomplete it is re-issued from the existing CA (which requires
+`ca-key.pem` on the host). A new CA is only created when both trust directories
+are genuinely empty (hidden files included); any partial state (CA key only,
+records only, missing `ca-cert.pem`, orphan leaf key, …) aborts and preserves the
+files.
+
+Readiness requires a fresh systemd invocation plus HTTP/TLS listeners owned by
+its MainPID, not a connected client/target. There is no `/health` endpoint: routing
+can legitimately return 404 (cert-bound) or 502 (classic) with no client. Failures
+and catchable interruptions restore code/unit/trust; SIGKILL, power loss and
+unrelated OS/package/Caddy/firewall changes require operator recovery (see runbook).
+
+The deployment never edits `/etc/ssh/sshd_config` and never restarts `ssh`:
+automatic `PasswordAuthentication no` / `PermitRootLogin no` hardening could lock
+out every administrator on a password-only or root-only host. Harden SSH
+manually from a second, already-verified session instead
+(`ssh -o PreferredAuthentications=publickey …`, `sudo sshd -t`,
+`sudo systemctl reload ssh`) — see `docs/deployment-fixes.md`.
 
 The UFW rules open the SSH management port configured in `.deploy.server`
 (`SSH_PORT`) or verified from the live listener + `sshd` configuration. UFW is
@@ -311,13 +343,13 @@ In cert-bound mode the service runs with the issued-domain index:
 
 ```bash
 apps/server/index.js --http-port 8080 --tls-port 9443 \
-  --key /var/lib/okproxy/certs/server-key.pem \
-  --cert /var/lib/okproxy/certs/server-cert.pem \
-  --ca /var/lib/okproxy/ca/ca-cert.pem \
-  --ca-dir /var/lib/okproxy/ca \
+  --key /var/lib/okproxy/current/certs/server-key.pem \
+  --cert /var/lib/okproxy/current/certs/server-cert.pem \
+  --ca /var/lib/okproxy/current/ca/ca-cert.pem \
+  --ca-dir /var/lib/okproxy/current/ca \
   --cert-bound-domains \
   --http-host 127.0.0.1 \
-  --issued-domain-index /var/lib/okproxy/ca/issued-domains.json
+  --issued-domain-index /var/lib/okproxy/current/ca/issued-domains.json
 ```
 
 Caddy is configured for on-demand HTTPS and asks okproxy before issuing a cert:
