@@ -20,4 +20,6 @@ REPO_URL=https://github.com/username/okproxy.git
 # DEPLOY_HOST=deploy@tunnel.example.com
 
 # Optional: custom SSH port (default: 22)
+# The deploy script also allows this port in UFW before enabling the firewall,
+# so deploying over a non-default management port cannot lock you out.
 # SSH_PORT=2222

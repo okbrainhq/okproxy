@@ -20,6 +20,7 @@ CLIENT_CERT_DIR=./.certs/client-1
 
 # Optional: remote cert directory on the client machine
 # Defaults to ~/.okproxy/certs/$CLIENT_NAME (or ~/.okproxy/certs for CLIENT_NAME=default)
+# A leading ~ is resolved against the remote home directory before upload.
 # REMOTE_CERT_DIR=~/.okproxy/certs/client-1
 
 # Optional: number of parallel tunnel sockets per network interface.

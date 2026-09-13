@@ -7,6 +7,25 @@
 
 set -eo pipefail
 
+# ------------------------------------------------------------ pure helpers
+# XML escaping for the LaunchAgent plist. Values come from .deploy.client and
+# filesystem paths; without escaping, a value containing &, <, > or a quote
+# would produce an invalid plist (and could inject plist keys).
+xml_escape() {
+    # sed-based so the result does not depend on the bash version's
+    # patsub_replacement behaviour for "&" in ${var//pat/repl}.
+    printf '%s' "$1" | tr '\r\n' '  ' | sed \
+        -e 's/&/\&amp;/g' \
+        -e 's/</\&lt;/g' \
+        -e 's/>/\&gt;/g' \
+        -e 's/"/\&quot;/g' \
+        -e "s/'/\&apos;/g"
+}
+
+if [ "${OKPROXY_DEPLOY_SOURCE_ONLY:-0}" = "1" ]; then
+    return 0
+fi
+
 # Collect positional args
 if [ $# -lt 3 ]; then
     echo "Error: SERVER_HOST, TARGET_HOST, and REPO_URL are required."
@@ -287,41 +306,55 @@ fi
 
 # 6. Create LaunchAgent plist
 echo "Creating LaunchAgent plist..."
+# Escape every interpolated value for XML so plist content cannot break out of
+# its <string> element.
+PLIST_LABEL="$(xml_escape "$LAUNCH_LABEL")"
+PLIST_NODE_PATH="$(xml_escape "$NODE_PATH")"
+PLIST_CLIENT_INDEX="$(xml_escape "$CLIENT_DIR/index.js")"
+PLIST_WORK_DIR="$(xml_escape "$CLIENT_DIR")"
+PLIST_SERVER="$(xml_escape "$SERVER_HOSTNAME:$SERVER_PORT")"
+PLIST_TARGET="$(xml_escape "$TARGET_HOSTNAME:$TARGET_PORT")"
+PLIST_PARALLEL="$(xml_escape "$PARALLEL_SOCKETS")"
+PLIST_CLIENT_CERT="$(xml_escape "$CLIENT_CERT")"
+PLIST_CLIENT_KEY="$(xml_escape "$CLIENT_KEY")"
+PLIST_CA_CERT="$(xml_escape "$CA_CERT")"
+PLIST_LOG_DIR="$(xml_escape "$LOG_DIR")"
+
 cat > "$PLIST_PATH" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>${LAUNCH_LABEL}</string>
+    <string>${PLIST_LABEL}</string>
     
     <key>ProgramArguments</key>
     <array>
-        <string>${NODE_PATH}</string>
-        <string>${CLIENT_DIR}/index.js</string>
+        <string>${PLIST_NODE_PATH}</string>
+        <string>${PLIST_CLIENT_INDEX}</string>
         <string>--multipath</string>
         <string>--server</string>
-        <string>${SERVER_HOSTNAME}:${SERVER_PORT}</string>
+        <string>${PLIST_SERVER}</string>
         <string>--target</string>
-        <string>${TARGET_HOSTNAME}:${TARGET_PORT}</string>
+        <string>${PLIST_TARGET}</string>
         <string>--parallel-sockets</string>
-        <string>${PARALLEL_SOCKETS}</string>
+        <string>${PLIST_PARALLEL}</string>
         <string>--cert</string>
-        <string>${CLIENT_CERT}</string>
+        <string>${PLIST_CLIENT_CERT}</string>
         <string>--key</string>
-        <string>${CLIENT_KEY}</string>
+        <string>${PLIST_CLIENT_KEY}</string>
         <string>--ca</string>
-        <string>${CA_CERT}</string>
+        <string>${PLIST_CA_CERT}</string>
     </array>
     
     <key>WorkingDirectory</key>
-    <string>${CLIENT_DIR}</string>
+    <string>${PLIST_WORK_DIR}</string>
     
     <key>StandardOutPath</key>
-    <string>${LOG_DIR}/client.log</string>
+    <string>${PLIST_LOG_DIR}/client.log</string>
     
     <key>StandardErrorPath</key>
-    <string>${LOG_DIR}/client-error.log</string>
+    <string>${PLIST_LOG_DIR}/client-error.log</string>
     
     <key>KeepAlive</key>
     <dict>
@@ -346,7 +379,7 @@ cat > "$PLIST_PATH" <<EOF
         <key>MULTIPATH_ENABLED</key>
         <string>true</string>
         <key>OKPROXY_PARALLEL_SOCKETS</key>
-        <string>${PARALLEL_SOCKETS}</string>
+        <string>${PLIST_PARALLEL}</string>
     </dict>
 </dict>
 </plist>

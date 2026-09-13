@@ -5,6 +5,7 @@ const assert = require('node:assert');
 const { connect } = require('node:tls');
 const { encodeFrame, FrameType, MAX_FRAME_SIZE } = require('../../../packages/frame-protocol');
 const { createTestEnv } = require('./setup');
+const { memorySnapshot, startPeakSampler, mb } = require('./memory-utils');
 
 describe('Oversized Frame Rejection', () => {
   it('should destroy connection on oversized frame header', async () => {
@@ -62,7 +63,10 @@ describe('Oversized Frame Rejection', () => {
       const socket = connect({ port: env.ports.tlsPort });
       
       let disconnected = false;
-      const startMem = process.memoryUsage().heapUsed;
+      // Peak RSS + native buffer sampling: an accepted 100MB frame would show
+      // up in arrayBuffers/external long before the JS heap.
+      const before = memorySnapshot();
+      const sampler = startPeakSampler(10);
       
       await new Promise((resolve) => {
         socket.on('connect', () => {
@@ -95,12 +99,18 @@ describe('Oversized Frame Rejection', () => {
         setTimeout(resolve, 2000);
       });
       
-      const endMem = process.memoryUsage().heapUsed;
-      const memIncrease = endMem - startMem;
+      const peak = sampler.stop();
+      const rssGrowth = peak.peakRss - before.rss;
+      const nativeGrowth = peak.peakArrayBuffers - before.arrayBuffers;
+      const heapGrowth = peak.peakHeapUsed - before.heapUsed;
       
       assert.ok(disconnected, 'Should disconnect');
-      // Should not allocate 100MB
-      assert.ok(memIncrease < 50 * 1024 * 1024, 'Should not allocate huge memory');
+      // Should not allocate 100MB: assert peak growth, not a single sample.
+      assert.ok(nativeGrowth < 50 * 1024 * 1024,
+        `Should not allocate native buffers for the claimed frame (grew ${mb(nativeGrowth)})`);
+      assert.ok(rssGrowth < 80 * 1024 * 1024,
+        `RSS should stay bounded (grew ${mb(rssGrowth)}, sampled ${peak.samples}x)`);
+      assert.ok(heapGrowth < 50 * 1024 * 1024, 'Should not allocate huge memory');
     } finally {
       await env.cleanup();
     }
