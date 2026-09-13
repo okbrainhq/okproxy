@@ -24,6 +24,20 @@ BINARY="$ROOT/.build/release/$EXECUTABLE_NAME"
 ICON_BUILD_DIR="$ROOT/.build/icons/$ICON_NAME.iconset"
 ICON_FILE="$ROOT/.build/icons/$ICON_NAME.icns"
 cd "$ROOT"
+
+# Serialize concurrent invocations (two `build.sh` runs racing on .build and the
+# .app bundle can corrupt both). macOS has no flock(1), so use the mkdir lock
+# helper, which also recovers the lock if a previous build was killed.
+mkdir -p "$ROOT/.build"
+source "$ROOT/scripts/lib/build-lock.sh"
+BUILD_LOCK="$ROOT/.build/.okproxy-build.lock"
+okproxy_acquire_build_lock "$BUILD_LOCK" 300 || exit 1
+# Signal handlers must exit (plain `trap f INT` would resume the build after the
+# handler returned) and still release the lock.
+trap 'okproxy_release_build_lock' EXIT
+trap 'okproxy_release_build_lock; exit 130' INT
+trap 'okproxy_release_build_lock; exit 143' TERM
+
 export CODE_SIGNING_ALLOWED=NO
 export CODE_SIGN_IDENTITY="-"
 swift build -c release
@@ -112,6 +126,8 @@ iconutil -c icns "$ICON_BUILD_DIR" -o "$ICON_FILE"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BINARY" "$APP/Contents/MacOS/$EXECUTABLE_NAME"
+cp "$ROOT/.build/release/OkProxyProcessHelper" "$APP/Contents/MacOS/OkProxyProcessHelper"
+codesign --force --sign - --timestamp=none "$APP/Contents/MacOS/OkProxyProcessHelper"
 cp "$PLIST" "$APP/Contents/Info.plist"
 cp "$ICON_FILE" "$APP/Contents/Resources/$ICON_NAME.icns"
 codesign --force --sign - --timestamp=none "$APP"

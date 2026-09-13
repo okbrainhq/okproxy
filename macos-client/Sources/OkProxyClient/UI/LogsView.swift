@@ -116,6 +116,7 @@ private struct LogTextScrollView: NSViewRepresentable {
         private var isUpdatingProgrammatically = false
 
         private let bottomTolerance: CGFloat = 16
+        private let emptyPlaceholder = "Logs will appear here."
 
         deinit {
             if let boundsObserver {
@@ -149,17 +150,32 @@ private struct LogTextScrollView: NSViewRepresentable {
             let previousOrigin = scrollView.contentView.bounds.origin
             let newEntryIDs = entries.map(\.id)
             let removedPrefixHeight = shouldFollowTail ? 0 : removedPrefixLineHeight(newEntryIDs: newEntryIDs, font: font)
-            let newText = entries.isEmpty ? "Logs will appear here." : entries.map(\.text).joined(separator: "\n")
-            let textChanged = newEntryIDs != renderedEntryIDs || newText != renderedText
+            let idsChanged = newEntryIDs != renderedEntryIDs
+            let canAppend = canAppendIncrementally(newEntryIDs: newEntryIDs)
 
             isUpdatingProgrammatically = true
             textView.font = font
             textView.textColor = entries.isEmpty ? .secondaryLabelColor : .textColor
 
-            if textChanged {
-                textView.string = newText
+            if idsChanged {
+                // Log entries are immutable once appended, so a stable prefix of
+                // IDs means only the tail is new. Appending just those lines
+                // avoids reassigning the whole document (and relaying out up to
+                // 2,000 lines) on every flushed log chunk.
+                if canAppend, let storage = textView.textStorage {
+                    let appendedEntries = entries[renderedEntryIDs.count...]
+                    let appendedText = "\n" + appendedEntries.map(\.text).joined(separator: "\n")
+                    storage.append(NSAttributedString(
+                        string: appendedText,
+                        attributes: [.font: font, .foregroundColor: NSColor.textColor]
+                    ))
+                    renderedText += appendedText
+                } else {
+                    let newText = entries.isEmpty ? emptyPlaceholder : entries.map(\.text).joined(separator: "\n")
+                    textView.string = newText
+                    renderedText = newText
+                }
                 renderedEntryIDs = newEntryIDs
-                renderedText = newText
             }
 
             textView.layoutSubtreeIfNeeded()
@@ -168,7 +184,7 @@ private struct LogTextScrollView: NSViewRepresentable {
             if shouldFollowTail {
                 scrollToBottom(textView: textView, scrollView: scrollView)
                 isFollowingTail = true
-            } else if textChanged {
+            } else if idsChanged {
                 restoreScrollPosition(
                     previousOrigin: previousOrigin,
                     removedPrefixHeight: removedPrefixHeight,
@@ -179,6 +195,12 @@ private struct LogTextScrollView: NSViewRepresentable {
 
             isUpdatingProgrammatically = false
             lastForceFollowTail = forceFollowTail
+        }
+
+        private func canAppendIncrementally(newEntryIDs: [Int]) -> Bool {
+            guard !renderedEntryIDs.isEmpty, !renderedText.isEmpty, renderedText != emptyPlaceholder else { return false }
+            guard newEntryIDs.count > renderedEntryIDs.count else { return false }
+            return Array(newEntryIDs.prefix(renderedEntryIDs.count)) == renderedEntryIDs
         }
 
         private func removedPrefixLineHeight(newEntryIDs: [Int], font: NSFont) -> CGFloat {
